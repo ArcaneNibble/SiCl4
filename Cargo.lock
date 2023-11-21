@@ -431,6 +431,7 @@ dependencies = [
  "bson",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -439,6 +440,7 @@ version = "0.0.0"
 dependencies = [
  "pyo3",
  "sicl4_db",
+ "uuid",
 ]
 
 [[package]]
@@ -518,6 +520,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e395fcf16a7a3d8127ec99782007af141946b4795001f876d54fb0d55978560"
 dependencies = [
  "getrandom",
+ "rand",
  "serde",
 ]
 

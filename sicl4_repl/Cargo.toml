@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 sicl4_db = { path = "../sicl4_db" }
+uuid = { version = "1.6" }
 
 [dependencies.pyo3]
 version = "0.20.0"
