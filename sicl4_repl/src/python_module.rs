@@ -133,6 +133,11 @@ impl Db {
             .save_bson(file)
             .map_err(|err| -> PyErr { PyIOError::new_err(format!("{}", err)) })
     }
+
+    fn import_yosys_json(&mut self, filename: &str) {
+        let mut db = self.inner.write().unwrap();
+        sicl4_interchange::import_yosys_json(&mut db, filename);
+    }
 }
 
 #[pymodule]

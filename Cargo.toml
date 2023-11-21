@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
 
-members = ["sicl4_db", "sicl4_repl"]
+members = ["sicl4_db", "sicl4_interchange", "sicl4_repl"]

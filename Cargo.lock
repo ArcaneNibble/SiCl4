@@ -435,11 +435,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sicl4_interchange"
+version = "0.0.0"
+dependencies = [
+ "sicl4_db",
+ "yosys-netlist-json",
+]
+
+[[package]]
 name = "sicl4_repl"
 version = "0.0.0"
 dependencies = [
  "pyo3",
  "sicl4_db",
+ "sicl4_interchange",
  "uuid",
 ]
 
@@ -654,6 +663,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "yosys-netlist-json"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c5f0e35fbc1276ad3b3cc9375b55796fa2fcc61aa01d41fa3d2b7a57e3adb3f"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "serde_json",
 ]
 
 [[package]]

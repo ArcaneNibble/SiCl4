@@ -1,5 +1,5 @@
 [package]
-name = "sicl4_repl"
+name = "sicl4_interchange"
 version = "0.0.0"
 edition = "2021"
 
@@ -7,9 +7,4 @@ edition = "2021"
 
 [dependencies]
 sicl4_db = { path = "../sicl4_db" }
-sicl4_interchange = { path = "../sicl4_interchange" }
-uuid = { version = "1.6" }
-
-[dependencies.pyo3]
-version = "0.20.0"
-features = ["auto-initialize"]
+yosys-netlist-json = { version = "0.1.0", default-features = false }
