@@ -1,13 +1,11 @@
 [package]
-name = "sicl4_repl"
+name = "sicl4_db"
 version = "0.0.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-sicl4_db = { path = "../sicl4_db" }
-
-[dependencies.pyo3]
-version = "0.20.0"
-features = ["auto-initialize"]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bson = "2.7"

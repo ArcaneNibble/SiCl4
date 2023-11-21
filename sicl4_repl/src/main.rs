@@ -2,17 +2,8 @@ use std::{error::Error, fmt::Display};
 
 use pyo3::prelude::*;
 
-#[pyfunction]
-fn test_double(x: usize) -> usize {
-    x * 2
-}
-
-#[pymodule]
-#[pyo3(name = "sicl4")]
-fn sicl4_py_module(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(test_double, m)?)?;
-    Ok(())
-}
+mod python_module;
+use python_module::sicl4_py_module;
 
 #[derive(Debug)]
 enum ReplError {
@@ -24,7 +15,7 @@ impl Display for ReplError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReplError::PythonError(e) => write!(f, "python error: {}", e),
-            ReplError::IoError(e) => write!(f, "io error: {}", e)
+            ReplError::IoError(e) => write!(f, "io error: {}", e),
         }
     }
 }
@@ -67,13 +58,11 @@ else:
 code.InteractiveConsole(vars).interact('Welcome to SiCl4 Python REPL!')
         "#;
 
-        Python::with_gil(|py| {
-            py.run(startup_code, None, None)
-        })?;
+        Python::with_gil(|py| py.run(startup_code, None, None))?;
     } else {
         let fn_to_load = &args[1];
         let code = std::fs::read_to_string(fn_to_load)?;
-        Python::with_gil(|py| -> PyResult<()>{
+        Python::with_gil(|py| -> PyResult<()> {
             PyModule::from_code(py, &code, fn_to_load, "__main__")?;
             Ok(())
         })?;
