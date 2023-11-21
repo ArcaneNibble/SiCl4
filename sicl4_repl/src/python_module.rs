@@ -7,6 +7,26 @@ use pyo3::{exceptions::PyIOError, prelude::*};
 use uuid::Uuid;
 
 #[pyclass(module = "sicl4")]
+struct CellInstantiation {
+    module: Py<Module>,
+    name: String,
+}
+
+#[pymethods]
+impl CellInstantiation {
+    fn connect_port(&mut self, port_name: &str, wire_name: &str) {
+        Python::with_gil(|py| {
+            let module_py = self.module.borrow(py);
+            let db_py = module_py.db.borrow(py);
+            let mut db = db_py.inner.write().unwrap();
+            let module = db.get_module_mut(module_py.uuid).unwrap();
+            let cell = module.get_cell_mut(&self.name).unwrap();
+            cell.connect_port(port_name, wire_name);
+        })
+    }
+}
+
+#[pyclass(module = "sicl4")]
 struct Module {
     db: Py<Db>,
     uuid: Uuid,
@@ -23,6 +43,34 @@ impl Module {
                 width: width.unwrap_or(1),
             };
             module.add_port(name, port);
+        })
+    }
+
+    fn add_inner_wire(&self, name: &str, width: Option<u64>) {
+        Python::with_gil(|py| {
+            let db_py = self.db.borrow(py);
+            let mut db = db_py.inner.write().unwrap();
+            let module = db.get_module_mut(self.uuid).unwrap();
+            let wire = sicl4_db::InnerWire {
+                width: width.unwrap_or(1),
+            };
+            module.add_inner_wire(name, wire);
+        })
+    }
+
+    fn add_cell(self_: Py<Self>, name: &str, cell_type: &str) -> CellInstantiation {
+        Python::with_gil(|py| {
+            {
+                let self__ = self_.borrow(py);
+                let db_py = self__.db.borrow(py);
+                let mut db = db_py.inner.write().unwrap();
+                let module = db.get_module_mut(self__.uuid).unwrap();
+                module.add_cell(name, cell_type);
+            }
+            CellInstantiation {
+                module: self_,
+                name: name.to_owned(),
+            }
         })
     }
 }

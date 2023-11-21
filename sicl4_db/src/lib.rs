@@ -18,10 +18,38 @@ impl Default for Port {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct InnerWire {
+    pub width: u64,
+}
+
+impl Default for InnerWire {
+    fn default() -> Self {
+        Self { width: 1 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CellInstantiation {
+    cell_type: String,
+    connections: HashMap<String, String>,
+}
+
+impl CellInstantiation {
+    pub fn connect_port(&mut self, port_name: &str, wire_name: &str) {
+        // XXX this will be completely redone
+        self.connections
+            .insert(port_name.to_owned(), wire_name.to_owned());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Module {
     name: String,
     ports: HashMap<String, Port>,
+    // fixme: different types of modules
+    wires: HashMap<String, InnerWire>,
+    cells: HashMap<String, CellInstantiation>,
 }
 
 impl Module {
@@ -30,6 +58,28 @@ impl Module {
     }
     pub fn get_port(&self, name: &str) -> Option<Port> {
         self.ports.get(name).map(|x| *x)
+    }
+
+    pub fn add_inner_wire(&mut self, name: &str, wire: InnerWire) {
+        self.wires.insert(name.to_owned(), wire);
+    }
+    pub fn get_inner_wire(&self, name: &str) -> Option<InnerWire> {
+        self.wires.get(name).map(|x| *x)
+    }
+
+    pub fn add_cell(&mut self, name: &str, cell_type: &str) -> &mut CellInstantiation {
+        let cell = CellInstantiation {
+            cell_type: cell_type.to_owned(),
+            connections: HashMap::new(),
+        };
+        self.cells.insert(name.to_owned(), cell);
+        self.cells.get_mut(name).unwrap()
+    }
+    pub fn get_cell(&self, name: &str) -> Option<&CellInstantiation> {
+        self.cells.get(name)
+    }
+    pub fn get_cell_mut(&mut self, name: &str) -> Option<&mut CellInstantiation> {
+        self.cells.get_mut(name)
     }
 }
 
@@ -49,6 +99,8 @@ impl Db {
         let module = Module {
             name: name.to_owned(),
             ports: HashMap::new(),
+            wires: HashMap::new(),
+            cells: HashMap::new(),
         };
         let uuid = Uuid::new_v4();
         self.modules.insert(uuid, module);
