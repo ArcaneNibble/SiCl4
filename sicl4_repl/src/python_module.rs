@@ -17,6 +17,26 @@ impl Db {
         }
     }
 
+    #[staticmethod]
+    fn load_json(filename: &str) -> PyResult<Self> {
+        let file = File::open(filename)?;
+        let inner = sicl4_db::Db::load_json(file)
+            .map_err(|err| -> PyErr { PyIOError::new_err(format!("{}", err)) })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    #[staticmethod]
+    fn load_bson(filename: &str) -> PyResult<Self> {
+        let file = File::open(filename)?;
+        let inner = sicl4_db::Db::load_bson(file)
+            .map_err(|err| -> PyErr { PyIOError::new_err(format!("{}", err)) })?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
     fn save_json(&self, filename: &str) -> PyResult<()> {
         let file = File::create(filename)?;
         self.inner

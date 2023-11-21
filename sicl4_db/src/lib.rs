@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 
 use bson::SerializerOptions;
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,14 @@ impl Db {
         Self {
             test: "hello world".to_owned(),
         }
+    }
+
+    pub fn load_json<R: Read>(r: R) -> serde_json::Result<Self> {
+        serde_json::from_reader(r)
+    }
+
+    pub fn load_bson<R: Read>(r: R) -> bson::de::Result<Self> {
+        bson::from_reader(r)
     }
 
     pub fn save_json<W: Write>(&self, w: W) -> serde_json::Result<()> {
