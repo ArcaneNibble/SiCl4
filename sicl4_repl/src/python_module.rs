@@ -14,12 +14,15 @@ struct Module {
 
 #[pymethods]
 impl Module {
-    fn test(&self) {
+    fn add_port(&self, name: &str, width: Option<u64>) {
         Python::with_gil(|py| {
             let db_py = self.db.borrow(py);
-            let db = db_py.inner.read().unwrap();
-            let module = db.get_module(self.uuid).unwrap();
-            println!("test: module is {:?}", module);
+            let mut db = db_py.inner.write().unwrap();
+            let module = db.get_module_mut(self.uuid).unwrap();
+            let port = sicl4_db::Port {
+                width: width.unwrap_or(1),
+            };
+            module.add_port(name, port);
         })
     }
 }

@@ -7,9 +7,30 @@ use bson::SerializerOptions;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Port {
+    pub width: u64,
+}
+
+impl Default for Port {
+    fn default() -> Self {
+        Self { width: 1 }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Module {
     name: String,
+    ports: HashMap<String, Port>,
+}
+
+impl Module {
+    pub fn add_port(&mut self, name: &str, port: Port) {
+        self.ports.insert(name.to_owned(), port);
+    }
+    pub fn get_port(&self, name: &str) -> Option<Port> {
+        self.ports.get(name).map(|x| *x)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +48,7 @@ impl Db {
     pub fn add_module(&mut self, name: &str) -> (Uuid, &mut Module) {
         let module = Module {
             name: name.to_owned(),
+            ports: HashMap::new(),
         };
         let uuid = Uuid::new_v4();
         self.modules.insert(uuid, module);
