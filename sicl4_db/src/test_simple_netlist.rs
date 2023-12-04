@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 #[derive(Debug)]
 pub struct NetlistCell {
-    cell_type: Uuid,
+    pub cell_type: Uuid,
     connections: Vec<Option<Weak<RwLock<Wire>>>>,
 }
 
@@ -32,6 +32,15 @@ impl NetlistCell {
         let mut wire = wire_arc.write().unwrap();
         cell.connections[idx] = Some(wire_.clone());
         wire.sinks.push(self_.clone());
+    }
+
+    pub fn connect_bidir(self_: &Weak<RwLock<Self>>, idx: usize, wire_: &Weak<RwLock<Wire>>) {
+        let cell_arc = self_.upgrade().unwrap();
+        let mut cell = cell_arc.write().unwrap();
+        let wire_arc = wire_.upgrade().unwrap();
+        let mut wire = wire_arc.write().unwrap();
+        cell.connections[idx] = Some(wire_.clone());
+        wire.bidirs.push(self_.clone());
     }
 }
 
@@ -83,14 +92,9 @@ impl NetlistModule {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::Cell,
-        sync::{Arc, RwLock},
-    };
-
     use uuid::uuid;
 
-    use super::{NetlistCell, NetlistModule, Wire};
+    use super::{NetlistCell, NetlistModule};
 
     #[test]
     fn test_simple_netlist() {
