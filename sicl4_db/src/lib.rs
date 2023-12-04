@@ -7,6 +7,8 @@ use bson::SerializerOptions;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod test_simple_netlist;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Port {
     pub width: u64,
