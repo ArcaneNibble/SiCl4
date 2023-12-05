@@ -163,6 +163,7 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
+    use memory_stats::memory_stats;
     use rand::{Rng, SeedableRng};
     use uuid::uuid;
     use uuid::Uuid;
@@ -245,6 +246,7 @@ mod tests {
         let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(0);
 
         let start_create = Instant::now();
+        let start_mem = memory_stats().unwrap();
         for _ in 0..NLUTS {
             let lut = netlist.add_cell(TEST_LUT_UUID, 5);
             let outwire = netlist.add_wire();
@@ -265,7 +267,12 @@ mod tests {
             }
         }
         let create_duration = start_create.elapsed();
+        let create_mem = memory_stats().unwrap();
         println!("Creating netlist took {:?}", create_duration);
+        println!(
+            "Creating netlist took {:?} MB memory",
+            (create_mem.physical_mem - start_mem.physical_mem) as f64 / 1024.0 / 1024.0
+        );
 
         let workqueue = work_queue::Queue::new(NTHREADS, 128);
         {
@@ -348,7 +355,12 @@ mod tests {
             t.join().unwrap();
         }
         let mutate_duration = start_mutate.elapsed();
+        let mutate_ram = memory_stats().unwrap();
         println!("Mutating netlist took {:?}", mutate_duration);
+        println!(
+            "Final additional usage {:?} MB memory",
+            (mutate_ram.physical_mem - start_mem.physical_mem) as f64 / 1024.0 / 1024.0
+        );
         // dbg!(&netlist);
         // _debug_print_simple_netlist(&netlist);
     }
