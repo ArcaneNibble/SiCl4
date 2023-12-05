@@ -159,6 +159,7 @@ impl NetlistModule {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::Weak;
     use std::thread;
     use std::time::Instant;
 
@@ -199,7 +200,7 @@ mod tests {
         dbg!(&netlist);
     }
 
-    fn debug_print_simple_netlist(netlist: &NetlistModule) {
+    fn _debug_print_simple_netlist(netlist: &NetlistModule) {
         let cells = netlist.cells.read().unwrap();
         for cell in cells.iter() {
             let cell = cell.read().unwrap();
@@ -235,10 +236,10 @@ mod tests {
 
     #[test]
     fn bench_simple_netlist() {
-        const NLUTS: usize = 10;
+        const NLUTS: usize = 1_000_000;
         const AVG_FANIN: f64 = 3.0;
-        const N_INITIAL_WORK: usize = 1;
-        const NTHREADS: usize = 1;
+        const N_INITIAL_WORK: usize = 1000;
+        const NTHREADS: usize = 2;
 
         let netlist = Arc::new(NetlistModule::new());
         let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(0);
@@ -272,13 +273,13 @@ mod tests {
             for _ in 0..N_INITIAL_WORK {
                 let luti = rng.gen_range(0..NLUTS);
                 let lut = Arc::downgrade(&cells_rd[luti]);
-                println!("Initial work item: {}", luti);
+                // println!("Initial work item: {}", luti);
                 workqueue.push(lut);
             }
         }
 
         // dbg!(&netlist);
-        debug_print_simple_netlist(&netlist);
+        // _debug_print_simple_netlist(&netlist);
         let start_mutate = Instant::now();
         let thread_handles = workqueue
             .local_queues()
@@ -286,43 +287,58 @@ mod tests {
                 let netlist = netlist.clone();
                 thread::spawn(move || {
                     while let Some(cell) = local_queue.pop() {
-                        let outwire = {
-                            let cell_arc = cell.upgrade().unwrap();
-                            let mut cell_wr = cell_arc.write().unwrap();
-                            if cell_wr.visited_marker {
-                                continue;
-                            }
-                            cell_wr.visited_marker = true;
-                            // println!("debug: cell is {:?}", cell_wr);
+                        let cell_arc = cell.upgrade().unwrap();
+                        let mut cell_wr = cell_arc.write().unwrap();
+                        if cell_wr.visited_marker {
+                            continue;
+                        }
+                        cell_wr.visited_marker = true;
+                        // println!("debug: cell is {:?}", cell_wr);
 
-                            if cell_wr.cell_type == TEST_BUF_UUID {
-                                let inp_wire_ref = cell_wr.connections[0].as_ref().unwrap();
+                        if cell_wr.cell_type == TEST_BUF_UUID {
+                            let inp_wire_ref = cell_wr.connections[0].as_ref().unwrap();
+                            let inp_wire_arc = inp_wire_ref.upgrade().unwrap();
+                            let inp_wire = inp_wire_arc.read().unwrap();
+                            let driver_cell = &inp_wire.drivers[0];
+                            local_queue.push(driver_cell.clone());
+                            continue;
+                        }
+
+                        for i in 0..4 {
+                            if let Some(inp_wire_ref) = &cell_wr.connections[i] {
                                 let inp_wire_arc = inp_wire_ref.upgrade().unwrap();
                                 let inp_wire = inp_wire_arc.read().unwrap();
                                 let driver_cell = &inp_wire.drivers[0];
                                 local_queue.push(driver_cell.clone());
-                                continue;
                             }
+                        }
 
-                            for i in 0..4 {
-                                if let Some(inp_wire_ref) = &cell_wr.connections[i] {
-                                    let inp_wire_arc = inp_wire_ref.upgrade().unwrap();
-                                    let inp_wire = inp_wire_arc.read().unwrap();
-                                    let driver_cell = &inp_wire.drivers[0];
-                                    local_queue.push(driver_cell.clone());
-                                }
-                            }
+                        let outwire_ref = cell_wr.connections[4].as_ref().unwrap();
+                        let outwire_arc = outwire_ref.upgrade().unwrap();
+                        let mut outwire = outwire_arc.write().unwrap();
 
-                            cell_wr.connections[4].as_ref().unwrap().clone()
-                        };
+                        let added_buf_ref = netlist.add_cell(TEST_BUF_UUID, 2);
+                        let added_buf_arc = added_buf_ref.upgrade().unwrap();
+                        let mut added_buf = added_buf_arc.write().unwrap();
+                        let added_wire_ref = netlist.add_wire();
+                        let added_wire_arc = added_wire_ref.upgrade().unwrap();
+                        let mut added_wire = added_wire_arc.write().unwrap();
 
-                        let added_buf = netlist.add_cell(TEST_BUF_UUID, 2);
-                        let added_wire = netlist.add_wire();
+                        // xxx this is an ad-hoc clusterfuck
+                        let outwire_backlink_idx = outwire
+                            .drivers
+                            .iter()
+                            .position(|wire_to_cell| Weak::ptr_eq(&cell, wire_to_cell))
+                            .unwrap();
 
-                        NetlistCell::disconnect_driver(&cell, 4);
-                        NetlistCell::connect_driver(&cell, 4, &added_wire);
-                        NetlistCell::connect_sink(&added_buf, 0, &added_wire);
-                        NetlistCell::connect_driver(&added_buf, 1, &outwire);
+                        outwire.drivers[outwire_backlink_idx] = added_buf_ref.clone();
+                        added_buf.connections[1] = Some(outwire_ref.clone());
+
+                        added_buf.connections[0] = Some(added_wire_ref.clone());
+                        added_wire.sinks.push(added_buf_ref.clone());
+
+                        cell_wr.connections[4] = Some(added_wire_ref.clone());
+                        added_wire.drivers.push(cell);
                     }
                 })
             })
@@ -334,6 +350,6 @@ mod tests {
         let mutate_duration = start_mutate.elapsed();
         println!("Mutating netlist took {:?}", mutate_duration);
         // dbg!(&netlist);
-        debug_print_simple_netlist(&netlist);
+        // _debug_print_simple_netlist(&netlist);
     }
 }
