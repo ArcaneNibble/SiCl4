@@ -14,3 +14,4 @@ uuid = { version = "1.6", features = ["v4", "fast-rng", "serde"] }
 [dev-dependencies]
 rand = "0.8"
 rand_xorshift = "0.3"
+work-queue = "0.1.4"
