@@ -42,6 +42,54 @@ impl NetlistCell {
         cell.connections[idx] = Some(wire_.clone());
         wire.bidirs.push(self_.clone());
     }
+
+    pub fn disconnect_driver(self_: &Weak<RwLock<Self>>, idx: usize) {
+        let cell_arc = self_.upgrade().unwrap();
+        let mut cell = cell_arc.write().unwrap();
+
+        if let Some(wire_) = cell.connections[idx].take() {
+            let wire_arc = wire_.upgrade().unwrap();
+            let mut wire = wire_arc.write().unwrap();
+            let wire_to_cell_idx = wire
+                .drivers
+                .iter()
+                .position(|wire_to_cell| Weak::ptr_eq(self_, wire_to_cell))
+                .unwrap();
+            wire.drivers.swap_remove(wire_to_cell_idx);
+        }
+    }
+
+    pub fn disconnect_sink(self_: &Weak<RwLock<Self>>, idx: usize) {
+        let cell_arc = self_.upgrade().unwrap();
+        let mut cell = cell_arc.write().unwrap();
+
+        if let Some(wire_) = cell.connections[idx].take() {
+            let wire_arc = wire_.upgrade().unwrap();
+            let mut wire = wire_arc.write().unwrap();
+            let wire_to_cell_idx = wire
+                .sinks
+                .iter()
+                .position(|wire_to_cell| Weak::ptr_eq(self_, wire_to_cell))
+                .unwrap();
+            wire.sinks.swap_remove(wire_to_cell_idx);
+        }
+    }
+
+    pub fn disconnect_bidir(self_: &Weak<RwLock<Self>>, idx: usize) {
+        let cell_arc = self_.upgrade().unwrap();
+        let mut cell = cell_arc.write().unwrap();
+
+        if let Some(wire_) = cell.connections[idx].take() {
+            let wire_arc = wire_.upgrade().unwrap();
+            let mut wire = wire_arc.write().unwrap();
+            let wire_to_cell_idx = wire
+                .bidirs
+                .iter()
+                .position(|wire_to_cell| Weak::ptr_eq(self_, wire_to_cell))
+                .unwrap();
+            wire.bidirs.swap_remove(wire_to_cell_idx);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -93,8 +141,12 @@ impl NetlistModule {
 #[cfg(test)]
 mod tests {
     use uuid::uuid;
+    use uuid::Uuid;
 
     use super::{NetlistCell, NetlistModule};
+
+    const TEST_LUT_UUID: Uuid = uuid!("00000000-0000-0000-0000-000000000000");
+    const TEST_BUF_UUID: Uuid = uuid!("00000000-0000-0000-0000-000000000001");
 
     #[test]
     fn test_simple_netlist() {
@@ -103,8 +155,8 @@ mod tests {
         let wire1 = netlist.add_wire();
         let wire2 = netlist.add_wire();
 
-        let cell1 = netlist.add_cell(uuid!("00000000-0000-0000-0000-000000000000"), 2);
-        let cell2 = netlist.add_cell(uuid!("00000000-0000-0000-0000-000000000001"), 2);
+        let cell1 = netlist.add_cell(TEST_LUT_UUID, 2);
+        let cell2 = netlist.add_cell(TEST_BUF_UUID, 2);
 
         NetlistCell::connect_driver(&cell1, 0, &wire1);
         NetlistCell::connect_sink(&cell1, 1, &wire2);
@@ -112,6 +164,15 @@ mod tests {
         NetlistCell::connect_driver(&cell2, 0, &wire2);
         NetlistCell::connect_sink(&cell2, 1, &wire1);
 
-        dbg!(netlist);
+        dbg!(&netlist);
+
+        NetlistCell::disconnect_driver(&cell1, 0);
+        dbg!(&netlist);
+        NetlistCell::disconnect_driver(&cell2, 0);
+        dbg!(&netlist);
+        NetlistCell::disconnect_sink(&cell1, 1);
+        dbg!(&netlist);
+        NetlistCell::disconnect_sink(&cell2, 1);
+        dbg!(&netlist);
     }
 }
