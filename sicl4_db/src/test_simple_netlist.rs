@@ -140,6 +140,10 @@ impl NetlistModule {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use rand::{Rng, SeedableRng};
     use uuid::uuid;
     use uuid::Uuid;
 
@@ -174,5 +178,38 @@ mod tests {
         dbg!(&netlist);
         NetlistCell::disconnect_sink(&cell2, 1);
         dbg!(&netlist);
+    }
+
+    #[test]
+    fn bench_simple_netlist() {
+        const NLUTS: usize = 1000;
+        const AVG_FANIN: f64 = 3.0;
+
+        let netlist = NetlistModule::new();
+        let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(0);
+
+        let start_create = Instant::now();
+        for _ in 0..NLUTS {
+            let lut = netlist.add_cell(TEST_LUT_UUID, 5);
+            let outwire = netlist.add_wire();
+            NetlistCell::connect_driver(&lut, 4, &outwire);
+        }
+        {
+            let cells_wr = netlist.cells.write().unwrap();
+            let wires_rd = netlist.wires.read().unwrap();
+            for luti in 0..NLUTS {
+                let lut = &cells_wr[luti];
+                for inpi in 0..4 {
+                    if rng.gen::<f64>() < (AVG_FANIN / 4.0) {
+                        let inp_wire_i = rng.gen_range(0..NLUTS);
+                        let inp_wire = Arc::downgrade(&wires_rd[inp_wire_i]);
+                        NetlistCell::connect_sink(&Arc::downgrade(lut), inpi, &inp_wire);
+                    }
+                }
+            }
+        }
+        let create_duration = start_create.elapsed();
+        println!("Creating netlist took {:?}", create_duration);
+        // dbg!(&netlist);
     }
 }
