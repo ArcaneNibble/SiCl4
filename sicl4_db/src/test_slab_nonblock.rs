@@ -290,14 +290,14 @@ mod tests {
                         if cell_w.cell_type == TEST_BUF_UUID {
                             let inp_wire_i = cell_w.connections[0].unwrap();
                             let inp_wire_e = netlist.wires.get(inp_wire_i).unwrap();
-                            let inp_wire_w = inp_wire_e.try_read();
-                            if inp_wire_w.is_err() {
+                            let inp_wire_r = inp_wire_e.try_read();
+                            if inp_wire_r.is_err() {
                                 // dbg!("failed to grab inp wire for buf");
                                 local_queue.push(cell);
                                 continue;
                             }
-                            let inp_wire_w = inp_wire_w.unwrap();
-                            let driver_cell = inp_wire_w.drivers[0];
+                            let inp_wire_r = inp_wire_r.unwrap();
+                            let driver_cell = inp_wire_r.drivers[0];
 
                             cell_w.visited_marker = true;
                             local_queue.push(driver_cell);
@@ -313,15 +313,15 @@ mod tests {
                             if let Some(inp_wire_ref) = cell_w.connections[0] {
                                 if inp_wire_ref != outwire {
                                     inp_wire_0_e = Some(netlist.wires.get(inp_wire_ref).unwrap());
-                                    let inp_wire_w = inp_wire_0_e.as_ref().unwrap().try_read();
-                                    if inp_wire_w.is_err() {
+                                    let inp_wire_r = inp_wire_0_e.as_ref().unwrap().try_read();
+                                    if inp_wire_r.is_err() {
                                         // dbg!("failed to grab inp 0");
                                         local_queue.push(cell);
                                         continue;
                                     }
-                                    let inp_wire_w = inp_wire_w.unwrap();
+                                    let inp_wire_r = inp_wire_r.unwrap();
                                     // println!("grabbed wire {}", inp_wire_w.debug_id);
-                                    inp_wire_0_r = Some(inp_wire_w);
+                                    inp_wire_0_r = Some(inp_wire_r);
                                 }
                             }
                             let inp_wire_1_e;
@@ -329,15 +329,15 @@ mod tests {
                             if let Some(inp_wire_ref) = cell_w.connections[1] {
                                 if inp_wire_ref != outwire {
                                     inp_wire_1_e = Some(netlist.wires.get(inp_wire_ref).unwrap());
-                                    let inp_wire_w = inp_wire_1_e.as_ref().unwrap().try_read();
-                                    if inp_wire_w.is_err() {
+                                    let inp_wire_r = inp_wire_1_e.as_ref().unwrap().try_read();
+                                    if inp_wire_r.is_err() {
                                         // dbg!("failed to grab inp 1");
                                         local_queue.push(cell);
                                         continue;
                                     }
-                                    let inp_wire_w = inp_wire_w.unwrap();
+                                    let inp_wire_r = inp_wire_r.unwrap();
                                     // println!("grabbed wire {}", inp_wire_w.debug_id);
-                                    inp_wire_1_r = Some(inp_wire_w);
+                                    inp_wire_1_r = Some(inp_wire_r);
                                 }
                             }
                             let inp_wire_2_e;
@@ -345,15 +345,15 @@ mod tests {
                             if let Some(inp_wire_ref) = cell_w.connections[2] {
                                 if inp_wire_ref != outwire {
                                     inp_wire_2_e = Some(netlist.wires.get(inp_wire_ref).unwrap());
-                                    let inp_wire_w = inp_wire_2_e.as_ref().unwrap().try_read();
-                                    if inp_wire_w.is_err() {
+                                    let inp_wire_r = inp_wire_2_e.as_ref().unwrap().try_read();
+                                    if inp_wire_r.is_err() {
                                         // dbg!("failed to grab inp 2");
                                         local_queue.push(cell);
                                         continue;
                                     }
-                                    let inp_wire_w = inp_wire_w.unwrap();
+                                    let inp_wire_r = inp_wire_r.unwrap();
                                     // println!("grabbed wire {}", inp_wire_w.debug_id);
-                                    inp_wire_2_r = Some(inp_wire_w);
+                                    inp_wire_2_r = Some(inp_wire_r);
                                 }
                             }
                             let inp_wire_3_e;
@@ -361,15 +361,15 @@ mod tests {
                             if let Some(inp_wire_ref) = cell_w.connections[3] {
                                 if inp_wire_ref != outwire {
                                     inp_wire_3_e = Some(netlist.wires.get(inp_wire_ref).unwrap());
-                                    let inp_wire_w = inp_wire_3_e.as_ref().unwrap().try_read();
-                                    if inp_wire_w.is_err() {
+                                    let inp_wire_r = inp_wire_3_e.as_ref().unwrap().try_read();
+                                    if inp_wire_r.is_err() {
                                         // dbg!("failed to grab inp 3");
                                         local_queue.push(cell);
                                         continue;
                                     }
-                                    let inp_wire_w = inp_wire_w.unwrap();
+                                    let inp_wire_r = inp_wire_r.unwrap();
                                     // println!("grabbed wire {}", inp_wire_w.debug_id);
-                                    inp_wire_3_r = Some(inp_wire_w);
+                                    inp_wire_3_r = Some(inp_wire_r);
                                 }
                             }
 

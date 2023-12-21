@@ -364,4 +364,217 @@ mod tests {
         // dbg!(&netlist);
         // _debug_print_simple_netlist(&netlist);
     }
+
+    #[test]
+    fn bench_simple_nonblock_netlist() {
+        const NLUTS: usize = 1_000_000;
+        const AVG_FANIN: f64 = 3.0;
+        const N_INITIAL_WORK: usize = 1000;
+        const NTHREADS: usize = 2;
+
+        let netlist = Arc::new(NetlistModule::new());
+        let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(0);
+
+        let start_create = Instant::now();
+        let start_mem = memory_stats().unwrap();
+        for _ in 0..NLUTS {
+            let lut = netlist.add_cell(TEST_LUT_UUID, 5);
+            let outwire = netlist.add_wire();
+            NetlistCell::connect_driver(&lut, 4, &outwire);
+        }
+        {
+            let cells_wr = netlist.cells.write().unwrap();
+            let wires_rd = netlist.wires.read().unwrap();
+            for luti in 0..NLUTS {
+                let lut = &cells_wr[luti];
+                for inpi in 0..4 {
+                    if rng.gen::<f64>() < (AVG_FANIN / 4.0) {
+                        let inp_wire_i = rng.gen_range(0..NLUTS);
+                        let inp_wire = Arc::downgrade(&wires_rd[inp_wire_i]);
+                        NetlistCell::connect_sink(&Arc::downgrade(lut), inpi, &inp_wire);
+                    }
+                }
+            }
+        }
+        let create_duration = start_create.elapsed();
+        let create_mem = memory_stats().unwrap();
+        println!("Creating netlist took {:?}", create_duration);
+        println!(
+            "Creating netlist took {:?} MB memory",
+            (create_mem.physical_mem - start_mem.physical_mem) as f64 / 1024.0 / 1024.0
+        );
+
+        let workqueue = work_queue::Queue::new(NTHREADS, 128);
+        {
+            let cells_rd = netlist.cells.read().unwrap();
+            for _ in 0..N_INITIAL_WORK {
+                let luti = rng.gen_range(0..NLUTS);
+                let lut = Arc::downgrade(&cells_rd[luti]);
+                // println!("Initial work item: {}", luti);
+                workqueue.push(lut);
+            }
+        }
+
+        // dbg!(&netlist);
+        // _debug_print_simple_netlist(&netlist);
+        let start_mutate = Instant::now();
+        let thread_handles = workqueue
+            .local_queues()
+            .map(|mut local_queue| {
+                let netlist = netlist.clone();
+                thread::spawn(move || {
+                    while let Some(cell) = local_queue.pop() {
+                        let cell_arc = cell.upgrade().unwrap();
+                        let cell_wr = cell_arc.try_write();
+                        if cell_wr.is_err() {
+                            local_queue.push(cell);
+                            continue;
+                        }
+                        let mut cell_wr = cell_wr.unwrap();
+                        if cell_wr.visited_marker {
+                            continue;
+                        }
+
+                        if cell_wr.cell_type == TEST_BUF_UUID {
+                            let inp_wire_ref = cell_wr.connections[0].as_ref().unwrap();
+                            let inp_wire_arc = inp_wire_ref.upgrade().unwrap();
+                            let inp_wire_r = inp_wire_arc.try_read();
+                            if inp_wire_r.is_err() {
+                                local_queue.push(cell);
+                                continue;
+                            }
+                            let inp_wire_r = inp_wire_r.unwrap();
+                            let driver_cell = &inp_wire_r.drivers[0];
+
+                            cell_wr.visited_marker = true;
+                            local_queue.push(driver_cell.clone());
+                            continue;
+                        } else {
+                            // hack for self-loop
+                            let outwire_ref = cell_wr.connections[4].as_ref().unwrap();
+
+                            // grab input wires for read
+                            let inp_wire_0_arc;
+                            let mut inp_wire_0_r = None;
+                            if let Some(inp_wire_ref) = &cell_wr.connections[0] {
+                                if !Weak::ptr_eq(inp_wire_ref, outwire_ref) {
+                                    inp_wire_0_arc = inp_wire_ref.upgrade().unwrap();
+                                    let inp_wire_r = inp_wire_0_arc.try_read();
+                                    if inp_wire_r.is_err() {
+                                        local_queue.push(cell);
+                                        continue;
+                                    }
+                                    let inp_wire_r = inp_wire_r.unwrap();
+                                    inp_wire_0_r = Some(inp_wire_r);
+                                }
+                            }
+                            let inp_wire_1_arc;
+                            let mut inp_wire_1_r = None;
+                            if let Some(inp_wire_ref) = &cell_wr.connections[1] {
+                                if !Weak::ptr_eq(inp_wire_ref, outwire_ref) {
+                                    inp_wire_1_arc = inp_wire_ref.upgrade().unwrap();
+                                    let inp_wire_r = inp_wire_1_arc.try_read();
+                                    if inp_wire_r.is_err() {
+                                        local_queue.push(cell);
+                                        continue;
+                                    }
+                                    let inp_wire_r = inp_wire_r.unwrap();
+                                    inp_wire_1_r = Some(inp_wire_r);
+                                }
+                            }
+                            let inp_wire_2_arc;
+                            let mut inp_wire_2_r = None;
+                            if let Some(inp_wire_ref) = &cell_wr.connections[2] {
+                                if !Weak::ptr_eq(inp_wire_ref, outwire_ref) {
+                                    inp_wire_2_arc = inp_wire_ref.upgrade().unwrap();
+                                    let inp_wire_r = inp_wire_2_arc.try_read();
+                                    if inp_wire_r.is_err() {
+                                        local_queue.push(cell);
+                                        continue;
+                                    }
+                                    let inp_wire_r = inp_wire_r.unwrap();
+                                    inp_wire_2_r = Some(inp_wire_r);
+                                }
+                            }
+                            let inp_wire_3_arc;
+                            let mut inp_wire_3_r = None;
+                            if let Some(inp_wire_ref) = &cell_wr.connections[3] {
+                                if !Weak::ptr_eq(inp_wire_ref, outwire_ref) {
+                                    inp_wire_3_arc = inp_wire_ref.upgrade().unwrap();
+                                    let inp_wire_r = inp_wire_3_arc.try_read();
+                                    if inp_wire_r.is_err() {
+                                        local_queue.push(cell);
+                                        continue;
+                                    }
+                                    let inp_wire_r = inp_wire_r.unwrap();
+                                    inp_wire_3_r = Some(inp_wire_r);
+                                }
+                            }
+
+                            // grab output wire for write
+                            let outwire_arc = outwire_ref.upgrade().unwrap();
+                            let mut outwire = outwire_arc.write().unwrap();
+
+                            let added_buf_ref = netlist.add_cell(TEST_BUF_UUID, 2);
+                            let added_buf_arc = added_buf_ref.upgrade().unwrap();
+                            let mut added_buf = added_buf_arc.write().unwrap();
+                            let added_wire_ref = netlist.add_wire();
+                            let added_wire_arc = added_wire_ref.upgrade().unwrap();
+                            let mut added_wire = added_wire_arc.write().unwrap();
+
+                            // actual updates
+                            cell_wr.visited_marker = true;
+                            let outwire_ref = cell_wr.connections[4].as_ref().unwrap();
+
+                            if let Some(inp_wire_r) = inp_wire_0_r {
+                                let driver_cell = &inp_wire_r.drivers[0];
+                                local_queue.push(driver_cell.clone());
+                            }
+                            if let Some(inp_wire_r) = inp_wire_1_r {
+                                let driver_cell = &inp_wire_r.drivers[0];
+                                local_queue.push(driver_cell.clone());
+                            }
+                            if let Some(inp_wire_r) = inp_wire_2_r {
+                                let driver_cell = &inp_wire_r.drivers[0];
+                                local_queue.push(driver_cell.clone());
+                            }
+                            if let Some(inp_wire_r) = inp_wire_3_r {
+                                let driver_cell = &inp_wire_r.drivers[0];
+                                local_queue.push(driver_cell.clone());
+                            }
+
+                            // xxx this is an ad-hoc clusterfuck
+                            let outwire_backlink_idx = outwire
+                                .drivers
+                                .iter()
+                                .position(|wire_to_cell| Weak::ptr_eq(&cell, wire_to_cell))
+                                .unwrap();
+
+                            outwire.drivers[outwire_backlink_idx] = added_buf_ref.clone();
+                            added_buf.connections[1] = Some(outwire_ref.clone());
+
+                            added_buf.connections[0] = Some(added_wire_ref.clone());
+                            added_wire.sinks.push(added_buf_ref.clone());
+
+                            cell_wr.connections[4] = Some(added_wire_ref.clone());
+                            added_wire.drivers.push(cell);
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for t in thread_handles {
+            t.join().unwrap();
+        }
+        let mutate_duration = start_mutate.elapsed();
+        let mutate_ram = memory_stats().unwrap();
+        println!("Mutating netlist took {:?}", mutate_duration);
+        println!(
+            "Final additional usage {:?} MB memory",
+            (mutate_ram.physical_mem - start_mem.physical_mem) as f64 / 1024.0 / 1024.0
+        );
+        // dbg!(&netlist);
+        // _debug_print_simple_netlist(&netlist);
+    }
 }
