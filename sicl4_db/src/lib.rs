@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod test_simple_netlist;
+pub mod test_slab_nonblock;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Port {
