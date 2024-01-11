@@ -240,7 +240,7 @@ mod tests {
         const NLUTS: usize = 1_000_000;
         const AVG_FANIN: f64 = 3.0;
         const N_INITIAL_WORK: usize = 1000;
-        const NTHREADS: usize = 2;
+        const NTHREADS: usize = 4;
 
         let netlist = Arc::new(NetlistModule::new());
         let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(0);

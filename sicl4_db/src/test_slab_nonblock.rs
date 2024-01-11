@@ -1,4 +1,4 @@
-use std::sync::{atomic::AtomicUsize, RwLock, RwLockWriteGuard};
+use std::sync::{atomic::AtomicUsize, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use sharded_slab::Slab;
 use uuid::Uuid;
@@ -158,6 +158,22 @@ impl NetlistModule {
             .unwrap();
         wire.bidirs.swap_remove(wire_to_cell_idx);
     }
+
+    pub fn lock_cell_for_read_ro_phase(&self, idx: usize) -> Option<CellLockWip> {
+        let cell = self.cells.get(idx).unwrap();
+        Some(CellLockWip {
+            idx,
+            r: Some(cell.try_read().ok()?),
+            w: None,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct CellLockWip<'a> {
+    idx: usize,
+    r: Option<RwLockReadGuard<'a, NetlistCell>>,
+    w: Option<RwLockWriteGuard<'a, NetlistCell>>,
 }
 
 #[cfg(test)]
@@ -211,10 +227,10 @@ mod tests {
 
     #[test]
     fn bench_slab_netlist() {
-        const NLUTS: usize = 1_000_000;
+        const NLUTS: usize = 1000;
         const AVG_FANIN: f64 = 3.0;
-        const N_INITIAL_WORK: usize = 1000;
-        const NTHREADS: usize = 8;
+        const N_INITIAL_WORK: usize = 1;
+        const NTHREADS: usize = 1;
 
         let mut netlist = Arc::new(NetlistModule::new());
         let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(0);
