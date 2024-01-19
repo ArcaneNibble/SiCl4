@@ -22,6 +22,7 @@ const SEGMENT_LAYOUT: Layout = match Layout::from_size_align(SEGMENT_SZ, SEGMENT
     Err(_) => panic!("Invalid SEGMENT_SZ"),
 };
 const ALLOC_PAGE_SZ: usize = 64 * 1024;
+const PAGES_PER_SEG: usize = SEGMENT_SZ / ALLOC_PAGE_SZ;
 
 use std::{
     alloc::Layout,
@@ -29,6 +30,8 @@ use std::{
     mem::size_of,
     sync::atomic::{AtomicUsize, Ordering},
 };
+
+use crate::util::*;
 
 #[derive(Debug)]
 pub struct SlabAlloc<T: Send> {
@@ -76,8 +79,42 @@ impl<T: Send> SlabThreadState<T> {
 
             println!("Allocated segment @ {:?} owned by thread {}", seg, tid);
 
-            let _seg_hdr_size = size_of::<SlabSegmentHdr>();
-            println!("Segment header size is {}", _seg_hdr_size);
+            let seg_hdr_size = size_of::<SlabSegmentHdr>();
+            println!("Segment header size is {}", seg_hdr_size);
+
+            let block_with_t_layout = Layout::new::<SlabBlock<T>>().pad_to_align();
+            println!("Block type layout {:?}", block_with_t_layout);
+
+            let rounded_seg_hdr_sz = divroundup(seg_hdr_size, block_with_t_layout.align());
+
+            for page_i in 0..PAGES_PER_SEG {
+                let page_ptr = if page_i == 0 {
+                    (seg as *mut u8).offset(rounded_seg_hdr_sz as isize)
+                } else {
+                    (seg as *mut u8).offset((page_i * ALLOC_PAGE_SZ) as isize)
+                };
+                println!("Page {} addr is {:?}", page_i, page_ptr);
+
+                let num_objects = if page_i == 0 {
+                    (ALLOC_PAGE_SZ - rounded_seg_hdr_sz) / block_with_t_layout.size()
+                } else {
+                    ALLOC_PAGE_SZ / block_with_t_layout.size()
+                };
+                println!("\tfits {} objects", num_objects);
+
+                for obj_i in 0..(num_objects - 1) {
+                    let block_ptr =
+                        (page_ptr as *mut u8).offset((obj_i * block_with_t_layout.size()) as isize);
+                    let block_ptr = block_ptr as *mut SlabBlock<*mut SlabBlock<*mut ()>>;
+                    let next_block_ptr = (page_ptr as *mut u8)
+                        .offset(((obj_i + 1) * block_with_t_layout.size()) as isize);
+                    (*block_ptr).payload = next_block_ptr as *mut SlabBlock<*mut ()>;
+                }
+
+                (*seg).pages[page_i].this_free_list = page_ptr as *mut SlabBlock<*mut ()>;
+            }
+
+            print!("{}", _debug_hexdump(seg as *const u8, SEGMENT_SZ).unwrap());
 
             seg
         };
@@ -95,7 +132,7 @@ impl<T: Send> SlabThreadState<T> {
 #[derive(Debug)]
 pub struct SlabSegmentHdr {
     owning_tid: usize,
-    pages: [SlabSegmentPageMeta; SEGMENT_SZ / ALLOC_PAGE_SZ],
+    pages: [SlabSegmentPageMeta; PAGES_PER_SEG],
 }
 
 #[repr(C)]
@@ -137,7 +174,7 @@ mod tests {
 
     #[test]
     fn basic_single_thread_alloc() {
-        let alloc = SlabAlloc::<u32>::new();
+        let alloc = SlabAlloc::<u8>::new();
         let thread_shard = alloc.new_shard();
     }
 }
