@@ -16,18 +16,20 @@
 // FIXME: *const vs *mut variance???
 // FIXME: NotNull etc annotation?
 
-const SEGMENT_SZ: usize = 4 * 1024 * 1024;
+const SEGMENT_SZ: usize = 4 * 1024 * 1024; // 4 M
 const SEGMENT_LAYOUT: Layout = match Layout::from_size_align(SEGMENT_SZ, SEGMENT_SZ) {
     Ok(x) => x,
     Err(_) => panic!("Invalid SEGMENT_SZ"),
 };
-const ALLOC_PAGE_SZ: usize = 64 * 1024;
+const ALLOC_PAGE_SHIFT: usize = 16; // 64 K
+const ALLOC_PAGE_SZ: usize = 1 << ALLOC_PAGE_SHIFT;
 const PAGES_PER_SEG: usize = SEGMENT_SZ / ALLOC_PAGE_SZ;
 
 use std::{
     alloc::Layout,
     marker::PhantomData,
     mem::size_of,
+    ptr::{addr_of, addr_of_mut},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -71,7 +73,7 @@ pub struct SlabThreadState<T: Send> {
 unsafe impl<T: Send> Send for SlabThreadState<T> {}
 
 impl<T: Send> SlabThreadState<T> {
-    fn new(tid: usize) -> Self {
+    pub fn new(tid: usize) -> Self {
         let seg = unsafe {
             // xxx make really sure that allocating all-zeros won't make UB
             let seg = std::alloc::alloc_zeroed(SEGMENT_LAYOUT) as *mut SlabSegmentHdr;
@@ -114,7 +116,7 @@ impl<T: Send> SlabThreadState<T> {
                 (*seg).pages[page_i].this_free_list = page_ptr as *mut SlabBlock<*mut ()>;
             }
 
-            print!("{}", _debug_hexdump(seg as *const u8, SEGMENT_SZ).unwrap());
+            // print!("{}", _debug_hexdump(seg as *const u8, SEGMENT_SZ).unwrap());
 
             seg
         };
@@ -125,6 +127,48 @@ impl<T: Send> SlabThreadState<T> {
             segments_head: seg,
             _p: PhantomData,
         }
+    }
+
+    pub fn alloc(&mut self) -> *mut SlabBlock<T> {
+        unsafe {
+            let seg = self.segments_head;
+            // XXX search each page???
+            let page = addr_of_mut!((*seg).pages[0]);
+            // XXX wtf is going on with lifetimes?
+            let block_ptr = (*page).this_free_list;
+            if block_ptr.is_null() {
+                todo!()
+            }
+            let block_next = (*block_ptr).payload as *mut SlabBlock<*mut ()>;
+            (*page).this_free_list = block_next;
+            // XXX initialization halp
+            block_ptr as *mut SlabBlock<T>
+        }
+    }
+
+    pub unsafe fn free(&mut self, p: *mut SlabBlock<T>) {
+        let p_usz = p as usize;
+        let seg_usz = p_usz & !(SEGMENT_SZ - 1);
+        let seg = seg_usz as *mut SlabSegmentHdr;
+        let page_i = (p_usz - seg_usz) >> ALLOC_PAGE_SHIFT;
+
+        // we don't allow freeing null?
+
+        println!("Freeing {:?}", p);
+        println!("Seg is {:?}", seg);
+        println!("Page # {}", page_i);
+
+        if self.tid == (*seg).owning_tid {
+            // local free
+            let p_as_free = p as *mut SlabBlock<*mut SlabBlock<*mut ()>>;
+            (*p_as_free).payload = (*seg).pages[page_i].local_free_list;
+            (*seg).pages[page_i].local_free_list = p as *mut SlabBlock<*mut ()>;
+        } else {
+            // remote free
+            todo!()
+        }
+
+        print!("{}", _debug_hexdump(seg as *const u8, SEGMENT_SZ).unwrap());
     }
 }
 
@@ -175,6 +219,15 @@ mod tests {
     #[test]
     fn basic_single_thread_alloc() {
         let alloc = SlabAlloc::<u8>::new();
-        let thread_shard = alloc.new_shard();
+        let mut thread_shard = alloc.new_shard();
+        let obj_1 = thread_shard.alloc();
+        let obj_2 = thread_shard.alloc();
+        println!("Allocated obj 1 {:?}", obj_1);
+        println!("Allocated obj 2 {:?}", obj_2);
+
+        unsafe { thread_shard.free(obj_2) };
+        unsafe { thread_shard.free(obj_1) };
+
+        // XXX we should be testing things automatically and not with eyeballs
     }
 }
