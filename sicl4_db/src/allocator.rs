@@ -10,6 +10,7 @@ use std::{
     cell::Cell,
     marker::PhantomData,
     mem::{self, MaybeUninit},
+    ptr::addr_of,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -26,12 +27,14 @@ const MAX_THREADS: usize = 64;
 const _: () = assert!(MAX_THREADS <= 64);
 
 #[derive(Debug)]
+/// Slab allocator root object
 pub struct SlabRoot<'arena> {
     /// Bitfield, where a `1` bit in position `n` indicates that
     /// a [SlabThreadShard] has been handed out for the nth entry of
     /// [per_thread_state](Self::per_thread_state)
     /// (and it hasn't been dropped yet)
     thread_inuse: AtomicU64,
+    /// Actual storage for per-thread data
     per_thread_state: [SlabPerThreadState<'arena>; MAX_THREADS],
     /// Ensure `'arena` lifetime is invariant
     _p: PhantomData<Cell<&'arena ()>>,
@@ -40,6 +43,7 @@ pub struct SlabRoot<'arena> {
 unsafe impl<'arena> Sync for SlabRoot<'arena> {}
 
 impl<'arena> SlabRoot<'arena> {
+    /// Allocate a new root object for a slab memory allocator
     pub fn new() -> Self {
         // safety: standard array per-element init, where a MaybeUninit doesn't require init
         let mut per_thread_state: [MaybeUninit<SlabPerThreadState>; MAX_THREADS] =
@@ -49,7 +53,7 @@ impl<'arena> SlabRoot<'arena> {
         // (except corrected, see https://github.com/sebastiencs/shared-arena/issues/6)
         // in order to push the safety requirement down to SlabPerThreadState::init
         for i in 0..MAX_THREADS {
-            let _ = SlabPerThreadState::init(&mut per_thread_state[i]);
+            let _ = SlabPerThreadState::init(&mut per_thread_state[i], i as u64);
         }
 
         Self {
@@ -59,6 +63,9 @@ impl<'arena> SlabRoot<'arena> {
         }
     }
 
+    /// Get a handle on one per-thread shard of the slab
+    ///
+    /// Panics if [MAX_THREADS] is reached
     pub fn new_thread(&'arena self) -> SlabThreadShard<'arena> {
         let allocated_tid;
         // TODO: relax ordering
@@ -86,22 +93,37 @@ impl<'arena> SlabRoot<'arena> {
         }
 
         let thread_state = &self.per_thread_state[allocated_tid];
-        thread_state
+        let root_ptr = addr_of!(thread_state.root) as *mut Option<&'arena SlabRoot<'arena>>;
+        unsafe {
+            // safety: current thread now owns this slice of per_thread_state exclusively
+            (*root_ptr) = Some(self);
+        }
+        SlabThreadShard { x: thread_state }
     }
 }
 
 #[derive(Debug)]
+/// Slab allocator per-thread state (actual contents)
 pub struct SlabPerThreadState<'arena> {
-    _hack_for_tests_for_now: u8,
+    /// Identifies this thread
+    ///
+    /// Current impl: bit position in the [SlabRoot::thread_inuse] bitfield
+    tid: u64,
+    /// Pointer to the [SlabRoot] this belongs to
+    ///
+    /// Can be removed if `offset_of!` gets stabilized
+    root: Option<&'arena SlabRoot<'arena>>,
     /// Ensure `'arena` lifetime is invariant
     _p: PhantomData<Cell<&'arena ()>>,
 }
 
 impl<'arena> SlabPerThreadState<'arena> {
-    pub fn init(self_: &mut MaybeUninit<Self>) -> &mut Self {
+    /// Initialize state
+    pub fn init(self_: &mut MaybeUninit<Self>, tid: u64) -> &mut Self {
         unsafe {
             let p = self_.as_mut_ptr();
-            (*p)._hack_for_tests_for_now = 0;
+            (*p).tid = tid;
+            (*p).root = None;
             (*p)._p = PhantomData;
             // safety: we initialized everything
             &mut *p
@@ -109,7 +131,19 @@ impl<'arena> SlabPerThreadState<'arena> {
     }
 }
 
-type SlabThreadShard<'arena> = &'arena SlabPerThreadState<'arena>;
+/// Handle to a per-thread shard of an allocator
+pub struct SlabThreadShard<'arena> {
+    x: &'arena SlabPerThreadState<'arena>,
+}
+
+impl<'arena> Drop for SlabThreadShard<'arena> {
+    fn drop(&mut self) {
+        let root = self.x.root.unwrap();
+        let mask = !(1 << self.x.tid);
+        // TODO: relax ordering
+        root.thread_inuse.fetch_and(mask, Ordering::SeqCst);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -133,12 +167,32 @@ mod tests {
         let shard1 = slab.new_thread();
         assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b1);
         unsafe {
-            assert_eq!(slab.per_thread_state.as_ptr().offset(0), shard1 as *const _);
+            assert_eq!(
+                slab.per_thread_state.as_ptr().offset(0),
+                shard1.x as *const _
+            );
         }
         let shard2 = slab.new_thread();
         assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b11);
         unsafe {
-            assert_eq!(slab.per_thread_state.as_ptr().offset(1), shard2 as *const _);
+            assert_eq!(
+                slab.per_thread_state.as_ptr().offset(1),
+                shard2.x as *const _
+            );
+        }
+
+        // drop the lower one
+        drop(shard1);
+        assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b10);
+
+        // this should allocate in its place
+        let shard1_2 = slab.new_thread();
+        assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b11);
+        unsafe {
+            assert_eq!(
+                slab.per_thread_state.as_ptr().offset(0),
+                shard1_2.x as *const _
+            );
         }
     }
 }
