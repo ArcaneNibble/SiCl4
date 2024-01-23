@@ -5,15 +5,153 @@
 //! crate, which is in turn inspired by the
 //! [Mimalloc](https://www.microsoft.com/en-us/research/uploads/prod/2019/06/mimalloc-tr-v1.pdf)
 //! allocator from Microsoft Research.
-//!
+
+use std::{
+    cell::Cell,
+    marker::PhantomData,
+    mem::{self, MaybeUninit},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+/// Absolute maximum number of threads that can be supported.
+///
+/// The reason that this is not dynamic is because the "root" state needs
+/// to store per-thread data and then hand out references to it.
+/// If this were stored in a `Vec` then reallocating the backing store
+/// will invalidate the references that have been handed out.
+/// This can be replaced with something like the `elsa` crate if necessary.
+///
+/// Currently limited to 64 so that a u64 atomic bitfield can be used
+const MAX_THREADS: usize = 64;
+const _: () = assert!(MAX_THREADS <= 64);
+
+#[derive(Debug)]
+pub struct SlabRoot<'arena> {
+    /// Bitfield, where a `1` bit in position `n` indicates that
+    /// a [SlabThreadShard] has been handed out for the nth entry of
+    /// [per_thread_state](Self::per_thread_state)
+    /// (and it hasn't been dropped yet)
+    thread_inuse: AtomicU64,
+    per_thread_state: [SlabPerThreadState<'arena>; MAX_THREADS],
+    /// Ensure `'arena` lifetime is invariant
+    _p: PhantomData<Cell<&'arena ()>>,
+}
+// safety: we carefully use atomic operations on thread_inuse
+unsafe impl<'arena> Sync for SlabRoot<'arena> {}
+
+impl<'arena> SlabRoot<'arena> {
+    pub fn new() -> Self {
+        // safety: standard array per-element init, where a MaybeUninit doesn't require init
+        let mut per_thread_state: [MaybeUninit<SlabPerThreadState>; MAX_THREADS] =
+            unsafe { MaybeUninit::uninit().assume_init() };
+
+        // use the trick from the shared-arena crate
+        // (except corrected, see https://github.com/sebastiencs/shared-arena/issues/6)
+        // in order to push the safety requirement down to SlabPerThreadState::init
+        for i in 0..MAX_THREADS {
+            let _ = SlabPerThreadState::init(&mut per_thread_state[i]);
+        }
+
+        Self {
+            thread_inuse: AtomicU64::new(0),
+            per_thread_state: unsafe { mem::transmute(per_thread_state) },
+            _p: PhantomData,
+        }
+    }
+
+    pub fn new_thread(&'arena self) -> SlabThreadShard<'arena> {
+        let allocated_tid;
+        // TODO: relax ordering
+        let mut old_inuse = self.thread_inuse.load(Ordering::SeqCst);
+        loop {
+            let next_tid = old_inuse.trailing_ones();
+            if next_tid as usize >= MAX_THREADS {
+                panic!("No more threads allowed!");
+            }
+            let new_inuse = old_inuse | (1 << next_tid);
+            match self.thread_inuse.compare_exchange_weak(
+                old_inuse,
+                new_inuse,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    allocated_tid = next_tid as usize;
+                    break;
+                }
+                Err(x) => {
+                    old_inuse = x;
+                }
+            }
+        }
+
+        let thread_state = &self.per_thread_state[allocated_tid];
+        thread_state
+    }
+}
+
+#[derive(Debug)]
+pub struct SlabPerThreadState<'arena> {
+    _hack_for_tests_for_now: u8,
+    /// Ensure `'arena` lifetime is invariant
+    _p: PhantomData<Cell<&'arena ()>>,
+}
+
+impl<'arena> SlabPerThreadState<'arena> {
+    pub fn init(self_: &mut MaybeUninit<Self>) -> &mut Self {
+        unsafe {
+            let p = self_.as_mut_ptr();
+            (*p)._hack_for_tests_for_now = 0;
+            (*p)._p = PhantomData;
+            // safety: we initialized everything
+            &mut *p
+        }
+    }
+}
+
+type SlabThreadShard<'arena> = &'arena SlabPerThreadState<'arena>;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::SlabRoot;
+
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    #[test]
+    fn ensure_slab_root_send_sync() {
+        assert_send::<SlabRoot<'_>>();
+        assert_sync::<SlabRoot<'_>>();
+    }
+
+    #[test]
+    fn slab_root_new_thread() {
+        let slab = SlabRoot::new();
+
+        let shard1 = slab.new_thread();
+        assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b1);
+        unsafe {
+            assert_eq!(slab.per_thread_state.as_ptr().offset(0), shard1 as *const _);
+        }
+        let shard2 = slab.new_thread();
+        assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b11);
+        unsafe {
+            assert_eq!(slab.per_thread_state.as_ptr().offset(1), shard2 as *const _);
+        }
+    }
+}
+
+/*//!
 //! There are a number of relatively-minor changes made relative to the
 //! `sharded_slab` crate, but the most significant change is that the code
 //! here has tighter integration between memory allocation and object locking.
 //! Some notes as to why have been written
 //! [here](https://arcanenibble.github.io/drafts/parallel-capable-netlist-data-structures-part-2.html)
-//! (TODO CHANGE THIS WHEN PUBLISHED).
+//! (TODO CHANGE THIS WHEN PUBLISHED).*/
 
-// FIXME: *const vs *mut variance???
+/*// FIXME: *const vs *mut variance???
 // FIXME: NotNull etc annotation?
 
 const SEGMENT_SZ: usize = 4 * 1024 * 1024; // 4 M
@@ -231,3 +369,4 @@ mod tests {
         // XXX we should be testing things automatically and not with eyeballs
     }
 }
+*/
