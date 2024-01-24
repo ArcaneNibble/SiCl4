@@ -186,10 +186,12 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
 
     /// Allocate a new segment, link it into segments list,
     /// and make it the head of the pages list
-    fn new_seg(&'arena self) {
+    fn new_seg(&'arena self, link: Option<&'arena SlabSegmentPageMeta<'arena, T>>) {
+        println!("new seg");
         let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
         let old_seg_head = self.segments.take();
         let new_seg = unsafe {
+            (*new_seg).pages[PAGES_PER_SEG - 1].next_page = link;
             (*new_seg).next = old_seg_head;
             &*new_seg
         };
@@ -200,14 +202,34 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
     /// Allocation slow path
     ///
     /// Returns a block, which must be free and ready for use
-    fn alloc_slow(&'arena self) -> &'arena SlabFreeBlock<'arena> {
-        let mut page = self.pages.get().unwrap();
+    fn alloc_slow(
+        &'arena self,
+    ) -> (
+        &'arena SlabSegmentPageMeta<'arena, T>,
+        &'arena SlabFreeBlock<'arena>,
+    ) {
+        println!("slow path");
+        // TODO: page is full, do full list stuff?
+        let first_page = self.pages.get().unwrap();
+        let mut page = first_page;
         loop {
+            println!("looking at page {:?}", page as *const _);
             page.collect_free_lists();
             if page.this_free_list.get().is_some() {
-                return page.this_free_list.get().unwrap();
+                println!("page has free");
+                return (page, page.this_free_list.get().unwrap());
             } else {
-                todo!()
+                // TODO rotate page ist
+                match page.next_page {
+                    Some(next_page) => page = next_page,
+                    None => {
+                        self.new_seg(Some(first_page));
+                        return (
+                            self.pages.get().unwrap(),
+                            self.pages.get().unwrap().this_free_list.get().unwrap(),
+                        );
+                    }
+                }
             }
         }
     }
@@ -219,13 +241,13 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
         // XXX we now have one more branch vs msft
         if self.pages.get().is_none() {
             // need to allocate a new segment
-            self.new_seg();
+            self.new_seg(None);
         }
 
-        let page = self.pages.get().unwrap();
-        let block = page.this_free_list.get();
-        let block = match block {
-            Some(x) => x, // fast path
+        let fast_page = self.pages.get().unwrap();
+        let fast_block = fast_page.this_free_list.get();
+        let (page, block) = match fast_block {
+            Some(x) => (fast_page, x), // fast path
             None => self.alloc_slow(),
         };
         page.this_free_list.set(block.next);
@@ -414,11 +436,15 @@ impl<'arena, T> SlabSegmentPageMeta<'arena, T> {
     }
 
     pub fn collect_free_lists(&'arena self) {
-        // this thread
-        debug_assert!(self.this_free_list.get().is_none());
+        if self.this_free_list.get().is_some() {
+            // don't actually do anything if there are blocks free
+            return;
+        }
+
+        // collect this thread
         let mut our_free_list = self.local_free_list.take();
 
-        // other threads
+        // collect other threads
         let mut prev_remote_free = self.remote_free_list.load(Ordering::SeqCst);
         loop {
             match self.remote_free_list.compare_exchange_weak(
@@ -748,5 +774,17 @@ mod tests {
             obj_2_2nd_try as *const _ as usize,
             obj_2 as *const _ as usize
         );
+    }
+
+    #[test]
+    fn slab_test_new_seg() {
+        let alloc = SlabRoot::<[u8; 30000]>::new();
+        let thread_shard = alloc.new_thread();
+        let mut things = Vec::new();
+        for i in 0..129 {
+            let obj = thread_shard.0.alloc();
+            println!("Allocated obj {:3} {:?}", i, obj as *const _);
+            things.push(obj);
+        }
     }
 }
