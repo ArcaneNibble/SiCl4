@@ -136,13 +136,13 @@ impl<'arena, T> SlabRoot<'arena, T> {
             // safety: current thread now owns this slice of per_thread_state exclusively
             (*root_ptr) = Some(self);
         }
-        SlabThreadShard { x: thread_state }
+        SlabThreadShard(thread_state)
     }
 }
 
 #[derive(Debug)]
 /// Slab allocator per-thread state (actual contents)
-struct SlabPerThreadState<'arena, T> {
+pub struct SlabPerThreadState<'arena, T> {
     /// Identifies this thread
     ///
     /// Current impl: bit position in the [SlabRoot::thread_inuse] bitfield
@@ -174,26 +174,34 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
             &mut *p
         }
     }
+
+    /// Allocates an object from this shard
+    ///
+    /// Does *NOT* initialize any of the resulting memory
+    pub fn alloc(&'arena self) -> &'arena SlabBlock<'arena, T> {
+        todo!()
+    }
 }
 
 /// Handle to a per-thread shard of an allocator
-pub struct SlabThreadShard<'arena, T> {
-    x: &'arena SlabPerThreadState<'arena, T>,
-}
+pub struct SlabThreadShard<'arena, T>(pub &'arena SlabPerThreadState<'arena, T>);
 
 impl<'arena, T> Drop for SlabThreadShard<'arena, T> {
     fn drop(&mut self) {
-        let root = self.x.root.unwrap();
-        let mask = !(1 << self.x.tid);
+        let root = self.0.root.unwrap();
+        let mask = !(1 << self.0.tid);
         // TODO: relax ordering
         root.thread_inuse.fetch_and(mask, Ordering::SeqCst);
     }
 }
 
+/// Header for each (4 M) segment
 #[repr(C)]
 #[derive(Debug)]
 struct SlabSegmentHdr<'arena, T> {
+    /// Thread that created this segment and owns its "local" data
     owning_tid: u64,
+    /// Metadata for each page within the segment
     pages: [SlabSegmentPageMeta<'arena, T>; PAGES_PER_SEG],
     _p: PhantomData<T>,
 }
@@ -260,12 +268,19 @@ impl<'arena, T> SlabSegmentHdr<'arena, T> {
     }
 }
 
+/// Metadata for each (64 K) page.
+///
+/// Note that this is not stored *in* the page, but in the segment header.
 #[repr(C)]
 #[derive(Debug)]
 struct SlabSegmentPageMeta<'arena, T> {
+    /// Linked list of pages
     next_page: Option<&'arena SlabSegmentPageMeta<'arena, T>>,
+    /// List that we allocate from in the fast path
     this_free_list: Option<&'arena SlabFreeBlock<'arena>>,
+    /// List that we free to from the same thread
     local_free_list: Option<&'arena SlabFreeBlock<'arena>>,
+    /// List that other threads free onto
     remote_free_list: Option<&'arena SlabFreeBlock<'arena>>,
     _p: PhantomData<T>, // FIXME what does "covariant (with drop check)" mean?
 }
@@ -322,9 +337,9 @@ impl<'arena, T> SlabSegmentPageMeta<'arena, T> {
 
 /// A slab block (used to ensure size/align for free chain)
 #[repr(C)]
-union SlabBlock<'arena, T> {
+pub union SlabBlock<'arena, T> {
     free: SlabFreeBlock<'arena>,
-    alloced: ManuallyDrop<T>,
+    alloced: ManuallyDrop<MaybeUninit<T>>,
 }
 
 /// Contents of a slab block when it is free (i.e. free chain)
@@ -389,7 +404,7 @@ mod tests {
         unsafe {
             assert_eq!(
                 slab.per_thread_state.as_ptr().offset(0),
-                shard1.x as *const _
+                shard1.0 as *const _
             );
         }
         let shard2 = slab.new_thread();
@@ -397,7 +412,7 @@ mod tests {
         unsafe {
             assert_eq!(
                 slab.per_thread_state.as_ptr().offset(1),
-                shard2.x as *const _
+                shard2.0 as *const _
             );
         }
 
@@ -411,7 +426,7 @@ mod tests {
         unsafe {
             assert_eq!(
                 slab.per_thread_state.as_ptr().offset(0),
-                shard1_2.x as *const _
+                shard1_2.0 as *const _
             );
         }
     }
