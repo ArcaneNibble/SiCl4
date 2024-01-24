@@ -184,6 +184,34 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
         }
     }
 
+    /// Allocate a new segment, link it into segments list,
+    /// and make it the head of the pages list
+    fn new_seg(&'arena self) {
+        let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
+        let old_seg_head = self.segments.take();
+        let new_seg = unsafe {
+            (*new_seg).next = old_seg_head;
+            &*new_seg
+        };
+        self.segments.set(Some(new_seg));
+        self.pages.set(Some(&new_seg.pages[0]));
+    }
+
+    /// Allocation slow path
+    ///
+    /// Returns a block, which must be free and ready for use
+    fn alloc_slow(&'arena self) -> &'arena SlabFreeBlock<'arena> {
+        let mut page = self.pages.get().unwrap();
+        loop {
+            page.collect_free_lists();
+            if page.this_free_list.get().is_some() {
+                return page.this_free_list.get().unwrap();
+            } else {
+                todo!()
+            }
+        }
+    }
+
     /// Allocates an object from this shard
     ///
     /// Does *NOT* initialize any of the resulting memory
@@ -191,23 +219,15 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
         // XXX we now have one more branch vs msft
         if self.pages.get().is_none() {
             // need to allocate a new segment
-            let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
-            let old_seg_head = self.segments.take();
-            let new_seg = unsafe {
-                (*new_seg).next = old_seg_head;
-                &*new_seg
-            };
-            self.segments.set(Some(new_seg));
-            self.pages.set(Some(&new_seg.pages[0]));
+            self.new_seg();
         }
 
         let page = self.pages.get().unwrap();
         let block = page.this_free_list.get();
-        if block.is_none() {
-            // slow path
-            todo!()
-        }
-        let block = block.unwrap();
+        let block = match block {
+            Some(x) => x, // fast path
+            None => self.alloc_slow(),
+        };
         page.this_free_list.set(block.next);
         unsafe {
             // safety: just coercing to a repr(C) union reference
@@ -236,6 +256,7 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
                 .set(Some(mem::transmute(obj)));
         } else {
             // remote free
+            // TODO: full list
             let page = &seg.pages[page_i];
             let mut prev_remote_free = page.remote_free_list.load(Ordering::SeqCst);
             loop {
@@ -390,6 +411,52 @@ impl<'arena, T> SlabSegmentPageMeta<'arena, T> {
 
         let block_0_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, 0) as *const _;
         (*self_).this_free_list.set(Some(&*block_0_ptr));
+    }
+
+    pub fn collect_free_lists(&'arena self) {
+        // this thread
+        debug_assert!(self.this_free_list.get().is_none());
+        let mut our_free_list = self.local_free_list.take();
+
+        // other threads
+        let mut prev_remote_free = self.remote_free_list.load(Ordering::SeqCst);
+        loop {
+            match self.remote_free_list.compare_exchange_weak(
+                prev_remote_free,
+                ptr::null_mut(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(x) => prev_remote_free = x,
+            }
+        }
+
+        if !prev_remote_free.is_null() {
+            // append to end of our free list
+            if our_free_list.is_none() {
+                // only remote free, none of ours
+                self.this_free_list.set(Some(unsafe {
+                    // safety: these blocks should definitely belong to our allocation
+                    // assuming we didn't mess up
+                    &*prev_remote_free
+                }));
+            } else {
+                while our_free_list.unwrap().next.is_some() {
+                    our_free_list = our_free_list.unwrap().next;
+                }
+                unsafe {
+                    // safety: these blocks should definitely belong to our allocation
+                    // assuming we didn't mess up. we can't data race on next because
+                    // current thread owns all of the local free list
+                    let next = addr_of!(our_free_list.unwrap().next);
+                    *(next as *mut _) = Some(&*prev_remote_free);
+                }
+                self.this_free_list.set(our_free_list);
+            }
+        } else {
+            self.this_free_list.set(our_free_list);
+        }
     }
 }
 
@@ -598,5 +665,88 @@ mod tests {
                 obj_2 as *const _ as usize
             );
         }
+    }
+
+    #[test]
+    fn slab_test_collect_local() {
+        let alloc = SlabRoot::<[u8; 30000]>::new();
+        let thread_shard = alloc.new_thread();
+        let obj_1 = thread_shard.0.alloc();
+        let obj_2 = thread_shard.0.alloc();
+        println!("Allocated obj 1 {:?}", obj_1 as *const _);
+        println!("Allocated obj 2 {:?}", obj_2 as *const _);
+
+        unsafe { thread_shard.0.free(obj_1) };
+        unsafe { thread_shard.0.free(obj_2) };
+
+        let obj_1_2nd_try = thread_shard.0.alloc();
+        let obj_2_2nd_try = thread_shard.0.alloc();
+        println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
+        println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
+
+        assert_eq!(
+            obj_1_2nd_try as *const _ as usize,
+            obj_2 as *const _ as usize
+        );
+        assert_eq!(
+            obj_2_2nd_try as *const _ as usize,
+            obj_1 as *const _ as usize
+        );
+    }
+
+    #[test]
+    fn slab_test_collect_remote() {
+        let alloc = SlabRoot::<[u8; 30000]>::new();
+        let thread_shard_0 = alloc.new_thread();
+        let obj_1 = thread_shard_0.0.alloc();
+        let obj_2 = thread_shard_0.0.alloc();
+        println!("Allocated obj 1 {:?}", obj_1 as *const _);
+        println!("Allocated obj 2 {:?}", obj_2 as *const _);
+
+        let thread_shard_1 = alloc.new_thread();
+        unsafe { thread_shard_1.0.free(obj_1) };
+        unsafe { thread_shard_1.0.free(obj_2) };
+
+        let obj_1_2nd_try = thread_shard_0.0.alloc();
+        let obj_2_2nd_try = thread_shard_0.0.alloc();
+        println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
+        println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
+
+        assert_eq!(
+            obj_1_2nd_try as *const _ as usize,
+            obj_2 as *const _ as usize
+        );
+        assert_eq!(
+            obj_2_2nd_try as *const _ as usize,
+            obj_1 as *const _ as usize
+        );
+    }
+
+    #[test]
+    fn slab_test_collect_both() {
+        let alloc = SlabRoot::<[u8; 30000]>::new();
+        let thread_shard_0 = alloc.new_thread();
+        let obj_1 = thread_shard_0.0.alloc();
+        let obj_2 = thread_shard_0.0.alloc();
+        println!("Allocated obj 1 {:?}", obj_1 as *const _);
+        println!("Allocated obj 2 {:?}", obj_2 as *const _);
+
+        let thread_shard_1 = alloc.new_thread();
+        unsafe { thread_shard_0.0.free(obj_1) };
+        unsafe { thread_shard_1.0.free(obj_2) };
+
+        let obj_1_2nd_try = thread_shard_0.0.alloc();
+        let obj_2_2nd_try = thread_shard_0.0.alloc();
+        println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
+        println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
+
+        assert_eq!(
+            obj_1_2nd_try as *const _ as usize,
+            obj_1 as *const _ as usize
+        );
+        assert_eq!(
+            obj_2_2nd_try as *const _ as usize,
+            obj_2 as *const _ as usize
+        );
     }
 }
