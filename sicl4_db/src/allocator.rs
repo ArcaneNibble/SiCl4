@@ -71,7 +71,7 @@ const fn num_that_fits(layout: Layout, tot_sz: usize) -> usize {
 
 #[derive(Debug)]
 /// Slab allocator root object
-pub struct SlabRoot<'arena, T> {
+pub struct SlabRoot<'arena, T: Send> {
     /// Bitfield, where a `1` bit in position `n` indicates that
     /// a [SlabThreadShard] has been handed out for the nth entry of
     /// [per_thread_state](Self::per_thread_state)
@@ -83,9 +83,9 @@ pub struct SlabRoot<'arena, T> {
     _p: PhantomData<Cell<&'arena ()>>,
 }
 // safety: we carefully use atomic operations on thread_inuse
-unsafe impl<'arena, T> Sync for SlabRoot<'arena, T> {}
+unsafe impl<'arena, T: Send> Sync for SlabRoot<'arena, T> {}
 
-impl<'arena, T> SlabRoot<'arena, T> {
+impl<'arena, T: Send> SlabRoot<'arena, T> {
     /// Allocate a new root object for a slab memory allocator
     pub fn new() -> Self {
         // safety: standard array per-element init, where a MaybeUninit doesn't require init
@@ -147,7 +147,7 @@ impl<'arena, T> SlabRoot<'arena, T> {
 
 #[derive(Debug)]
 /// Slab allocator per-thread state (actual contents)
-pub struct SlabPerThreadState<'arena, T> {
+pub struct SlabPerThreadState<'arena, T: Send> {
     /// Identifies this thread
     ///
     /// Current impl: bit position in the [SlabRoot::thread_inuse] bitfield
@@ -162,17 +162,9 @@ pub struct SlabPerThreadState<'arena, T> {
     pages: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
     /// Pointer to end of (non-full, TODO) page list
     last_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
-    /// Ensure `'arena` lifetime is invariant
-    _p: PhantomData<Cell<&'arena ()>>,
-    // XXX
-    _p2: PhantomData<T>,
 }
-// safety: we carefully use atomic operations on FIXME,
-// and everything else is owned by one specific thread
-// (which is guarded by SlabRoot::thread_inuse)
-unsafe impl<'arena, T> Sync for SlabPerThreadState<'arena, T> {}
 
-impl<'arena, T> SlabPerThreadState<'arena, T> {
+impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
     /// Initialize state
     pub fn init(self_: &mut MaybeUninit<Self>, tid: u64) -> &mut Self {
         unsafe {
@@ -190,7 +182,6 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
     /// Allocate a new segment, link it into segments list,
     /// and make it the head of the pages list
     fn new_seg(&'arena self, link: Option<&'arena SlabSegmentPageMeta<'arena, T>>) {
-        println!("new seg");
         let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
         let old_seg_head = self.segments.take();
         let new_seg = unsafe {
@@ -211,18 +202,14 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
         &'arena SlabSegmentPageMeta<'arena, T>,
         &'arena SlabFreeBlock<'arena>,
     ) {
-        println!("slow path");
         // TODO: page is full, do full list stuff?
         let first_page = self.pages.get().unwrap();
         let mut page = first_page;
         let mut prev_page = None;
         let mut prev_page_next_ptr = self.pages.as_ptr();
         loop {
-            println!("looking at page {:?}", page as *const _);
             page.collect_free_lists();
             if page.this_free_list.get().is_some() {
-                println!("page has free");
-
                 if page as *const _ != first_page {
                     // rotate the page search list
                     unsafe {
@@ -326,9 +313,11 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
 }
 
 /// Handle to a per-thread shard of an allocator
-pub struct SlabThreadShard<'arena, T>(pub &'arena SlabPerThreadState<'arena, T>);
+pub struct SlabThreadShard<'arena, T: Send>(pub &'arena SlabPerThreadState<'arena, T>);
+// fixme document why this should be allowed
+unsafe impl<'arena, T: Send> Send for SlabThreadShard<'arena, T> {}
 
-impl<'arena, T> Drop for SlabThreadShard<'arena, T> {
+impl<'arena, T: Send> Drop for SlabThreadShard<'arena, T> {
     fn drop(&mut self) {
         let root = self.0.root.unwrap();
         let mask = !(1 << self.0.tid);
@@ -340,21 +329,16 @@ impl<'arena, T> Drop for SlabThreadShard<'arena, T> {
 /// Header for each (4 M) segment
 #[repr(C)]
 #[derive(Debug)]
-struct SlabSegmentHdr<'arena, T> {
+struct SlabSegmentHdr<'arena, T: Send> {
     /// Thread that created this segment and owns its "local" data
     owning_tid: u64,
     /// List of segments (all owned by this thread)
     next: Option<&'arena SlabSegmentHdr<'arena, T>>,
     /// Metadata for each page within the segment
     pages: [SlabSegmentPageMeta<'arena, T>; PAGES_PER_SEG],
-    _p: PhantomData<T>,
 }
-// safety: we carefully use atomic operations on FIXME,
-// and everything else is owned by one specific thread
-// (which is guarded by SlabRoot::thread_inuse)
-unsafe impl<'arena, T> Sync for SlabSegmentHdr<'arena, T> {}
 
-impl<'arena, T> SlabSegmentHdr<'arena, T> {
+impl<'arena, T: Send> SlabSegmentHdr<'arena, T> {
     pub fn alloc_new_seg(owning_tid: u64) -> *mut Self {
         unsafe {
             let seg = alloc::alloc_zeroed(SEGMENT_LAYOUT) as *mut Self;
@@ -412,7 +396,7 @@ impl<'arena, T> SlabSegmentHdr<'arena, T> {
 /// Note that this is not stored *in* the page, but in the segment header.
 #[repr(C)]
 #[derive(Debug)]
-struct SlabSegmentPageMeta<'arena, T> {
+struct SlabSegmentPageMeta<'arena, T: Send> {
     /// Linked list of pages
     next_page: Option<&'arena SlabSegmentPageMeta<'arena, T>>,
     /// List that we allocate from in the fast path
@@ -423,12 +407,12 @@ struct SlabSegmentPageMeta<'arena, T> {
     remote_free_list: AtomicPtr<SlabFreeBlock<'arena>>,
     _p: PhantomData<T>, // FIXME what does "covariant (with drop check)" mean?
 }
-// safety: we carefully use atomic operations on FIXME,
+// safety: we carefully use atomic operations on remote_free_list,
 // and everything else is owned by one specific thread
 // (which is guarded by SlabRoot::thread_inuse)
-unsafe impl<'arena, T> Sync for SlabSegmentPageMeta<'arena, T> {}
+unsafe impl<'arena, T: Send> Sync for SlabSegmentPageMeta<'arena, T> {}
 
-impl<'arena, T> SlabSegmentPageMeta<'arena, T> {
+impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
     pub unsafe fn init_page(
         self_: *mut Self,
         seg_ptr: *const SlabSegmentHdr<'arena, T>,
