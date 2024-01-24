@@ -17,8 +17,8 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     mem::{self, size_of, ManuallyDrop, MaybeUninit},
-    ptr::{addr_of, addr_of_mut},
-    sync::atomic::{AtomicU64, Ordering},
+    ptr::{self, addr_of, addr_of_mut},
+    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
 
 use crate::util::divroundup;
@@ -227,10 +227,6 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
 
         // we don't allow freeing null?
 
-        println!("Freeing 0x{:x}", obj_ptr);
-        println!("Seg is 0x{:x}", seg_ptr);
-        println!("Page # {}", page_i);
-
         if self.tid == (*seg).owning_tid {
             // local free
             let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
@@ -240,7 +236,21 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
                 .set(Some(mem::transmute(obj)));
         } else {
             // remote free
-            todo!()
+            let page = &seg.pages[page_i];
+            let mut prev_remote_free = page.remote_free_list.load(Ordering::SeqCst);
+            loop {
+                let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
+                (*obj_mut).free.next = Some(&*prev_remote_free);
+                match page.remote_free_list.compare_exchange_weak(
+                    prev_remote_free,
+                    obj_ptr as _,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(x) => prev_remote_free = x,
+                }
+            }
         }
     }
 }
@@ -288,11 +298,6 @@ impl<'arena, T> SlabSegmentHdr<'arena, T> {
                     (*seg).pages[i].next_page = Some(&*next_page_meta_ptr);
                 }
             }
-
-            println!(
-                "Allocated segment @ {:?} owned by thread {}",
-                seg, owning_tid
-            );
 
             // safety: we initialized everything
             seg
@@ -345,7 +350,7 @@ struct SlabSegmentPageMeta<'arena, T> {
     /// List that we free to from the same thread
     local_free_list: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
     /// List that other threads free onto
-    remote_free_list: Option<&'arena SlabFreeBlock<'arena>>,
+    remote_free_list: AtomicPtr<SlabFreeBlock<'arena>>,
     _p: PhantomData<T>, // FIXME what does "covariant (with drop check)" mean?
 }
 // safety: we carefully use atomic operations on FIXME,
@@ -558,6 +563,38 @@ mod tests {
             // XXX this makes an awful pointer/usize cast
             assert_eq!(
                 *(seg.pages[0].local_free_list.get().unwrap() as *const _ as *const usize),
+                obj_2 as *const _ as usize
+            );
+        }
+    }
+
+    #[test]
+    fn slab_basic_fake_remote_free() {
+        let alloc = SlabRoot::<u8>::new();
+        let thread_shard_0 = alloc.new_thread();
+        let obj_1 = thread_shard_0.0.alloc();
+        let obj_2 = thread_shard_0.0.alloc();
+        println!("Allocated obj 1 {:?}", obj_1 as *const _);
+        println!("Allocated obj 2 {:?}", obj_2 as *const _);
+
+        let thread_shard_1 = alloc.new_thread();
+        unsafe { thread_shard_1.0.free(obj_2) };
+        unsafe { thread_shard_1.0.free(obj_1) };
+
+        unsafe {
+            let seg = thread_shard_0.0.segments.get().unwrap();
+            print!(
+                "{}",
+                _debug_hexdump(seg as *const _ as *const u8, ALLOC_PAGE_SZ).unwrap()
+            );
+
+            assert_eq!(
+                seg.pages[0].remote_free_list.load(Ordering::SeqCst) as usize,
+                obj_1 as *const _ as usize
+            );
+            // XXX this makes an awful pointer/usize cast
+            assert_eq!(
+                *(seg.pages[0].remote_free_list.load(Ordering::SeqCst) as *const usize),
                 obj_2 as *const _ as usize
             );
         }
