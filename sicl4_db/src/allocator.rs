@@ -17,6 +17,7 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     mem::{self, size_of, ManuallyDrop, MaybeUninit},
+    ops::Deref,
     ptr::{self, addr_of, addr_of_mut},
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
@@ -228,7 +229,6 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
 
                 return (page, page.this_free_list.get().unwrap());
             } else {
-                // TODO rotate page ist
                 match page.next_page {
                     Some(next_page) => {
                         prev_page_next_ptr = &page.next_page as *const _ as *mut _;
@@ -313,9 +313,27 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
 }
 
 /// Handle to a per-thread shard of an allocator
-pub struct SlabThreadShard<'arena, T: Send>(pub &'arena SlabPerThreadState<'arena, T>);
-// fixme document why this should be allowed
+///
+/// The only way to get one of these is to go through [SlabRoot::new_thread],
+/// which ensures that at most one `SlabThreadShard` exists for each
+/// `SlabPerThreadState`. This means that whoever has access to this handle
+/// effectively has exclusive access to the per-thread state (except fields
+/// that are explicitly managed with atomics).
+///
+/// It is *not* allowed for a raw `&'arena SlabPerThreadState<'arena, T>`
+/// to escape from this module. Allowing this can cause data races.
+pub struct SlabThreadShard<'arena, T: Send>(&'arena SlabPerThreadState<'arena, T>);
+// safety: this is effectively an exclusive handle that also doesn't
+// hold on to any data that depends on the lifetype of the current thread.
 unsafe impl<'arena, T: Send> Send for SlabThreadShard<'arena, T> {}
+
+impl<'arena, T: Send> Deref for SlabThreadShard<'arena, T> {
+    type Target = &'arena SlabPerThreadState<'arena, T>;
+
+    fn deref<'guard>(&'guard self) -> &'guard &'arena SlabPerThreadState<'arena, T> {
+        &self.0
+    }
+}
 
 impl<'arena, T: Send> Drop for SlabThreadShard<'arena, T> {
     fn drop(&mut self) {
@@ -566,7 +584,7 @@ mod tests {
         unsafe {
             assert_eq!(
                 slab.per_thread_state.as_ptr().offset(0),
-                shard1.0 as *const _
+                *shard1 as *const _
             );
         }
         let shard2 = slab.new_thread();
@@ -574,7 +592,7 @@ mod tests {
         unsafe {
             assert_eq!(
                 slab.per_thread_state.as_ptr().offset(1),
-                shard2.0 as *const _
+                *shard2 as *const _
             );
         }
 
@@ -588,7 +606,7 @@ mod tests {
         unsafe {
             assert_eq!(
                 slab.per_thread_state.as_ptr().offset(0),
-                shard1_2.0 as *const _
+                *shard1_2 as *const _
             );
         }
     }
@@ -648,18 +666,18 @@ mod tests {
     fn slab_basic_single_thread_alloc() {
         let alloc = SlabRoot::<u8>::new();
         let thread_shard = alloc.new_thread();
-        let obj_1 = thread_shard.0.alloc();
-        let obj_2 = thread_shard.0.alloc();
+        let obj_1 = thread_shard.alloc();
+        let obj_2 = thread_shard.alloc();
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         assert_eq!(obj_1 as *const _ as usize + 8, obj_2 as *const _ as usize);
 
-        unsafe { thread_shard.0.free(obj_2) };
-        unsafe { thread_shard.0.free(obj_1) };
+        unsafe { thread_shard.free(obj_2) };
+        unsafe { thread_shard.free(obj_1) };
 
         unsafe {
-            let seg = thread_shard.0.segments.get().unwrap();
+            let seg = thread_shard.segments.get().unwrap();
             assert_eq!(
                 seg.pages[0].local_free_list.get().unwrap() as *const _ as usize,
                 obj_1 as *const _ as usize
@@ -676,17 +694,17 @@ mod tests {
     fn slab_basic_fake_remote_free() {
         let alloc = SlabRoot::<u8>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.0.alloc();
-        let obj_2 = thread_shard_0.0.alloc();
+        let obj_1 = thread_shard_0.alloc();
+        let obj_2 = thread_shard_0.alloc();
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         let thread_shard_1 = alloc.new_thread();
-        unsafe { thread_shard_1.0.free(obj_2) };
-        unsafe { thread_shard_1.0.free(obj_1) };
+        unsafe { thread_shard_1.free(obj_2) };
+        unsafe { thread_shard_1.free(obj_1) };
 
         unsafe {
-            let seg = thread_shard_0.0.segments.get().unwrap();
+            let seg = thread_shard_0.segments.get().unwrap();
             print!(
                 "{}",
                 _debug_hexdump(seg as *const _ as *const u8, ALLOC_PAGE_SZ).unwrap()
@@ -708,16 +726,16 @@ mod tests {
     fn slab_test_collect_local() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
         let thread_shard = alloc.new_thread();
-        let obj_1 = thread_shard.0.alloc();
-        let obj_2 = thread_shard.0.alloc();
+        let obj_1 = thread_shard.alloc();
+        let obj_2 = thread_shard.alloc();
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
-        unsafe { thread_shard.0.free(obj_1) };
-        unsafe { thread_shard.0.free(obj_2) };
+        unsafe { thread_shard.free(obj_1) };
+        unsafe { thread_shard.free(obj_2) };
 
-        let obj_1_2nd_try = thread_shard.0.alloc();
-        let obj_2_2nd_try = thread_shard.0.alloc();
+        let obj_1_2nd_try = thread_shard.alloc();
+        let obj_2_2nd_try = thread_shard.alloc();
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -735,17 +753,17 @@ mod tests {
     fn slab_test_collect_remote() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.0.alloc();
-        let obj_2 = thread_shard_0.0.alloc();
+        let obj_1 = thread_shard_0.alloc();
+        let obj_2 = thread_shard_0.alloc();
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         let thread_shard_1 = alloc.new_thread();
-        unsafe { thread_shard_1.0.free(obj_1) };
-        unsafe { thread_shard_1.0.free(obj_2) };
+        unsafe { thread_shard_1.free(obj_1) };
+        unsafe { thread_shard_1.free(obj_2) };
 
-        let obj_1_2nd_try = thread_shard_0.0.alloc();
-        let obj_2_2nd_try = thread_shard_0.0.alloc();
+        let obj_1_2nd_try = thread_shard_0.alloc();
+        let obj_2_2nd_try = thread_shard_0.alloc();
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -763,17 +781,17 @@ mod tests {
     fn slab_test_collect_both() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.0.alloc();
-        let obj_2 = thread_shard_0.0.alloc();
+        let obj_1 = thread_shard_0.alloc();
+        let obj_2 = thread_shard_0.alloc();
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         let thread_shard_1 = alloc.new_thread();
-        unsafe { thread_shard_0.0.free(obj_1) };
-        unsafe { thread_shard_1.0.free(obj_2) };
+        unsafe { thread_shard_0.free(obj_1) };
+        unsafe { thread_shard_1.free(obj_2) };
 
-        let obj_1_2nd_try = thread_shard_0.0.alloc();
-        let obj_2_2nd_try = thread_shard_0.0.alloc();
+        let obj_1_2nd_try = thread_shard_0.alloc();
+        let obj_2_2nd_try = thread_shard_0.alloc();
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -793,20 +811,20 @@ mod tests {
         let thread_shard = alloc.new_thread();
         let mut things = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard.0.alloc();
+            let obj = thread_shard.alloc();
             println!("Allocated obj {:3} {:?}", i, obj as *const _);
             things.push(obj);
         }
 
         for i in 0..129 {
             let obj = things[i];
-            unsafe { thread_shard.0.free(obj) };
+            unsafe { thread_shard.free(obj) };
             println!("Freed obj {:3}", i);
         }
 
         let mut things2 = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard.0.alloc();
+            let obj = thread_shard.alloc();
             println!("Allocated obj {:3} again {:?}", i, obj as *const _);
             things2.push(obj);
         }
