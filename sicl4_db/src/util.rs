@@ -1,7 +1,8 @@
 use std::{fmt, fmt::Write};
 
+/// Divide, rounding up
 pub const fn divroundup(num: usize, divisor: usize) -> usize {
-    ((num + divisor - 1) / divisor) * divisor
+    (num + divisor - 1) / divisor
 }
 
 pub unsafe fn _debug_hexdump(p: *const u8, mut sz: usize) -> Result<String, fmt::Error> {
@@ -45,8 +46,8 @@ mod tests {
     #[test]
     fn divroundup_test() {
         assert_eq!(divroundup(0, 4), 0);
-        assert_eq!(divroundup(4, 4), 4);
-        assert_eq!(divroundup(5, 4), 8);
+        assert_eq!(divroundup(4, 4), 1);
+        assert_eq!(divroundup(5, 4), 2);
     }
 
     #[test]
