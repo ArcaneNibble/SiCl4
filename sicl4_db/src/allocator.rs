@@ -517,7 +517,7 @@ impl<'arena, T> SlabSegmentPageMeta<'arena, T> {
 #[repr(C)]
 pub union SlabBlock<'arena, T> {
     free: SlabFreeBlock<'arena>,
-    alloced: ManuallyDrop<MaybeUninit<T>>,
+    pub alloced: ManuallyDrop<MaybeUninit<T>>,
 }
 
 /// Contents of a slab block when it is free (i.e. free chain)
