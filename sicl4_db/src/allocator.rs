@@ -5,6 +5,11 @@
 //! crate, which is in turn inspired by the
 //! [Mimalloc](https://www.microsoft.com/en-us/research/uploads/prod/2019/06/mimalloc-tr-v1.pdf)
 //! allocator from Microsoft Research.
+//!
+//! This code has tighter integration between memory allocation and object locking.
+//! Some notes as to why have been written
+//! [here](https://arcanenibble.github.io/drafts/parallel-capable-netlist-data-structures-part-2.html)
+//! (TODO CHANGE THIS WHEN PUBLISHED).
 
 use std::{
     alloc::{self, Layout},
@@ -152,7 +157,9 @@ pub struct SlabPerThreadState<'arena, T> {
     /// Can be removed if `offset_of!` gets stabilized
     root: Option<&'arena SlabRoot<'arena, T>>,
     /// Pointer to segment list (used for global ops) TODO
-    // _segments: Option<&'arena SlabSegmentHdr<'arena, T>>,
+    segments: Cell<Option<&'arena SlabSegmentHdr<'arena, T>>>,
+    /// Pointer to head of (non-full, TODO) page list
+    pages: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
     /// Ensure `'arena` lifetime is invariant
     _p: PhantomData<Cell<&'arena ()>>,
     // XXX
@@ -170,6 +177,8 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
             let p = self_.as_mut_ptr();
             (*p).tid = tid;
             (*p).root = None;
+            (*p).segments = Cell::new(None);
+            (*p).pages = Cell::new(None);
             // safety: we initialized everything
             &mut *p
         }
@@ -179,7 +188,60 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
     ///
     /// Does *NOT* initialize any of the resulting memory
     pub fn alloc(&'arena self) -> &'arena SlabBlock<'arena, T> {
-        todo!()
+        // XXX we now have one more branch vs msft
+        if self.pages.get().is_none() {
+            // need to allocate a new segment
+            let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
+            let old_seg_head = self.segments.take();
+            let new_seg = unsafe {
+                (*new_seg).next = old_seg_head;
+                &*new_seg
+            };
+            self.segments.set(Some(new_seg));
+            self.pages.set(Some(&new_seg.pages[0]));
+        }
+
+        let page = self.pages.get().unwrap();
+        let block = page.this_free_list.get();
+        if block.is_none() {
+            // slow path
+            todo!()
+        }
+        let block = block.unwrap();
+        page.this_free_list.set(block.next);
+        unsafe {
+            // safety: just coercing to a repr(C) union reference
+            mem::transmute(block)
+        }
+    }
+
+    /// Deallocates an object
+    ///
+    /// Object must be part of this slab, not already be freed,
+    /// and no other references may exist after calling free
+    pub unsafe fn free(&'arena self, obj: &'arena SlabBlock<'arena, T>) {
+        let obj_ptr = obj as *const _ as usize;
+        let seg_ptr = obj_ptr & !(SEGMENT_SZ - 1);
+        let seg = &*(seg_ptr as *const SlabSegmentHdr<'arena, T>);
+        let page_i = (obj_ptr - seg_ptr) >> ALLOC_PAGE_SHIFT;
+
+        // we don't allow freeing null?
+
+        println!("Freeing 0x{:x}", obj_ptr);
+        println!("Seg is 0x{:x}", seg_ptr);
+        println!("Page # {}", page_i);
+
+        if self.tid == (*seg).owning_tid {
+            // local free
+            let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
+            (*obj_mut).free.next = seg.pages[page_i].local_free_list.get();
+            seg.pages[page_i]
+                .local_free_list
+                .set(Some(mem::transmute(obj)));
+        } else {
+            // remote free
+            todo!()
+        }
     }
 }
 
@@ -201,6 +263,8 @@ impl<'arena, T> Drop for SlabThreadShard<'arena, T> {
 struct SlabSegmentHdr<'arena, T> {
     /// Thread that created this segment and owns its "local" data
     owning_tid: u64,
+    /// List of segments (all owned by this thread)
+    next: Option<&'arena SlabSegmentHdr<'arena, T>>,
     /// Metadata for each page within the segment
     pages: [SlabSegmentPageMeta<'arena, T>; PAGES_PER_SEG],
     _p: PhantomData<T>,
@@ -217,7 +281,7 @@ impl<'arena, T> SlabSegmentHdr<'arena, T> {
             (*seg).owning_tid = owning_tid;
 
             for i in 0..PAGES_PER_SEG {
-                SlabSegmentPageMeta::init_page(addr_of_mut!((*seg).pages[i]));
+                SlabSegmentPageMeta::init_page(addr_of_mut!((*seg).pages[i]), seg, i);
                 if i != PAGES_PER_SEG - 1 {
                     let next_page_meta_ptr = addr_of_mut!((*seg).pages[i + 1]);
                     // reborrowing is safe because we *never* make &mut
@@ -277,21 +341,27 @@ struct SlabSegmentPageMeta<'arena, T> {
     /// Linked list of pages
     next_page: Option<&'arena SlabSegmentPageMeta<'arena, T>>,
     /// List that we allocate from in the fast path
-    this_free_list: Option<&'arena SlabFreeBlock<'arena>>,
+    this_free_list: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
     /// List that we free to from the same thread
-    local_free_list: Option<&'arena SlabFreeBlock<'arena>>,
+    local_free_list: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
     /// List that other threads free onto
     remote_free_list: Option<&'arena SlabFreeBlock<'arena>>,
     _p: PhantomData<T>, // FIXME what does "covariant (with drop check)" mean?
 }
+// safety: we carefully use atomic operations on FIXME,
+// and everything else is owned by one specific thread
+// (which is guarded by SlabRoot::thread_inuse)
+unsafe impl<'arena, T> Sync for SlabSegmentPageMeta<'arena, T> {}
 
 impl<'arena, T> SlabSegmentPageMeta<'arena, T> {
-    pub unsafe fn init_page(self_: *mut Self) {
+    pub unsafe fn init_page(
+        self_: *mut Self,
+        seg_ptr: *const SlabSegmentHdr<'arena, T>,
+        page_i: usize,
+    ) {
         // XXX makes assumptions about niche optimization and layout of Option<&_>
 
         // don't need to init much of the meta, but here we set up the free chain of the blocks themselves
-        let (seg_ptr, page_i) = Self::get_seg_i_ptr(self_);
-        let seg_ptr = seg_ptr as *const SlabSegmentHdr<'arena, T>;
         let start_unusable = if page_i == 0 {
             SlabSegmentHdr::<T>::get_hdr_rounded_sz()
         } else {
@@ -314,24 +384,7 @@ impl<'arena, T> SlabSegmentPageMeta<'arena, T> {
         }
 
         let block_0_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, 0) as *const _;
-        (*self_).this_free_list = Some(&*block_0_ptr);
-    }
-
-    #[inline]
-    pub fn get_seg_i_ptr(self_: *const Self) -> (*const (), usize) {
-        let seg_ptr = ((self_ as usize) & !(SEGMENT_SZ - 1)) as *const SlabSegmentHdr<'_, T>;
-        let page_i = unsafe {
-            // safety: contiguous array, so we satisfy all the requirements
-            let pages_base_ptr = addr_of!((*seg_ptr).pages[0]);
-            self_.offset_from(pages_base_ptr) as usize
-        };
-        (seg_ptr as _, page_i)
-    }
-
-    #[inline]
-    pub fn get_seg_i(&'arena self) -> (&'arena SlabSegmentHdr<'arena, T>, usize) {
-        let (seg, i) = Self::get_seg_i_ptr(self);
-        unsafe { (&*(seg as *const _), i) }
+        (*self_).this_free_list.set(Some(&*block_0_ptr));
     }
 }
 
@@ -480,190 +533,33 @@ mod tests {
             SlabSegmentHdr::get_addr_of_block(x, 63, 1) as usize,
             (x as usize) + ALLOC_PAGE_SZ * 63 + 8
         );
-
-        // page meta -> seg
-        unsafe {
-            assert_eq!(
-                {
-                    let (out_seg, out_i) =
-                        SlabSegmentPageMeta::get_seg_i_ptr(addr_of!((*x).pages[0]));
-                    (out_seg as _, out_i)
-                },
-                (x, 0)
-            );
-            assert_eq!(
-                {
-                    let (out_seg, out_i) =
-                        SlabSegmentPageMeta::get_seg_i_ptr(addr_of!((*x).pages[1]));
-                    (out_seg as _, out_i)
-                },
-                (x, 1)
-            );
-            assert_eq!(
-                {
-                    let (out_seg, out_i) =
-                        SlabSegmentPageMeta::get_seg_i_ptr(addr_of!((*x).pages[63]));
-                    (out_seg as _, out_i)
-                },
-                (x, 63)
-            );
-        }
     }
-}
-
-/*//!
-//! There are a number of relatively-minor changes made relative to the
-//! `sharded_slab` crate, but the most significant change is that the code
-//! here has tighter integration between memory allocation and object locking.
-//! Some notes as to why have been written
-//! [here](https://arcanenibble.github.io/drafts/parallel-capable-netlist-data-structures-part-2.html)
-//! (TODO CHANGE THIS WHEN PUBLISHED).*/
-
-/*// FIXME: *const vs *mut variance???
-// FIXME: NotNull etc annotation?
-
-
-use std::{
-    alloc::Layout,
-    marker::PhantomData,
-    mem::size_of,
-    ptr::{addr_of, addr_of_mut},
-    sync::atomic::{AtomicUsize, Ordering},
-};
-
-use crate::util::*;
-
-#[derive(Debug)]
-pub struct SlabAlloc<T: Send> {
-    next_tid: AtomicUsize,
-    _p: PhantomData<T>,
-}
-
-impl<T: Send> SlabAlloc<T> {
-    pub fn new() -> Self {
-        let _t_layout = Layout::new::<T>().pad_to_align();
-        // TODO: checks that this will work okay
-
-        Self {
-            next_tid: AtomicUsize::new(0),
-            _p: PhantomData,
-        }
-    }
-
-    pub fn new_shard(&self) -> SlabThreadState<T> {
-        let new_tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
-        // TODO(?): panic on tid overflow
-        SlabThreadState::new(new_tid)
-    }
-}
-
-// XXX didn't necessarily think this through always?
-unsafe impl<T: Send> Sync for SlabAlloc<T> {}
-
-#[derive(Debug)]
-pub struct SlabThreadState<T: Send> {
-    tid: usize,
-    alloc_generation: usize,
-    segments_head: *mut SlabSegmentHdr,
-    _p: PhantomData<T>,
-}
-
-unsafe impl<T: Send> Send for SlabThreadState<T> {}
-
-impl<T: Send> SlabThreadState<T> {
-    pub fn new(tid: usize) -> Self {
-        let seg = unsafe {
-            // xxx make really sure that allocating all-zeros won't make UB
-            let seg = std::alloc::alloc_zeroed(SEGMENT_LAYOUT) as *mut SlabSegmentHdr;
-            (*seg).owning_tid = tid;
-
-            let block_with_t_layout = Layout::new::<SlabBlock<T>>().pad_to_align();
-            println!("Block type layout {:?}", block_with_t_layout);
-
-            let rounded_seg_hdr_sz = divroundup(seg_hdr_size, block_with_t_layout.align());
-
-            for page_i in 0..PAGES_PER_SEG {
-            }
-
-            // print!("{}", _debug_hexdump(seg as *const u8, SEGMENT_SZ).unwrap());
-
-            seg
-        };
-
-        Self {
-            tid,
-            alloc_generation: 0,
-            segments_head: seg,
-            _p: PhantomData,
-        }
-    }
-
-    pub fn alloc(&mut self) -> *mut SlabBlock<T> {
-        unsafe {
-            let seg = self.segments_head;
-            // XXX search each page???
-            let page = addr_of_mut!((*seg).pages[0]);
-            // XXX wtf is going on with lifetimes?
-            let block_ptr = (*page).this_free_list;
-            if block_ptr.is_null() {
-                todo!()
-            }
-            let block_next = (*block_ptr).payload as *mut SlabBlock<*mut ()>;
-            (*page).this_free_list = block_next;
-            // XXX initialization halp
-            block_ptr as *mut SlabBlock<T>
-        }
-    }
-
-    pub unsafe fn free(&mut self, p: *mut SlabBlock<T>) {
-        let p_usz = p as usize;
-        let seg_usz = p_usz & !(SEGMENT_SZ - 1);
-        let seg = seg_usz as *mut SlabSegmentHdr;
-        let page_i = (p_usz - seg_usz) >> ALLOC_PAGE_SHIFT;
-
-        // we don't allow freeing null?
-
-        println!("Freeing {:?}", p);
-        println!("Seg is {:?}", seg);
-        println!("Page # {}", page_i);
-
-        if self.tid == (*seg).owning_tid {
-            // local free
-            let p_as_free = p as *mut SlabBlock<*mut SlabBlock<*mut ()>>;
-            (*p_as_free).payload = (*seg).pages[page_i].local_free_list;
-            (*seg).pages[page_i].local_free_list = p as *mut SlabBlock<*mut ()>;
-        } else {
-            // remote free
-            todo!()
-        }
-
-        print!("{}", _debug_hexdump(seg as *const u8, SEGMENT_SZ).unwrap());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-
-    use std::cell::UnsafeCell;
-
-    use super::*;
-
 
     #[test]
-    fn basic_single_thread_alloc() {
-        let alloc = SlabAlloc::<u8>::new();
-        let mut thread_shard = alloc.new_shard();
-        let obj_1 = thread_shard.alloc();
-        let obj_2 = thread_shard.alloc();
-        println!("Allocated obj 1 {:?}", obj_1);
-        println!("Allocated obj 2 {:?}", obj_2);
+    fn slab_basic_single_thread_alloc() {
+        let alloc = SlabRoot::<u8>::new();
+        let thread_shard = alloc.new_thread();
+        let obj_1 = thread_shard.0.alloc();
+        let obj_2 = thread_shard.0.alloc();
+        println!("Allocated obj 1 {:?}", obj_1 as *const _);
+        println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
-        unsafe { thread_shard.free(obj_2) };
-        unsafe { thread_shard.free(obj_1) };
+        assert_eq!(obj_1 as *const _ as usize + 8, obj_2 as *const _ as usize);
 
-        // XXX we should be testing things automatically and not with eyeballs
+        unsafe { thread_shard.0.free(obj_2) };
+        unsafe { thread_shard.0.free(obj_1) };
+
+        unsafe {
+            let seg = thread_shard.0.segments.get().unwrap();
+            assert_eq!(
+                seg.pages[0].local_free_list.get().unwrap() as *const _ as usize,
+                obj_1 as *const _ as usize
+            );
+            // XXX this makes an awful pointer/usize cast
+            assert_eq!(
+                *(seg.pages[0].local_free_list.get().unwrap() as *const _ as *const usize),
+                obj_2 as *const _ as usize
+            );
+        }
     }
 }
-*/
