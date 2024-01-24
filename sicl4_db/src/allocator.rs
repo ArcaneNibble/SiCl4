@@ -160,6 +160,8 @@ pub struct SlabPerThreadState<'arena, T> {
     segments: Cell<Option<&'arena SlabSegmentHdr<'arena, T>>>,
     /// Pointer to head of (non-full, TODO) page list
     pages: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
+    /// Pointer to end of (non-full, TODO) page list
+    last_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
     /// Ensure `'arena` lifetime is invariant
     _p: PhantomData<Cell<&'arena ()>>,
     // XXX
@@ -179,6 +181,7 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
             (*p).root = None;
             (*p).segments = Cell::new(None);
             (*p).pages = Cell::new(None);
+            (*p).last_page = Cell::new(None);
             // safety: we initialized everything
             &mut *p
         }
@@ -212,16 +215,39 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
         // TODO: page is full, do full list stuff?
         let first_page = self.pages.get().unwrap();
         let mut page = first_page;
+        let mut prev_page = None;
+        let mut prev_page_next_ptr = self.pages.as_ptr();
         loop {
             println!("looking at page {:?}", page as *const _);
             page.collect_free_lists();
             if page.this_free_list.get().is_some() {
                 println!("page has free");
+
+                if page as *const _ != first_page {
+                    // rotate the page search list
+                    unsafe {
+                        // fixme: i'm not sure if all the reference<->pointer crap is correct wrt ub
+                        debug_assert!((*prev_page_next_ptr).unwrap() as *const _ == page);
+                        *prev_page_next_ptr = None;
+                        let last_page = (self.last_page.get().unwrap()) as *const _
+                            as *mut SlabSegmentPageMeta<'arena, T>;
+                        debug_assert!((*last_page).next_page.is_none());
+                        (*last_page).next_page = Some(first_page);
+                        self.pages.set(Some(page));
+                        debug_assert!(prev_page.is_some());
+                        self.last_page.set(prev_page);
+                    };
+                }
+
                 return (page, page.this_free_list.get().unwrap());
             } else {
                 // TODO rotate page ist
                 match page.next_page {
-                    Some(next_page) => page = next_page,
+                    Some(next_page) => {
+                        prev_page_next_ptr = &page.next_page as *const _ as *mut _;
+                        prev_page = Some(page);
+                        page = next_page;
+                    }
                     None => {
                         self.new_seg(Some(first_page));
                         return (
@@ -240,8 +266,9 @@ impl<'arena, T> SlabPerThreadState<'arena, T> {
     pub fn alloc(&'arena self) -> &'arena SlabBlock<'arena, T> {
         // XXX we now have one more branch vs msft
         if self.pages.get().is_none() {
-            // need to allocate a new segment
             self.new_seg(None);
+            let seg = self.segments.get().unwrap();
+            self.last_page.set(Some(&seg.pages[PAGES_PER_SEG - 1]));
         }
 
         let fast_page = self.pages.get().unwrap();
@@ -786,5 +813,27 @@ mod tests {
             println!("Allocated obj {:3} {:?}", i, obj as *const _);
             things.push(obj);
         }
+
+        for i in 0..129 {
+            let obj = things[i];
+            unsafe { thread_shard.0.free(obj) };
+            println!("Freed obj {:3}", i);
+        }
+
+        let mut things2 = Vec::new();
+        for i in 0..129 {
+            let obj = thread_shard.0.alloc();
+            println!("Allocated obj {:3} again {:?}", i, obj as *const _);
+            things2.push(obj);
+        }
+
+        // XXX this is a pretty unstable test
+        // everything is alloc from the new segment until the 129th item
+        // which comes from the existing seg, it just so happens to
+        // be the second half of the last block
+        assert_eq!(
+            things2[128] as *const _ as usize,
+            things[127] as *const _ as usize
+        );
     }
 }
