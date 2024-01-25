@@ -562,7 +562,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         // we don't allow freeing null so unlike msft we don't need to check for it
 
         if self.tid == (*seg).owning_tid {
-            // local free
+            // local free (incl. thread delayed free)
 
             // if we got here, we *know* we're no longer full
             // (regardless of how we might race the state transition
