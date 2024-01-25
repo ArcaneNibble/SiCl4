@@ -122,8 +122,13 @@ impl<'arena, T: Send> SlabRoot<'arena, T> {
     /// Panics if [MAX_THREADS] is reached, or if a global lock exists
     pub fn new_thread(&'arena self) -> SlabThreadShard<'arena, T> {
         let allocated_tid;
-        // TODO: relax ordering
-        let mut old_inuse = self.thread_inuse.load(Ordering::SeqCst);
+        // order: need to synchronize-with only the thread that set
+        // thread_inuse such that it allows us to (re)allocate a particular thread id
+        // release operations by other threads in the meantime do not matter
+        // (as they do not allow reallocating the relevant thread id)
+        // successful new_thread calls by other threads in the meantime
+        // will form part of the release sequence
+        let mut old_inuse = self.thread_inuse.load(Ordering::Relaxed);
         loop {
             let next_tid = old_inuse.trailing_ones();
             if next_tid as usize >= MAX_THREADS {
@@ -133,8 +138,8 @@ impl<'arena, T: Send> SlabRoot<'arena, T> {
             match self.thread_inuse.compare_exchange_weak(
                 old_inuse,
                 new_inuse,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+                Ordering::Acquire,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => {
                     allocated_tid = next_tid as usize;
@@ -163,9 +168,11 @@ impl<'arena, T: Send> SlabRoot<'arena, T> {
 
     /// Try and get a handle for performing global operations
     pub fn try_lock_global(&'arena self) -> Option<SlabRootGlobalGuard<'arena, T>> {
+        // order: need to synchronize-with only the thread that set
+        // thread_inuse to 0, after which we will read/write fresh updated data
         match self
             .thread_inuse
-            .compare_exchange(0, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(0, u64::MAX, Ordering::Acquire, Ordering::Relaxed)
         {
             Ok(_) => Some(SlabRootGlobalGuard(self, PhantomData)),
             Err(_) => None,
@@ -192,8 +199,8 @@ impl<'arena, T: Send> Debug for SlabRootGlobalGuard<'arena, T> {
 impl<'arena, T: Send> Drop for SlabRootGlobalGuard<'arena, T> {
     fn drop(&mut self) {
         let root = self.0;
-        // TODO: relax ordering
-        root.thread_inuse.store(0, Ordering::SeqCst);
+        // ordering: need all manipulation of thread-owned data to stick
+        root.thread_inuse.store(0, Ordering::Release);
     }
 }
 
@@ -738,8 +745,8 @@ impl<'arena, T: Send> Drop for SlabThreadShard<'arena, T> {
     fn drop(&mut self) {
         let root = self.0.root;
         let mask = !(1 << self.0.tid);
-        // TODO: relax ordering
-        root.thread_inuse.fetch_and(mask, Ordering::SeqCst);
+        // ordering: need all manipulation of thread-owned data to stick
+        root.thread_inuse.fetch_and(mask, Ordering::Release);
     }
 }
 
@@ -1127,6 +1134,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn slab_pointer_manip_check() {
         let x = SlabSegmentHdr::<u8>::alloc_new_seg(0);
@@ -1500,15 +1508,29 @@ mod tests {
             let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000]>::new()));
 
             let t0 = loom::thread::spawn(move || {
-                let thread_shard_0 = alloc.new_thread();
-                assert!(thread_shard_0.tid == 0 || thread_shard_0.tid == 1);
-                assert!(alloc.per_thread_state_inited[thread_shard_0.tid as usize].get());
+                {
+                    let thread_shard_0 = alloc.new_thread();
+                    assert!(thread_shard_0.tid == 0 || thread_shard_0.tid == 1);
+                    assert!(alloc.per_thread_state_inited[thread_shard_0.tid as usize].get());
+                }
+                {
+                    let thread_shard_0 = alloc.new_thread();
+                    assert!(thread_shard_0.tid == 0 || thread_shard_0.tid == 1);
+                    assert!(alloc.per_thread_state_inited[thread_shard_0.tid as usize].get());
+                }
             });
 
             let t1 = loom::thread::spawn(move || {
-                let thread_shard_1 = alloc.new_thread();
-                assert!(thread_shard_1.tid == 0 || thread_shard_1.tid == 1);
-                assert!(alloc.per_thread_state_inited[thread_shard_1.tid as usize].get());
+                {
+                    let thread_shard_1 = alloc.new_thread();
+                    assert!(thread_shard_1.tid == 0 || thread_shard_1.tid == 1);
+                    assert!(alloc.per_thread_state_inited[thread_shard_1.tid as usize].get());
+                }
+                {
+                    let thread_shard_1 = alloc.new_thread();
+                    assert!(thread_shard_1.tid == 0 || thread_shard_1.tid == 1);
+                    assert!(alloc.per_thread_state_inited[thread_shard_1.tid as usize].get());
+                }
             });
 
             t0.join().unwrap();
