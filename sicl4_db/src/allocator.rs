@@ -236,7 +236,6 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         while !thread_delayed_free.is_null() {
             unsafe {
                 // fixme transmute eww yuck
-                println!("delayed freeing block {:?}", thread_delayed_free);
                 let next = (*thread_delayed_free).next;
                 self.free(mem::transmute(thread_delayed_free));
                 thread_delayed_free = mem::transmute(next);
@@ -245,7 +244,6 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
 
         let mut page = self.pages.get().unwrap();
         loop {
-            println!("looking at page {:?}", page as *const _);
             page.collect_free_lists();
             if page.this_free_list.get().is_some() {
                 return (page, page.this_free_list.get().unwrap());
@@ -253,12 +251,10 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                 // this page is full, and so has every page we've passed by so far
                 match page.next_page.get() {
                     Some(next_page) => {
-                        println!("page is full, unlinking");
                         self.pages.set(Some(next_page));
                         page = next_page;
                     }
                     None => {
-                        println!("no more memory, new seg");
                         self.new_seg();
                         return (
                             self.pages.get().unwrap(),
@@ -320,7 +316,6 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             if prev_remote_list != REMOTE_FREE_FLAGS_STATE_NORMAL0
                 && prev_remote_list != REMOTE_FREE_FLAGS_STATE_NORMAL1
             {
-                println!("unmarking full");
                 seg.pages[page_i].next_page.set(None);
                 self.last_page
                     .get()
@@ -367,7 +362,6 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             loop {
                 let flag_bits = prev_remote_free as usize & 0b11;
                 if flag_bits != REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST {
-                    println!("free from normal or delayed");
                     // normal state or in-thread-delayed-list state
                     // push onto remote free list
                     let next_block_proper_addr = (prev_remote_free as usize & !0b11) as *const _;
@@ -383,7 +377,6 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                         Err(x) => prev_remote_free = x,
                     }
                 } else {
-                    println!("free from full");
                     // in-full-list state
                     page.remote_free_list.fetch_or(0b10, Ordering::SeqCst);
                     // push onto thread delayed free
