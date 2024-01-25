@@ -19,9 +19,10 @@ use std::{
     mem::{self, size_of, ManuallyDrop, MaybeUninit},
     ops::Deref,
     ptr::{self, addr_of, addr_of_mut},
-    sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::Ordering,
 };
 
+use crate::loom_testing::*;
 use crate::util::divroundup;
 
 /// Absolute maximum number of threads that can be supported.
@@ -604,6 +605,9 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
     ) {
         // XXX makes assumptions about niche optimization and layout of Option<&_>
 
+        // this is needed for loom?
+        (*self_).remote_free_list = AtomicUsize::new(0);
+
         // don't need to init much of the meta, but here we set up the free chain of the blocks themselves
         let start_unusable = if page_i == 0 {
             SlabSegmentHdr::<T>::get_hdr_rounded_sz()
@@ -790,6 +794,7 @@ mod tests {
         assert_send::<SlabThreadShard<'_, UnsafeCell<u8>>>();
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn slab_root_new_thread() {
         let slab = SlabRoot::<u8>::new();
@@ -877,6 +882,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn slab_basic_single_thread_alloc() {
         let alloc = SlabRoot::<u8>::new();
@@ -905,6 +911,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn slab_basic_fake_remote_free() {
         let alloc = SlabRoot::<u8>::new();
@@ -937,6 +944,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn slab_test_collect_local() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
@@ -964,6 +972,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn slab_test_collect_remote() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
@@ -992,6 +1001,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn slab_test_collect_both() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
@@ -1020,6 +1030,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn slab_test_new_seg() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
@@ -1054,6 +1065,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn slab_test_remote_free() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
@@ -1127,5 +1139,76 @@ mod tests {
                 things[127 - (i ^ 1)] as *const _ as usize
             );
         }
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn slab_loom_new_thread() {
+        loom::model(|| {
+            let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000]>::new()));
+
+            let t0 = loom::thread::spawn(move || {
+                let thread_shard_0 = alloc.new_thread();
+                assert!(thread_shard_0.tid == 0 || thread_shard_0.tid == 1);
+                assert!(alloc.per_thread_state_inited[thread_shard_0.tid as usize].get());
+            });
+
+            let t1 = loom::thread::spawn(move || {
+                let thread_shard_1 = alloc.new_thread();
+                assert!(thread_shard_1.tid == 0 || thread_shard_1.tid == 1);
+                assert!(alloc.per_thread_state_inited[thread_shard_1.tid as usize].get());
+            });
+
+            t0.join().unwrap();
+            t1.join().unwrap();
+
+            assert_eq!(alloc.thread_inuse.load(Ordering::SeqCst), 0);
+        })
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn slab_loom_smoke_test() {
+        loom::model(|| {
+            let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000]>::new()));
+            let (sender, receiver) = loom::sync::mpsc::channel();
+
+            let t0 = loom::thread::spawn(move || {
+                let thread_shard_0 = alloc.new_thread();
+                let mut alloc_history = Vec::new();
+                let mut prev = None;
+                for _ in 0..5 {
+                    let obj = thread_shard_0.alloc();
+                    let obj_addr = obj as *const _ as usize;
+                    alloc_history.push(obj_addr);
+                    // in range
+                    assert!(obj_addr >= thread_shard_0.segments.get() as *const _ as usize);
+                    assert!(
+                        obj_addr < thread_shard_0.segments.get() as *const _ as usize + SEGMENT_SZ
+                    );
+
+                    // delay freeing by 1
+                    if let Some(prev) = prev {
+                        let prev_addr = prev as *const _ as usize;
+                        // check that we didn't dup allocate a block
+                        assert!(obj_addr != prev_addr);
+                        sender.send(prev).unwrap();
+                    }
+                    prev = Some(obj);
+                }
+                sender.send(prev.unwrap()).unwrap();
+            });
+
+            let t1 = loom::thread::spawn(move || {
+                let thread_shard_1 = alloc.new_thread();
+                for _ in 0..5 {
+                    let obj = receiver.recv().unwrap();
+                    unsafe { thread_shard_1.free(obj) }
+                }
+            });
+
+            t0.join().unwrap();
+            t1.join().unwrap();
+        })
     }
 }
