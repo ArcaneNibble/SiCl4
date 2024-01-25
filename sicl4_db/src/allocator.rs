@@ -161,8 +161,6 @@ pub struct SlabPerThreadState<'arena, T: Send> {
     segments: Cell<Option<&'arena SlabSegmentHdr<'arena, T>>>,
     /// Pointer to head of (non-full, TODO) page list
     pages: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
-    /// Pointer to end of (non-full, TODO) page list
-    last_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
     /// List of blocks freed by another thread when the containing page was full
     ///
     /// This is an optimization to prevent having to search through many full pages
@@ -185,7 +183,6 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             (*p).root = None;
             (*p).segments = Cell::new(None);
             (*p).pages = Cell::new(None);
-            (*p).last_page = Cell::new(None);
             (*p).thread_delayed_free = AtomicPtr::new(ptr::null_mut());
             // safety: we initialized everything
             &mut *p
@@ -194,11 +191,10 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
 
     /// Allocate a new segment, link it into segments list,
     /// and make it the head of the pages list
-    fn new_seg(&'arena self, link: Option<&'arena SlabSegmentPageMeta<'arena, T>>) {
+    fn new_seg(&'arena self) {
         let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
         let old_seg_head = self.segments.take();
         let new_seg = unsafe {
-            (*new_seg).pages[PAGES_PER_SEG - 1].next_page.set(link);
             (*new_seg).owning_thread_state = self;
             (*new_seg).next = old_seg_head;
             // safety: at this point we've initialized everything
@@ -218,39 +214,23 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         &'arena SlabSegmentPageMeta<'arena, T>,
         &'arena SlabFreeBlock<'arena>,
     ) {
-        // TODO: page is full, do full list stuff?
-        let first_page = self.pages.get().unwrap();
-        let mut page = first_page;
-        let mut prev_page = None;
-        let mut prev_page_next_ptr = self.pages.as_ptr();
+        let mut page = self.pages.get().unwrap();
         loop {
+            println!("looking at page {:?}", page as *const _);
             page.collect_free_lists();
             if page.this_free_list.get().is_some() {
-                if page as *const _ != first_page {
-                    // rotate the page search list
-                    unsafe {
-                        // fixme: i'm not sure if all the reference<->pointer crap is correct wrt ub
-                        debug_assert!((*prev_page_next_ptr).unwrap() as *const _ == page);
-                        *prev_page_next_ptr = None;
-                        let last_page = self.last_page.get().unwrap();
-                        debug_assert!(last_page.next_page.get().is_none());
-                        last_page.next_page.set(Some(first_page));
-                        self.pages.set(Some(page));
-                        debug_assert!(prev_page.is_some());
-                        self.last_page.set(prev_page);
-                    };
-                }
-
                 return (page, page.this_free_list.get().unwrap());
             } else {
+                // this page is full, and so has every page we've passed by so far
                 match page.next_page.get() {
                     Some(next_page) => {
-                        prev_page_next_ptr = &page.next_page as *const _ as *mut _;
-                        prev_page = Some(page);
+                        println!("page is full, unlinking");
+                        self.pages.set(Some(next_page));
                         page = next_page;
                     }
                     None => {
-                        self.new_seg(Some(first_page));
+                        println!("no more memory, new seg");
+                        self.new_seg();
                         return (
                             self.pages.get().unwrap(),
                             self.pages.get().unwrap().this_free_list.get().unwrap(),
@@ -267,9 +247,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
     pub fn alloc(&'arena self) -> &'arena SlabBlock<'arena, T> {
         // XXX we now have one more branch vs msft
         if self.pages.get().is_none() {
-            self.new_seg(None);
-            let seg = self.segments.get().unwrap();
-            self.last_page.set(Some(&seg.pages[PAGES_PER_SEG - 1]));
+            self.new_seg();
         }
 
         let fast_page = self.pages.get().unwrap();
@@ -489,15 +467,34 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
             return;
         }
 
+        let mut is_full = true;
+
         // collect this thread
         let mut our_free_list = self.local_free_list.take();
+        if our_free_list.is_some() {
+            is_full = false;
+        }
 
         // collect other threads
         let mut prev_remote_free = self.remote_free_list.load(Ordering::SeqCst);
         loop {
+            // state must be normal
+            debug_assert!(prev_remote_free as usize & 0b11 == 0b00);
+
+            if !prev_remote_free.is_null() {
+                is_full = false;
+            }
+
+            let remote_free_new_ptr_with_flags = if is_full {
+                debug_assert!(prev_remote_free.is_null());
+                0b01 as *mut _
+            } else {
+                ptr::null_mut()
+            };
+
             match self.remote_free_list.compare_exchange_weak(
                 prev_remote_free,
-                ptr::null_mut(),
+                remote_free_new_ptr_with_flags,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
@@ -505,6 +502,19 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
                 Err(x) => prev_remote_free = x,
             }
         }
+
+        // the only possible state transition allowed here for the remote free list is
+        // normal -> in-full-list
+        // the race that needs to be checked for is "we put this page on the full list,
+        // but at the same time another thread frees something (making it not full anymore)
+        // but we miss that free and thus never manage to access this block again"
+        //
+        // this is prevented because:
+        // * freeing from the in-full-list state will put something onto the thread delayed free list
+        //   (i.e. we have another chance to recover this block the next time we go through the slow path)
+        // * freeing from the in-thread-delayed-list state requires moving through the in-full-list state
+        // * freeing from the normal state
+        // * setting the state to in-full-list is atomic with consuming the remote free list
 
         if !prev_remote_free.is_null() {
             // append to end of our free list
