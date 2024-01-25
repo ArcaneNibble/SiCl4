@@ -14,6 +14,7 @@
 use std::{
     alloc::{self, Layout},
     cell::{Cell, UnsafeCell},
+    collections::HashSet,
     fmt::Debug,
     marker::PhantomData,
     mem::{self, size_of, ManuallyDrop, MaybeUninit},
@@ -196,6 +197,165 @@ impl<'arena, T: Send> Drop for SlabRootGlobalGuard<'arena, T> {
     }
 }
 
+impl<'guard, 'arena, T: Send> SlabRootGlobalGuard<'arena, T> {
+    pub fn _debug_check_missing_blocks(&'guard self) -> HashSet<usize> {
+        let mut all_outstanding_blocks = HashSet::new();
+
+        for thread_i in 0..MAX_THREADS {
+            if self.0.per_thread_state_inited[thread_i].get() {
+                let per_thread = unsafe { &*self.0.per_thread_state[thread_i].as_ptr() };
+                println!("Checking state for thread {}", thread_i);
+
+                let mut thread_delayed_free_blocks = HashSet::new();
+                let mut delayed_free_block = per_thread.thread_delayed_free.load(Ordering::Relaxed);
+                while !delayed_free_block.is_null() {
+                    println!("thread delayed free: {:?}", delayed_free_block);
+                    thread_delayed_free_blocks.insert(delayed_free_block as usize);
+                    unsafe {
+                        let b = &*delayed_free_block;
+                        delayed_free_block = mem::transmute(b.next.get());
+                    }
+                }
+
+                let mut page_linked_list_set = HashSet::new();
+                let mut avail_page = per_thread.pages.get();
+                loop {
+                    println!("Page on linked list: {:?}", avail_page as *const _);
+                    page_linked_list_set.insert(avail_page as *const _ as usize);
+
+                    if avail_page.next_page.get().is_some() {
+                        avail_page = avail_page.next_page.get().unwrap();
+                    } else {
+                        let last_page = per_thread.last_page.get();
+                        assert_eq!(avail_page as *const _, last_page);
+                        break;
+                    }
+                }
+
+                let mut seg = per_thread.segments.get();
+                loop {
+                    println!("Checking segment {:?}", seg as *const _);
+
+                    for page_i in 0..PAGES_PER_SEG {
+                        let page = &seg.pages[page_i];
+                        println!("Checking page {} {:?}", page_i, page);
+
+                        let num_objects = SlabSegmentHdr::get_num_objects(seg, page_i == 0);
+                        let mut outstanding_blocks = HashSet::new();
+
+                        for obj_i in 0..num_objects {
+                            let obj_ptr = SlabSegmentHdr::get_addr_of_block(seg, page_i, obj_i);
+                            outstanding_blocks.insert(obj_ptr as usize);
+                        }
+
+                        let mut this_free = page.this_free_list.get();
+                        while let Some(this_free_block) = this_free {
+                            println!("This free list item: {:?}", this_free_block as *const _);
+                            let was_outstanding =
+                                outstanding_blocks.remove(&(this_free_block as *const _ as usize));
+
+                            if !was_outstanding {
+                                panic!("Block not in page or found in multiple free lists!");
+                            }
+
+                            this_free = this_free_block.next.get();
+                        }
+
+                        let mut local_free = page.local_free_list.get();
+                        while let Some(this_free_block) = local_free {
+                            println!("Local free list item: {:?}", this_free_block as *const _);
+                            let was_outstanding =
+                                outstanding_blocks.remove(&(this_free_block as *const _ as usize));
+
+                            if !was_outstanding {
+                                panic!("Block not in page or found in multiple free lists!");
+                            }
+
+                            local_free = this_free_block.next.get();
+                        }
+
+                        let remote_free = page.remote_free_list.load(Ordering::Relaxed);
+                        let mut remote_free_ptr = unsafe {
+                            let ptr = (remote_free & !0b11) as *const SlabFreeBlock;
+                            if ptr.is_null() {
+                                None
+                            } else {
+                                Some(&*ptr)
+                            }
+                        };
+                        let remote_free_flags = remote_free & 0b11;
+                        while let Some(this_free_block) = remote_free_ptr {
+                            println!("Remote free list item: {:?}", this_free_block as *const _);
+                            let was_outstanding =
+                                outstanding_blocks.remove(&(this_free_block as *const _ as usize));
+
+                            if !was_outstanding {
+                                panic!("Block not in page or found in multiple free lists!");
+                            }
+
+                            remote_free_ptr = this_free_block.next.get();
+                        }
+
+                        let full_without_thread_delayed_free =
+                            outstanding_blocks.len() == num_objects;
+
+                        let mut was_in_thread_delayed_blocks = false;
+
+                        for x in &thread_delayed_free_blocks {
+                            outstanding_blocks.remove(x);
+                            was_in_thread_delayed_blocks = true;
+                        }
+
+                        println!("The following blocks are still allocated:");
+                        for x in &outstanding_blocks {
+                            println!("* 0x{:x}", x);
+                            all_outstanding_blocks.insert(*x);
+                        }
+
+                        let full_actually_full = outstanding_blocks.len() == num_objects;
+
+                        if remote_free_flags == REMOTE_FREE_FLAGS_STATE_NORMAL {
+                            // If the page is normal, it must be in the list
+                            assert!(page_linked_list_set.contains(&(page as *const _ as usize)));
+                            // it may be full if it's the very first page (i.e. we haven't noticed yet)
+                            if per_thread.pages.get() as *const _ != page {
+                                // it cannot require thread delayed free to become unfull
+                                assert!(!full_without_thread_delayed_free);
+                            }
+                        } else if remote_free_flags == REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST {
+                            // If the page is in-full-list it cannot be linked
+                            assert!(!page_linked_list_set.contains(&(page as *const _ as usize)));
+                            // it must be *full* full
+                            assert!(full_actually_full);
+                            // it *cannot* exist in thread delayed blocks yet
+                            assert!(!was_in_thread_delayed_blocks);
+                        } else if remote_free_flags == REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST
+                        {
+                            // If the page is in-thread-delayed-list it cannot be linked
+                            assert!(!page_linked_list_set.contains(&(page as *const _ as usize)));
+                            // it *must* exist in thread delayed blocks
+                            assert!(was_in_thread_delayed_blocks);
+                            // at this point (stable, no threads running)
+                            // it cannot have any local free blocks
+                            assert!(page.this_free_list.get().is_none());
+                            assert!(page.local_free_list.get().is_none());
+                        } else {
+                            panic!("Illegal remote free state encountered");
+                        }
+                    }
+
+                    if seg.next.is_some() {
+                        seg = seg.next.unwrap();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        all_outstanding_blocks
+    }
+}
+
 /// Slab allocator per-thread state (actual contents)
 pub struct SlabPerThreadState<'arena, T: Send> {
     /// Identifies this thread
@@ -256,7 +416,7 @@ const REMOTE_FREE_FLAGS_STATE_NORMAL: usize = 0b00;
 const REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST: usize = 0b01;
 /// Flags shoved into low bits of [SlabSegmentPageMeta::remote_free_list]
 ///
-/// This state is "in-thread-delayed-free" and indicates that the page is full
+/// This state is "in-thread-delayed-list" and indicates that the page is full
 /// (and is thus no longer part of the owning thread's page linked list).
 /// Additionally, it means that something has already been remote freed
 /// inside this page (that previous something is on the
@@ -625,6 +785,20 @@ impl<'arena, T: Send> SlabSegmentHdr<'arena, T> {
     }
 
     #[inline]
+    pub fn get_num_objects(_: *const Self, is_first_page: bool) -> usize {
+        let start_unusable = if is_first_page {
+            Self::get_hdr_rounded_sz()
+        } else {
+            0
+        };
+        let num_objects = num_that_fits(
+            Layout::new::<SlabBlock<T>>(),
+            ALLOC_PAGE_SZ - start_unusable,
+        );
+        num_objects
+    }
+
+    #[inline]
     pub fn get_addr_of_block(self_: *const Self, page_i: usize, block_i: usize) -> *const u8 {
         assert!(page_i < PAGES_PER_SEG);
         let start_unusable = if page_i == 0 {
@@ -702,16 +876,7 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
         (*self_).remote_free_list = AtomicUsize::new(0);
 
         // don't need to init much of the meta, but here we set up the free chain of the blocks themselves
-        let start_unusable = if page_i == 0 {
-            SlabSegmentHdr::<T>::get_hdr_rounded_sz()
-        } else {
-            0
-        };
-        let num_objects = num_that_fits(
-            Layout::new::<SlabBlock<T>>(),
-            ALLOC_PAGE_SZ - start_unusable,
-        );
-
+        let num_objects = SlabSegmentHdr::get_num_objects(seg_ptr, page_i == 0);
         for block_i in 0..(num_objects - 1) {
             let block_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, block_i);
             let next_block_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, block_i + 1);
@@ -1010,6 +1175,13 @@ mod tests {
                 obj_2 as *const _ as usize
             );
         }
+
+        drop(thread_shard);
+        let outstanding_blocks = alloc
+            .try_lock_global()
+            .unwrap()
+            ._debug_check_missing_blocks();
+        assert_eq!(outstanding_blocks.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1043,6 +1215,14 @@ mod tests {
                 obj_2 as *const _ as usize
             );
         }
+
+        drop(thread_shard_0);
+        drop(thread_shard_1);
+        let outstanding_blocks = alloc
+            .try_lock_global()
+            .unwrap()
+            ._debug_check_missing_blocks();
+        assert_eq!(outstanding_blocks.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1071,6 +1251,15 @@ mod tests {
             obj_2_2nd_try as *const _ as usize,
             obj_1 as *const _ as usize
         );
+
+        drop(thread_shard);
+        let mut outstanding_blocks = alloc
+            .try_lock_global()
+            .unwrap()
+            ._debug_check_missing_blocks();
+        assert!(outstanding_blocks.remove(&(obj_1_2nd_try as *const _ as usize)));
+        assert!(outstanding_blocks.remove(&(obj_2_2nd_try as *const _ as usize)));
+        assert_eq!(outstanding_blocks.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1100,6 +1289,16 @@ mod tests {
             obj_2_2nd_try as *const _ as usize,
             obj_1 as *const _ as usize
         );
+
+        drop(thread_shard_0);
+        drop(thread_shard_1);
+        let mut outstanding_blocks = alloc
+            .try_lock_global()
+            .unwrap()
+            ._debug_check_missing_blocks();
+        assert!(outstanding_blocks.remove(&(obj_1_2nd_try as *const _ as usize)));
+        assert!(outstanding_blocks.remove(&(obj_2_2nd_try as *const _ as usize)));
+        assert_eq!(outstanding_blocks.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1129,6 +1328,16 @@ mod tests {
             obj_2_2nd_try as *const _ as usize,
             obj_2 as *const _ as usize
         );
+
+        drop(thread_shard_0);
+        drop(thread_shard_1);
+        let mut outstanding_blocks = alloc
+            .try_lock_global()
+            .unwrap()
+            ._debug_check_missing_blocks();
+        assert!(outstanding_blocks.remove(&(obj_1_2nd_try as *const _ as usize)));
+        assert!(outstanding_blocks.remove(&(obj_2_2nd_try as *const _ as usize)));
+        assert_eq!(outstanding_blocks.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1164,6 +1373,16 @@ mod tests {
             things2[128] as *const _ as usize,
             things[1] as *const _ as usize
         );
+
+        drop(thread_shard);
+        let mut outstanding_blocks = alloc
+            .try_lock_global()
+            .unwrap()
+            ._debug_check_missing_blocks();
+        for x in things2 {
+            assert!(outstanding_blocks.remove(&(x as *const _ as usize)));
+        }
+        assert_eq!(outstanding_blocks.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1240,6 +1459,17 @@ mod tests {
                 things[127 - (i ^ 1)] as *const _ as usize
             );
         }
+
+        drop(thread_shard_0);
+        drop(thread_shard_1);
+        let mut outstanding_blocks = alloc
+            .try_lock_global()
+            .unwrap()
+            ._debug_check_missing_blocks();
+        for x in things2 {
+            assert!(outstanding_blocks.remove(&(x as *const _ as usize)));
+        }
+        assert_eq!(outstanding_blocks.len(), 0);
     }
 
     #[cfg(loom)]
@@ -1310,6 +1540,12 @@ mod tests {
 
             t0.join().unwrap();
             t1.join().unwrap();
+
+            let outstanding_blocks = alloc
+                .try_lock_global()
+                .unwrap()
+                ._debug_check_missing_blocks();
+            assert_eq!(outstanding_blocks.len(), 0);
         })
     }
 
