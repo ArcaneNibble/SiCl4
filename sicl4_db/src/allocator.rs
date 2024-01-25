@@ -161,6 +161,8 @@ pub struct SlabPerThreadState<'arena, T: Send> {
     segments: Cell<Option<&'arena SlabSegmentHdr<'arena, T>>>,
     /// Pointer to head of (non-full, TODO) page list
     pages: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
+    /// Pointer to end of (non-full, TODO) page list
+    last_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
     /// List of blocks freed by another thread when the containing page was full
     ///
     /// This is an optimization to prevent having to search through many full pages
@@ -188,6 +190,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             (*p).root = None;
             (*p).segments = Cell::new(None);
             (*p).pages = Cell::new(None);
+            (*p).last_page = Cell::new(None);
             (*p).thread_delayed_free = AtomicPtr::new(ptr::null_mut());
             // safety: we initialized everything
             &mut *p
@@ -195,7 +198,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
     }
 
     /// Allocate a new segment, link it into segments list,
-    /// and make it the head of the pages list
+    /// and make it the *entirety* of the pages list
     fn new_seg(&'arena self) {
         let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
         let old_seg_head = self.segments.take();
@@ -208,6 +211,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         };
         self.segments.set(Some(new_seg));
         self.pages.set(Some(&new_seg.pages[0]));
+        self.last_page.set(Some(&new_seg.pages[PAGES_PER_SEG - 1]));
     }
 
     /// Allocation slow path
@@ -219,6 +223,26 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         &'arena SlabSegmentPageMeta<'arena, T>,
         &'arena SlabFreeBlock<'arena>,
     ) {
+        // collect thread delayed free block list and free them all
+        let mut thread_delayed_free = self
+            .thread_delayed_free
+            .fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |_| Some(ptr::null_mut()),
+            )
+            .unwrap();
+
+        while !thread_delayed_free.is_null() {
+            unsafe {
+                // fixme transmute eww yuck
+                println!("delayed freeing block {:?}", thread_delayed_free);
+                let next = (*thread_delayed_free).next;
+                self.free(mem::transmute(thread_delayed_free));
+                thread_delayed_free = mem::transmute(next);
+            }
+        }
+
         let mut page = self.pages.get().unwrap();
         loop {
             println!("looking at page {:?}", page as *const _);
@@ -283,7 +307,28 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         if self.tid == (*seg).owning_tid {
             // local free
 
-            // FIXME need to take the page off of the full list
+            // if we got here, we *know* we're no longer full
+            // (regardless of how we might race the state transition
+            // between in-full-list and in-thread-delayed-list)
+            // so take ourselves off if necessary.
+            //
+            // it is not possible to race against any other arcs,
+            // as they are synchronous with us on our own thread
+            let prev_remote_list = seg.pages[page_i]
+                .remote_free_list
+                .fetch_and(!0b11, Ordering::SeqCst);
+            if prev_remote_list != REMOTE_FREE_FLAGS_STATE_NORMAL0
+                && prev_remote_list != REMOTE_FREE_FLAGS_STATE_NORMAL1
+            {
+                println!("unmarking full");
+                seg.pages[page_i].next_page.set(None);
+                self.last_page
+                    .get()
+                    .unwrap()
+                    .next_page
+                    .set(Some(&seg.pages[page_i]));
+                self.last_page.set(Some(&seg.pages[page_i]));
+            }
 
             let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
             (*obj_mut).free.next = seg.pages[page_i].local_free_list.get();
@@ -305,10 +350,17 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             // block from the same page there. this is not a correctness issue,
             // it is just less optimal than ideal
 
-            // when freeing from the in-full-list state it FIXME FIXME FIXME
+            // when freeing from the in-full-list state it *is* *ALSO* possible to miss
             // the transition back into the normal state.
+            // the consequence of this is that this block being freed will *once again*
+            // be added to the thread delayed free list, *AND* it will *NOT*
+            // immediately end up back on the normal free list.
+            // HOWEVER, as the slow path is *always* taken periodically, this block
+            // has a chance to get picked up again once that happens.
 
-            // when freeing from the in-thread-delayed-list state, FIXME FIXME FIXME TODO
+            // when freeing from the in-thread-delayed-list state, the state transition
+            // to the normal state doesn't matter, because we are adding to the
+            // same page remote free list in either case.
 
             let page = &seg.pages[page_i];
             let mut prev_remote_free = page.remote_free_list.load(Ordering::SeqCst);
@@ -575,8 +627,8 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
         // * freeing from the in-full-list state will put something onto the thread delayed free list
         //   (i.e. we have another chance to recover this block the next time we go through the slow path)
         // * freeing from the in-thread-delayed-list state requires moving through the in-full-list state
-        // * freeing from the normal state
-        // * setting the state to in-full-list is atomic with consuming the remote free list
+        // * when freeing from the normal state, setting the state to in-full-list
+        //   is atomic with consuming the remote free list
 
         if !remote_free_list_ptr.is_null() {
             // append to end of our free list
@@ -920,17 +972,14 @@ mod tests {
             things2.push(obj);
         }
 
-        /*
-        FIXME FIXME FIXME
         // XXX this is a pretty unstable test
         // everything is alloc from the new segment until the 129th item
         // which comes from the existing seg, it just so happens to
-        // be the second half of the last block
+        // be the second half of the first block
         assert_eq!(
             things2[128] as *const _ as usize,
-            things[127] as *const _ as usize
+            things[1] as *const _ as usize
         );
-        */
     }
 
     #[test]
@@ -990,22 +1039,21 @@ mod tests {
             }
         }
 
-        let mut things2 = Vec::new();
-        for i in 0..129 {
+        let mut things2: Vec<&SlabBlock<'_, [u8; 30000]>> = Vec::new();
+        for i in 0..256 {
             let obj = thread_shard_0.alloc();
             println!("Allocated obj {:3} again {:?}", i, obj as *const _);
             things2.push(obj);
         }
 
-        /*
         // XXX this is a pretty unstable test
         // everything is alloc from the new segment until the 129th item
-        // which comes from the existing seg, it just so happens to
-        // be the second half of the last block
-        assert_eq!(
-            things2[128] as *const _ as usize,
-            things[127] as *const _ as usize
-        );
-        */
+        // which comes from the existing seg in this pattern
+        for i in 0..128 {
+            assert_eq!(
+                things2[128 + i] as *const _ as usize,
+                things[127 - (i ^ 1)] as *const _ as usize
+            );
+        }
     }
 }
