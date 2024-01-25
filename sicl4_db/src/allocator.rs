@@ -70,7 +70,6 @@ const fn num_that_fits(layout: Layout, tot_sz: usize) -> usize {
     tot_sz / layout.size()
 }
 
-#[derive(Debug)]
 /// Slab allocator root object
 pub struct SlabRoot<'arena, T: Send> {
     /// Bitfield, where a `1` bit in position `n` indicates that
@@ -87,6 +86,23 @@ pub struct SlabRoot<'arena, T: Send> {
 }
 // safety: we carefully use atomic operations on thread_inuse
 unsafe impl<'arena, T: Send> Sync for SlabRoot<'arena, T> {}
+
+impl<'arena, T: Send> Debug for SlabRoot<'arena, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut fields = f.debug_struct("SlabRoot");
+        fields.field("@addr", &(self as *const _));
+        for i in 0..MAX_THREADS {
+            if !self.per_thread_state_inited[i].get() {
+                fields.field(&format!("per_thread_state[{}]", i), &"<uninit>");
+            } else {
+                fields.field(&format!("per_thread_state[{}]", i), unsafe {
+                    self.per_thread_state[i].assume_init_ref()
+                });
+            }
+        }
+        fields.finish()
+    }
+}
 
 impl<'arena, T: Send> SlabRoot<'arena, T> {
     /// Allocate a new root object for a slab memory allocator
@@ -144,7 +160,6 @@ impl<'arena, T: Send> SlabRoot<'arena, T> {
     }
 }
 
-#[derive(Debug)]
 /// Slab allocator per-thread state (actual contents)
 pub struct SlabPerThreadState<'arena, T: Send> {
     /// Identifies this thread
@@ -173,6 +188,23 @@ pub struct SlabPerThreadState<'arena, T: Send> {
 // however, because only a SlabThreadShard can get outside this module,
 // the footgun is contained
 unsafe impl<'arena, T: Send> Sync for SlabPerThreadState<'arena, T> {}
+
+impl<'arena, T: Send> Debug for SlabPerThreadState<'arena, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlabPerThreadState")
+            .field("@addr", &(self as *const _))
+            .field("tid", &self.tid)
+            .field("root", &(self.root as *const _))
+            .field("segments", &(self.segments.get() as *const _))
+            .field("pages", &(self.pages.get() as *const _))
+            .field("last_page", &(self.last_page.get() as *const _))
+            .field(
+                "thread_delayed_free",
+                &(self.thread_delayed_free.load(Ordering::SeqCst)),
+            )
+            .finish()
+    }
+}
 
 const REMOTE_FREE_FLAGS_STATE_NORMAL0: usize = 0b00;
 const REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST: usize = 0b01;
@@ -417,6 +449,12 @@ pub struct SlabThreadShard<'arena, T: Send>(
     PhantomData<UnsafeCell<()>>,
 );
 
+impl<'arena, T: Send> Debug for SlabThreadShard<'arena, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SlabThreadShard").field(&self.0).finish()
+    }
+}
+
 impl<'arena, T: Send> Deref for SlabThreadShard<'arena, T> {
     type Target = &'arena SlabPerThreadState<'arena, T>;
 
@@ -436,7 +474,6 @@ impl<'arena, T: Send> Drop for SlabThreadShard<'arena, T> {
 
 /// Header for each (4 M) segment
 #[repr(C)]
-#[derive(Debug)]
 struct SlabSegmentHdr<'arena, T: Send> {
     /// Thread that created this segment and owns its "local" data
     owning_tid: u64,
@@ -447,6 +484,21 @@ struct SlabSegmentHdr<'arena, T: Send> {
     next: Option<&'arena SlabSegmentHdr<'arena, T>>,
     /// Metadata for each page within the segment
     pages: [SlabSegmentPageMeta<'arena, T>; PAGES_PER_SEG],
+}
+
+impl<'arena, T: Send> Debug for SlabSegmentHdr<'arena, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlabSegmentHdr")
+            .field("@addr", &(self as *const _))
+            .field("owning_tid", &self.owning_tid)
+            .field(
+                "owning_thread_state",
+                &(self.owning_thread_state as *const _),
+            )
+            .field("next", &self.next.map(|x| x as *const _))
+            .field("pages", &self.pages)
+            .finish()
+    }
 }
 
 impl<'arena, T: Send> SlabSegmentHdr<'arena, T> {
@@ -507,7 +559,6 @@ impl<'arena, T: Send> SlabSegmentHdr<'arena, T> {
 ///
 /// Note that this is not stored *in* the page, but in the segment header.
 #[repr(C)]
-#[derive(Debug)]
 struct SlabSegmentPageMeta<'arena, T: Send> {
     /// Linked list of pages
     next_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
@@ -523,6 +574,27 @@ struct SlabSegmentPageMeta<'arena, T: Send> {
 // and everything else is owned by one specific thread
 // (which is guarded by SlabRoot::thread_inuse)
 unsafe impl<'arena, T: Send> Sync for SlabSegmentPageMeta<'arena, T> {}
+
+impl<'arena, T: Send> Debug for SlabSegmentPageMeta<'arena, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlabSegmentPageMeta")
+            .field("@addr", &(self as *const _))
+            .field("next_page", &self.next_page.get().map(|x| x as *const _))
+            .field(
+                "this_free_list",
+                &self.this_free_list.get().map(|x| x as *const _),
+            )
+            .field(
+                "local_free_list",
+                &self.local_free_list.get().map(|x| x as *const _),
+            )
+            .field(
+                "remote_free_list",
+                &(self.remote_free_list.load(Ordering::SeqCst) as *const ()),
+            )
+            .finish()
+    }
+}
 
 impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
     pub unsafe fn init_page(
@@ -658,9 +730,18 @@ pub union SlabBlock<'arena, T> {
 
 /// Contents of a slab block when it is free (i.e. free chain)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct SlabFreeBlock<'arena> {
     next: Option<&'arena SlabFreeBlock<'arena>>,
+}
+
+impl<'arena> Debug for SlabFreeBlock<'arena> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlabFreeBlock")
+            .field("@addr", &(self as *const _))
+            .field("next", &self.next.map(|x| x as *const _))
+            .finish()
+    }
 }
 
 /// Wrapped payload type, additionally containing a rwlock and generation counter
