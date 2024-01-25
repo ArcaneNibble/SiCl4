@@ -13,7 +13,7 @@
 
 use std::{
     alloc::{self, Layout},
-    cell::Cell,
+    cell::{Cell, UnsafeCell},
     fmt::Debug,
     marker::PhantomData,
     mem::{self, size_of, ManuallyDrop, MaybeUninit},
@@ -142,7 +142,7 @@ impl<'arena, T: Send> SlabRoot<'arena, T> {
             // safety: current thread now owns this slice of per_thread_state exclusively
             (*root_ptr) = Some(self);
         }
-        SlabThreadShard(thread_state)
+        SlabThreadShard(thread_state, PhantomData)
     }
 }
 
@@ -163,7 +163,18 @@ pub struct SlabPerThreadState<'arena, T: Send> {
     pages: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
     /// Pointer to end of (non-full, TODO) page list
     last_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
+    /// List of blocks freed by another thread when the containing page was full
+    ///
+    /// This is an optimization to prevent having to search through many full pages
+    thread_delayed_free: AtomicPtr<SlabFreeBlock<'arena>>,
 }
+// safety: this is a *huge* footgun. this is marked Sync so that it is possible
+// for multiple threads to get access to it so that they can access the
+// thread delayed free block list. it is *not* otherwise safe.
+//
+// however, because only a SlabThreadShard can get outside this module,
+// the footgun is contained
+unsafe impl<'arena, T: Send> Sync for SlabPerThreadState<'arena, T> {}
 
 impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
     /// Initialize state
@@ -175,6 +186,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             (*p).segments = Cell::new(None);
             (*p).pages = Cell::new(None);
             (*p).last_page = Cell::new(None);
+            (*p).thread_delayed_free = AtomicPtr::new(ptr::null_mut());
             // safety: we initialized everything
             &mut *p
         }
@@ -186,8 +198,11 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
         let old_seg_head = self.segments.take();
         let new_seg = unsafe {
-            (*new_seg).pages[PAGES_PER_SEG - 1].next_page = link;
+            (*new_seg).pages[PAGES_PER_SEG - 1].next_page.set(link);
+            (*new_seg).owning_thread_state = self;
             (*new_seg).next = old_seg_head;
+            // safety: at this point we've initialized everything
+            // *including* the owning_thread_state footgun
             &*new_seg
         };
         self.segments.set(Some(new_seg));
@@ -217,10 +232,9 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                         // fixme: i'm not sure if all the reference<->pointer crap is correct wrt ub
                         debug_assert!((*prev_page_next_ptr).unwrap() as *const _ == page);
                         *prev_page_next_ptr = None;
-                        let last_page = (self.last_page.get().unwrap()) as *const _
-                            as *mut SlabSegmentPageMeta<'arena, T>;
-                        debug_assert!((*last_page).next_page.is_none());
-                        (*last_page).next_page = Some(first_page);
+                        let last_page = self.last_page.get().unwrap();
+                        debug_assert!(last_page.next_page.get().is_none());
+                        last_page.next_page.set(Some(first_page));
                         self.pages.set(Some(page));
                         debug_assert!(prev_page.is_some());
                         self.last_page.set(prev_page);
@@ -229,7 +243,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
 
                 return (page, page.this_free_list.get().unwrap());
             } else {
-                match page.next_page {
+                match page.next_page.get() {
                     Some(next_page) => {
                         prev_page_next_ptr = &page.next_page as *const _ as *mut _;
                         prev_page = Some(page);
@@ -322,10 +336,11 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
 ///
 /// It is *not* allowed for a raw `&'arena SlabPerThreadState<'arena, T>`
 /// to escape from this module. Allowing this can cause data races.
-pub struct SlabThreadShard<'arena, T: Send>(&'arena SlabPerThreadState<'arena, T>);
-// safety: this is effectively an exclusive handle that also doesn't
-// hold on to any data that depends on the lifetype of the current thread.
-unsafe impl<'arena, T: Send> Send for SlabThreadShard<'arena, T> {}
+pub struct SlabThreadShard<'arena, T: Send>(
+    &'arena SlabPerThreadState<'arena, T>,
+    /// prevent this type from being `Sync`
+    PhantomData<UnsafeCell<()>>,
+);
 
 impl<'arena, T: Send> Deref for SlabThreadShard<'arena, T> {
     type Target = &'arena SlabPerThreadState<'arena, T>;
@@ -350,6 +365,9 @@ impl<'arena, T: Send> Drop for SlabThreadShard<'arena, T> {
 struct SlabSegmentHdr<'arena, T: Send> {
     /// Thread that created this segment and owns its "local" data
     owning_tid: u64,
+    /// Per-thread data of the thread that created this
+    /// (used for thread delayed free)
+    owning_thread_state: &'arena SlabPerThreadState<'arena, T>,
     /// List of segments (all owned by this thread)
     next: Option<&'arena SlabSegmentHdr<'arena, T>>,
     /// Metadata for each page within the segment
@@ -367,11 +385,12 @@ impl<'arena, T: Send> SlabSegmentHdr<'arena, T> {
                 if i != PAGES_PER_SEG - 1 {
                     let next_page_meta_ptr = addr_of_mut!((*seg).pages[i + 1]);
                     // reborrowing is safe because we *never* make &mut
-                    (*seg).pages[i].next_page = Some(&*next_page_meta_ptr);
+                    (*seg).pages[i].next_page.set(Some(&*next_page_meta_ptr));
                 }
             }
 
-            // safety: we initialized everything
+            // safety: we initialized everything EXCEPT
+            // owning_thread_state which remains UNINIT!
             seg
         }
     }
@@ -416,7 +435,7 @@ impl<'arena, T: Send> SlabSegmentHdr<'arena, T> {
 #[derive(Debug)]
 struct SlabSegmentPageMeta<'arena, T: Send> {
     /// Linked list of pages
-    next_page: Option<&'arena SlabSegmentPageMeta<'arena, T>>,
+    next_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
     /// List that we allocate from in the fast path
     this_free_list: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
     /// List that we free to from the same thread
