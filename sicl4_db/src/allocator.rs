@@ -276,7 +276,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         while !thread_delayed_free.is_null() {
             unsafe {
                 // fixme transmute eww yuck
-                let next = (*thread_delayed_free).next;
+                let next = (*thread_delayed_free).next.get();
                 self.free(mem::transmute(thread_delayed_free));
                 thread_delayed_free = mem::transmute(next);
             }
@@ -316,7 +316,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             Some(x) => (fast_page, x), // fast path
             None => self.alloc_slow(),
         };
-        page.this_free_list.set(block.next);
+        page.this_free_list.set(block.next.get());
         unsafe {
             // safety: just coercing to a repr(C) union reference
             mem::transmute(block)
@@ -348,16 +348,16 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             let prev_remote_list = seg.pages[page_i]
                 .remote_free_list
                 .fetch_and(!0b11, Ordering::SeqCst);
-            if prev_remote_list != REMOTE_FREE_FLAGS_STATE_NORMAL0
-                && prev_remote_list != REMOTE_FREE_FLAGS_STATE_NORMAL1
+            let prev_remote_list_flags = prev_remote_list & 0b11;
+            if prev_remote_list_flags != REMOTE_FREE_FLAGS_STATE_NORMAL0
+                && prev_remote_list_flags != REMOTE_FREE_FLAGS_STATE_NORMAL1
             {
                 seg.pages[page_i].next_page.set(None);
                 self.last_page.get().next_page.set(Some(&seg.pages[page_i]));
                 self.last_page.set(&seg.pages[page_i]);
             }
 
-            let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
-            (*obj_mut).free.next = seg.pages[page_i].local_free_list.get();
+            obj.free.next.set(seg.pages[page_i].local_free_list.get());
             seg.pages[page_i]
                 .local_free_list
                 .set(Some(mem::transmute(obj)));
@@ -391,16 +391,15 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             let page = &seg.pages[page_i];
             let mut prev_remote_free = page.remote_free_list.load(Ordering::SeqCst);
             loop {
-                let flag_bits = prev_remote_free as usize & 0b11;
+                let flag_bits = prev_remote_free & 0b11;
                 if flag_bits != REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST {
                     // normal state or in-thread-delayed-list state
                     // push onto remote free list
-                    let next_block_proper_addr = (prev_remote_free as usize & !0b11) as *const _;
-                    let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
-                    (*obj_mut).free.next = Some(&*next_block_proper_addr);
+                    let next_block_proper_addr = (prev_remote_free & !0b11) as *const _;
+                    obj.free.next.set(Some(&*next_block_proper_addr));
                     match page.remote_free_list.compare_exchange_weak(
                         prev_remote_free,
-                        (obj_ptr | flag_bits) as _,
+                        obj_ptr | flag_bits,
                         Ordering::SeqCst,
                         Ordering::SeqCst,
                     ) {
@@ -415,8 +414,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                     let mut prev_thread_delayed_free =
                         per_thread.thread_delayed_free.load(Ordering::SeqCst);
                     loop {
-                        let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
-                        (*obj_mut).free.next = Some(&*prev_thread_delayed_free);
+                        obj.free.next.set(Some(&*prev_thread_delayed_free));
                         match per_thread.thread_delayed_free.compare_exchange_weak(
                             prev_thread_delayed_free,
                             obj_ptr as _,
@@ -625,9 +623,9 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
             let block_ptr = block_ptr as *mut SlabBlock<'arena, T>;
             let next_block_ptr = next_block_ptr as *mut SlabFreeBlock<'arena>;
 
-            (*block_ptr).free = SlabFreeBlock {
-                next: Some(&*next_block_ptr),
-            };
+            (*block_ptr).free = ManuallyDrop::new(SlabFreeBlock {
+                next: Cell::new(Some(&*next_block_ptr)),
+            });
         }
 
         let block_0_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, 0) as *const _;
@@ -684,6 +682,11 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
 
         let remote_free_list_ptr = (prev_remote_free & !0b11) as *const SlabFreeBlock<'arena>;
 
+        if is_full {
+            debug_assert!(our_free_list.is_none());
+            debug_assert!(remote_free_list_ptr.is_null());
+        }
+
         // the only possible state transition allowed here for the remote free list is
         // normal -> in-full-list
         // the race that needs to be checked for is "we put this page on the full list,
@@ -707,8 +710,8 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
                     &*remote_free_list_ptr
                 }));
             } else {
-                while our_free_list.unwrap().next.is_some() {
-                    our_free_list = our_free_list.unwrap().next;
+                while our_free_list.unwrap().next.get().is_some() {
+                    our_free_list = our_free_list.unwrap().next.get();
                 }
                 unsafe {
                     // safety: these blocks should definitely belong to our allocation
@@ -728,22 +731,21 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
 /// A slab block (used to ensure size/align for free chain)
 #[repr(C)]
 pub union SlabBlock<'arena, T> {
-    free: SlabFreeBlock<'arena>,
+    free: ManuallyDrop<SlabFreeBlock<'arena>>,
     pub alloced: ManuallyDrop<MaybeUninit<T>>,
 }
 
 /// Contents of a slab block when it is free (i.e. free chain)
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct SlabFreeBlock<'arena> {
-    next: Option<&'arena SlabFreeBlock<'arena>>,
+    next: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
 }
 
 impl<'arena> Debug for SlabFreeBlock<'arena> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlabFreeBlock")
             .field("@addr", &(self as *const _))
-            .field("next", &self.next.map(|x| x as *const _))
+            .field("next", &self.next.get().map(|x| x as *const _))
             .finish()
     }
 }
