@@ -211,7 +211,7 @@ impl<'arena, T: Send> Debug for SlabPerThreadState<'arena, T> {
 ///
 /// This state is "normal" and indicates that the page is not full
 /// (and is thus part of the owning thread's page linked list).
-const REMOTE_FREE_FLAGS_STATE_NORMAL0: usize = 0b00;
+const REMOTE_FREE_FLAGS_STATE_NORMAL: usize = 0b00;
 /// Flags shoved into low bits of [SlabSegmentPageMeta::remote_free_list]
 ///
 /// This state is "in-full-list" and indicates that the page is full
@@ -230,14 +230,11 @@ const REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST: usize = 0b01;
 /// page-local remote free list, because that *previous* something is
 /// sufficient to bring the page back into the linked list where
 /// the rest of the page-local remote free list will be swept eventually.
-const _REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST: usize = 0b11;
+const REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST: usize = 0b11;
 /// Flags shoved into low bits of [SlabSegmentPageMeta::remote_free_list]
 ///
-/// This state is "normal" and indicates that the page is not full
-/// (and is thus part of the owning thread's page linked list).
-/// This redundant state allows for a micro-simplification of
-/// the "free onto thread delayed free block list" situation.
-const REMOTE_FREE_FLAGS_STATE_NORMAL1: usize = 0b10;
+/// This bit pattern is invalid
+const _REMOTE_FREE_FLAGS_STATE_INVALID: usize = 0b10;
 
 impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
     /// Initialize state
@@ -384,9 +381,8 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                 .remote_free_list
                 .fetch_and(!0b11, Ordering::SeqCst);
             let prev_remote_list_flags = prev_remote_list & 0b11;
-            if prev_remote_list_flags != REMOTE_FREE_FLAGS_STATE_NORMAL0
-                && prev_remote_list_flags != REMOTE_FREE_FLAGS_STATE_NORMAL1
-            {
+            debug_assert!(prev_remote_list_flags != _REMOTE_FREE_FLAGS_STATE_INVALID);
+            if prev_remote_list_flags != REMOTE_FREE_FLAGS_STATE_NORMAL {
                 seg.pages[page_i].next_page.set(None);
                 self.last_page.get().next_page.set(Some(&seg.pages[page_i]));
                 self.last_page.set(&seg.pages[page_i]);
@@ -399,35 +395,82 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         } else {
             // remote free
 
-            // when freeing from the normal state, it is not possible to miss
-            // the transition into in-full-list state because this is done atomically.
-            // (so either state is normal and alloc will pick up this block we just freed,
-            // or else state will change to in-full-list and we will add to the thread delayed free list).
+            // when in the normal state, the only valid state transition is
+            // into the in-full-list state, performed in the allocation path.
+            // we cannot miss that because it is done atomically,
+            // so either state is normal and collect_free_lists in the allocation path
+            // will pick up this block we just freed, or else state will change to
+            // in-full-list and we will add to the thread delayed free list.
 
-            // when freeing from the in-full-list state it *is* possible to miss
-            // the transition into the in-thread-delayed-list state.
-            // the consequence of this is that this block being freed will be added
-            // to the thread delayed free list even though there is already another
-            // block from the same page there. this is not a correctness issue,
-            // it is just less optimal than ideal
+            // when in the in-full-list state, the only valid state transitions
+            // are into normal and into in-thread-delayed-list
+            // (racing against a local free in the thread that owns the page
+            // vs racing against yet another thread remote freeing into the same page as us).
+            //
+            // in the former case, if the remote change to the normal state happens first,
+            // then we notice and end up on the page remote free list.
+            // the page is removed from the full list by the owning thread doing the local free,
+            // and the page remote free list will get swept eventually.
+            // if our change to in-thread-delayed-list happens first, then
+            // we end up on the thread delayed block list. the state still ends up
+            // being unconditionally set back to normal, and the owning thread
+            // still removes the page from the full list. eventually the thread
+            // delayed block list will get swept and this block freed properly.
+            //
+            // in the latter case, one and only one of the threads will win
+            // the transition into in-thread-delayed-list. that one thread
+            // ends up putting the block onto the thread delayed block list.
+            // it does not matter which one.
+            //
+            // this location is the only place where the
+            // in-full-list -> in-thread-delayed-list state transition can occur
 
-            // when freeing from the in-full-list state it *is* *ALSO* possible to miss
-            // the transition back into the normal state.
-            // the consequence of this is that this block being freed will *once again*
-            // be added to the thread delayed free list, *AND* it will *NOT*
-            // immediately end up back on the normal free list.
-            // HOWEVER, as the slow path is *always* taken periodically, this block
-            // has a chance to get picked up again once that happens.
-
-            // when freeing from the in-thread-delayed-list state, the state transition
-            // to the normal state doesn't matter, because we are adding to the
+            // when in the in-thread-delayed-list state, the only possible
+            // state transition to race against is into normal.
+            // this state transition does not affect us as we are adding to the
             // same page remote free list in either case.
 
             let page = &seg.pages[page_i];
             let mut prev_remote_free = page.remote_free_list.load(Ordering::SeqCst);
             loop {
                 let flag_bits = prev_remote_free & 0b11;
-                if flag_bits != REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST {
+                if flag_bits == REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST {
+                    // in-full-list state
+                    // try to transition into in-thread-delayed-list state
+
+                    let new_remote_free =
+                        (prev_remote_free & !0b11) | REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST;
+
+                    match page.remote_free_list.compare_exchange_weak(
+                        prev_remote_free,
+                        new_remote_free,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {
+                            // we won, so push onto thread delayed free
+                            let per_thread = seg.owning_thread_state;
+                            let mut prev_thread_delayed_free =
+                                per_thread.thread_delayed_free.load(Ordering::SeqCst);
+                            loop {
+                                obj.free.next.set(Some(&*prev_thread_delayed_free));
+                                match per_thread.thread_delayed_free.compare_exchange_weak(
+                                    prev_thread_delayed_free,
+                                    obj_ptr as _,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(x) => prev_thread_delayed_free = x,
+                                }
+                            }
+                            break;
+                        }
+                        Err(x) => prev_remote_free = x,
+                    }
+                } else if flag_bits == REMOTE_FREE_FLAGS_STATE_NORMAL
+                    || flag_bits == REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST
+                {
                     // normal state or in-thread-delayed-list state
                     // push onto remote free list
                     let next_block_proper_addr = (prev_remote_free & !0b11) as *const _;
@@ -442,25 +485,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                         Err(x) => prev_remote_free = x,
                     }
                 } else {
-                    // in-full-list state
-                    page.remote_free_list.fetch_or(0b10, Ordering::SeqCst);
-                    // push onto thread delayed free
-                    let per_thread = seg.owning_thread_state;
-                    let mut prev_thread_delayed_free =
-                        per_thread.thread_delayed_free.load(Ordering::SeqCst);
-                    loop {
-                        obj.free.next.set(Some(&*prev_thread_delayed_free));
-                        match per_thread.thread_delayed_free.compare_exchange_weak(
-                            prev_thread_delayed_free,
-                            obj_ptr as _,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        ) {
-                            Ok(_) => break,
-                            Err(x) => prev_thread_delayed_free = x,
-                        }
-                    }
-                    break;
+                    panic!("Illegal remote free state encountered");
                 }
             }
         }
@@ -688,10 +713,7 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
             let ptr = prev_remote_free & !0b11;
 
             // state must be normal
-            debug_assert!(
-                state == REMOTE_FREE_FLAGS_STATE_NORMAL0
-                    || state == REMOTE_FREE_FLAGS_STATE_NORMAL1
-            );
+            debug_assert!(state == REMOTE_FREE_FLAGS_STATE_NORMAL);
 
             if ptr != 0 {
                 is_full = false;
@@ -701,7 +723,7 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
                 debug_assert!(ptr == 0);
                 REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST
             } else {
-                REMOTE_FREE_FLAGS_STATE_NORMAL0
+                REMOTE_FREE_FLAGS_STATE_NORMAL
             };
 
             match self.remote_free_list.compare_exchange_weak(
@@ -1137,7 +1159,7 @@ mod tests {
                 let remote_free_list = seg0.pages[page_i].remote_free_list.load(Ordering::SeqCst);
 
                 // each one of these should contain one block here and one block on the thread delayed free list
-                assert!(remote_free_list & 0b11 == _REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST);
+                assert!(remote_free_list & 0b11 == REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST);
 
                 assert_eq!(
                     remote_free_list & !0b11,
@@ -1148,7 +1170,7 @@ mod tests {
                 }
             }
             let remote_free_list_seg1_pg0 = seg1.pages[0].remote_free_list.load(Ordering::SeqCst);
-            assert!(remote_free_list_seg1_pg0 & 0b11 == REMOTE_FREE_FLAGS_STATE_NORMAL0);
+            assert!(remote_free_list_seg1_pg0 & 0b11 == REMOTE_FREE_FLAGS_STATE_NORMAL);
             assert_eq!(
                 remote_free_list_seg1_pg0 & !0b11,
                 things[128] as *const _ as usize
