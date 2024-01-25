@@ -157,9 +157,9 @@ pub struct SlabPerThreadState<'arena, T: Send> {
     root: &'arena SlabRoot<'arena, T>,
     /// Pointer to segment list (used for global ops) TODO
     segments: Cell<&'arena SlabSegmentHdr<'arena, T>>,
-    /// Pointer to head of (non-full, TODO) page list
+    /// Pointer to head of (non-full) page list
     pages: Cell<&'arena SlabSegmentPageMeta<'arena, T>>,
-    /// Pointer to end of (non-full, TODO) page list
+    /// Pointer to end of (non-full) page list
     last_page: Cell<&'arena SlabSegmentPageMeta<'arena, T>>,
     /// List of blocks freed by another thread when the containing page was full
     ///
