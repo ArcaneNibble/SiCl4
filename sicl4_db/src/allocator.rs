@@ -299,12 +299,21 @@ impl<'guard, 'arena, T: Send> SlabRootGlobalGuard<'arena, T> {
                         let full_without_thread_delayed_free =
                             outstanding_blocks.len() == num_objects;
 
-                        let mut was_in_thread_delayed_blocks = false;
-
+                        let mut delayed_free_block_for_this_page = None;
                         for x in &thread_delayed_free_blocks {
-                            outstanding_blocks.remove(x);
-                            was_in_thread_delayed_blocks = true;
+                            let was_removed = outstanding_blocks.remove(x);
+                            if was_removed {
+                                if delayed_free_block_for_this_page.is_some() {
+                                    panic!("ERR: page in thread delayed free multiple times");
+                                }
+                                delayed_free_block_for_this_page = Some(*x);
+                            }
                         }
+                        if let Some(x) = delayed_free_block_for_this_page {
+                            thread_delayed_free_blocks.remove(&x);
+                        }
+                        let was_in_thread_delayed_blocks =
+                            delayed_free_block_for_this_page.is_some();
 
                         println!("The following blocks are still allocated:");
                         for x in &outstanding_blocks {
@@ -349,6 +358,14 @@ impl<'guard, 'arena, T: Send> SlabRootGlobalGuard<'arena, T> {
                     } else {
                         break;
                     }
+                }
+
+                if thread_delayed_free_blocks.len() > 0 {
+                    println!("BAD! thread delayed free blocks exist that don't belong to us!");
+                    for x in &thread_delayed_free_blocks {
+                        println!("* 0x{:x}", x);
+                    }
+                    panic!();
                 }
             }
         }
