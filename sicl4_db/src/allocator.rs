@@ -118,7 +118,7 @@ impl<'arena, T: Send> SlabRoot<'arena, T> {
 
     /// Get a handle on one per-thread shard of the slab
     ///
-    /// Panics if [MAX_THREADS] is reached
+    /// Panics if [MAX_THREADS] is reached, or if a global lock exists
     pub fn new_thread(&'arena self) -> SlabThreadShard<'arena, T> {
         let allocated_tid;
         // TODO: relax ordering
@@ -126,7 +126,7 @@ impl<'arena, T: Send> SlabRoot<'arena, T> {
         loop {
             let next_tid = old_inuse.trailing_ones();
             if next_tid as usize >= MAX_THREADS {
-                panic!("No more threads allowed!");
+                panic!("No more threads allowed, or global lock acquired!");
             }
             let new_inuse = old_inuse | (1 << next_tid);
             match self.thread_inuse.compare_exchange_weak(
@@ -158,6 +158,41 @@ impl<'arena, T: Send> SlabRoot<'arena, T> {
             &*self.per_thread_state[allocated_tid].as_ptr()
         };
         SlabThreadShard(thread_state, PhantomData)
+    }
+
+    /// Try and get a handle for performing global operations
+    pub fn try_lock_global(&'arena self) -> Option<SlabRootGlobalGuard<'arena, T>> {
+        match self
+            .thread_inuse
+            .compare_exchange(0, u64::MAX, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => Some(SlabRootGlobalGuard(self, PhantomData)),
+            Err(_) => None,
+        }
+    }
+}
+
+/// Handle for performing global operations on the heap
+///
+/// The only way to get one of these is to go through [SlabRoot::try_lock_global]
+/// All the dangerous operations are only implemented on this object.
+pub struct SlabRootGlobalGuard<'arena, T: Send>(
+    &'arena SlabRoot<'arena, T>,
+    /// prevent this type from being `Sync`
+    PhantomData<UnsafeCell<()>>,
+);
+
+impl<'arena, T: Send> Debug for SlabRootGlobalGuard<'arena, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SlabRootGlobalGuard").field(&self.0).finish()
+    }
+}
+
+impl<'arena, T: Send> Drop for SlabRootGlobalGuard<'arena, T> {
+    fn drop(&mut self) {
+        let root = self.0;
+        // TODO: relax ordering
+        root.thread_inuse.store(0, Ordering::SeqCst);
     }
 }
 
@@ -1276,5 +1311,39 @@ mod tests {
             t0.join().unwrap();
             t1.join().unwrap();
         })
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn slab_global_lock_test() {
+        let alloc = SlabRoot::<u8>::new();
+        let thread_shard_0 = alloc.new_thread();
+        let thread_shard_1 = alloc.new_thread();
+
+        assert!(alloc.try_lock_global().is_none());
+
+        drop(thread_shard_0);
+        assert!(alloc.try_lock_global().is_none());
+
+        drop(thread_shard_1);
+        let global = alloc.try_lock_global();
+        assert!(global.is_some());
+
+        let global = global.unwrap();
+        assert_eq!(alloc.thread_inuse.load(Ordering::SeqCst), u64::MAX);
+
+        drop(global);
+        assert_eq!(alloc.thread_inuse.load(Ordering::SeqCst), 0);
+        let _thread_shard_0_again = alloc.new_thread();
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    #[should_panic]
+    fn slab_global_lock_blocks_threads_test() {
+        let alloc = SlabRoot::<u8>::new();
+        let _global = alloc.try_lock_global().unwrap();
+
+        let _thread_shard = alloc.new_thread();
     }
 }
