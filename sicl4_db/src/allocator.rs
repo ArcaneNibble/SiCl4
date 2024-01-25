@@ -1015,15 +1015,16 @@ pub union SlabBlock<'arena, T> {
     free: ManuallyDrop<SlabFreeBlock<'arena>>,
     pub alloced: ManuallyDrop<MaybeUninit<T>>,
 }
+// safety: this is a wrapper for T
+// if exposed outside of this module, the free variant (where the danger lies) is inaccessible
+unsafe impl<'arena, T: Send> Send for SlabBlock<'arena, T> {}
+unsafe impl<'arena, T: Sync> Sync for SlabBlock<'arena, T> {}
 
 /// Contents of a slab block when it is free (i.e. free chain)
 #[repr(C)]
 struct SlabFreeBlock<'arena> {
     next: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
 }
-// safety: only one thread will manipulate this at once
-// according to all of the invariants of this allocator
-unsafe impl<'arena> Sync for SlabFreeBlock<'arena> {}
 
 impl<'arena> Debug for SlabFreeBlock<'arena> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
