@@ -79,7 +79,9 @@ pub struct SlabRoot<'arena, T: Send> {
     /// (and it hasn't been dropped yet)
     thread_inuse: AtomicU64,
     /// Actual storage for per-thread data
-    per_thread_state: [SlabPerThreadState<'arena, T>; MAX_THREADS],
+    per_thread_state: [MaybeUninit<SlabPerThreadState<'arena, T>>; MAX_THREADS],
+    /// Indicates whether or not the state has been initialized
+    per_thread_state_inited: [Cell<bool>; MAX_THREADS],
     /// Ensure `'arena` lifetime is invariant
     _p: PhantomData<Cell<&'arena ()>>,
 }
@@ -89,20 +91,10 @@ unsafe impl<'arena, T: Send> Sync for SlabRoot<'arena, T> {}
 impl<'arena, T: Send> SlabRoot<'arena, T> {
     /// Allocate a new root object for a slab memory allocator
     pub fn new() -> Self {
-        // safety: standard array per-element init, where a MaybeUninit doesn't require init
-        let mut per_thread_state: [MaybeUninit<SlabPerThreadState<T>>; MAX_THREADS] =
-            unsafe { MaybeUninit::uninit().assume_init() };
-
-        // use the trick from the shared-arena crate
-        // (except corrected, see https://github.com/sebastiencs/shared-arena/issues/6)
-        // in order to push the safety requirement down to SlabPerThreadState::init
-        for i in 0..MAX_THREADS {
-            let _ = SlabPerThreadState::init(&mut per_thread_state[i], i as u64);
-        }
-
         Self {
             thread_inuse: AtomicU64::new(0),
-            per_thread_state: unsafe { mem::transmute(per_thread_state) },
+            per_thread_state: unsafe { MaybeUninit::uninit().assume_init() },
+            per_thread_state_inited: std::array::from_fn(|_| Cell::new(false)),
             _p: PhantomData,
         }
     }
@@ -136,12 +128,18 @@ impl<'arena, T: Send> SlabRoot<'arena, T> {
             }
         }
 
-        let thread_state = &self.per_thread_state[allocated_tid];
-        let root_ptr = addr_of!(thread_state.root) as *mut Option<&'arena SlabRoot<'arena, T>>;
-        unsafe {
-            // safety: current thread now owns this slice of per_thread_state exclusively
-            (*root_ptr) = Some(self);
-        }
+        let thread_state = unsafe {
+            // safety: current thread now owns this slice of per_thread_state and per_thread_state_inited exclusively
+            if !self.per_thread_state_inited[allocated_tid].get() {
+                SlabPerThreadState::<'arena, T>::init(
+                    self.per_thread_state[allocated_tid].as_ptr() as *mut _,
+                    allocated_tid as u64,
+                    self,
+                );
+                self.per_thread_state_inited[allocated_tid].set(true);
+            }
+            &*self.per_thread_state[allocated_tid].as_ptr()
+        };
         SlabThreadShard(thread_state, PhantomData)
     }
 }
@@ -156,13 +154,13 @@ pub struct SlabPerThreadState<'arena, T: Send> {
     /// Pointer to the [SlabRoot] this belongs to
     ///
     /// Can be removed if `offset_of!` gets stabilized
-    root: Option<&'arena SlabRoot<'arena, T>>,
+    root: &'arena SlabRoot<'arena, T>,
     /// Pointer to segment list (used for global ops) TODO
-    segments: Cell<Option<&'arena SlabSegmentHdr<'arena, T>>>,
+    segments: Cell<&'arena SlabSegmentHdr<'arena, T>>,
     /// Pointer to head of (non-full, TODO) page list
-    pages: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
+    pages: Cell<&'arena SlabSegmentPageMeta<'arena, T>>,
     /// Pointer to end of (non-full, TODO) page list
-    last_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
+    last_page: Cell<&'arena SlabSegmentPageMeta<'arena, T>>,
     /// List of blocks freed by another thread when the containing page was full
     ///
     /// This is an optimization to prevent having to search through many full pages
@@ -183,25 +181,34 @@ const REMOTE_FREE_FLAGS_STATE_NORMAL1: usize = 0b10;
 
 impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
     /// Initialize state
-    pub fn init(self_: &mut MaybeUninit<Self>, tid: u64) -> &mut Self {
+    pub unsafe fn init(self_: *mut Self, tid: u64, root: &'arena SlabRoot<'arena, T>) {
+        // alloc initial segment
+        let new_initial_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(tid);
+        let new_initial_seg = unsafe {
+            // 😱 this is super dangerous wrt uninit memory
+            // hopefully it doesn't break
+            (*new_initial_seg).owning_thread_state = mem::transmute(self_);
+            (*new_initial_seg).next = None;
+            &*new_initial_seg
+        };
+
         unsafe {
-            let p = self_.as_mut_ptr();
-            (*p).tid = tid;
-            (*p).root = None;
-            (*p).segments = Cell::new(None);
-            (*p).pages = Cell::new(None);
-            (*p).last_page = Cell::new(None);
-            (*p).thread_delayed_free = AtomicPtr::new(ptr::null_mut());
-            // safety: we initialized everything
-            &mut *p
+            (*self_).tid = tid;
+            (*self_).root = root;
+            (*self_).segments = Cell::new(new_initial_seg);
+            (*self_).pages = Cell::new(&new_initial_seg.pages[0]);
+            (*self_).last_page = Cell::new(&new_initial_seg.pages[PAGES_PER_SEG - 1]);
+            (*self_).thread_delayed_free = AtomicPtr::new(ptr::null_mut());
         }
+
+        // safety: we initialized everything
     }
 
     /// Allocate a new segment, link it into segments list,
     /// and make it the *entirety* of the pages list
     fn new_seg(&'arena self) {
         let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
-        let old_seg_head = self.segments.take();
+        let old_seg_head = Some(self.segments.get());
         let new_seg = unsafe {
             (*new_seg).owning_thread_state = self;
             (*new_seg).next = old_seg_head;
@@ -209,9 +216,9 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             // *including* the owning_thread_state footgun
             &*new_seg
         };
-        self.segments.set(Some(new_seg));
-        self.pages.set(Some(&new_seg.pages[0]));
-        self.last_page.set(Some(&new_seg.pages[PAGES_PER_SEG - 1]));
+        self.segments.set(new_seg);
+        self.pages.set(&new_seg.pages[0]);
+        self.last_page.set(&new_seg.pages[PAGES_PER_SEG - 1]);
     }
 
     /// Allocation slow path
@@ -242,7 +249,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             }
         }
 
-        let mut page = self.pages.get().unwrap();
+        let mut page = self.pages.get();
         loop {
             page.collect_free_lists();
             if page.this_free_list.get().is_some() {
@@ -251,14 +258,14 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                 // this page is full, and so has every page we've passed by so far
                 match page.next_page.get() {
                     Some(next_page) => {
-                        self.pages.set(Some(next_page));
+                        self.pages.set(next_page);
                         page = next_page;
                     }
                     None => {
                         self.new_seg();
                         return (
-                            self.pages.get().unwrap(),
-                            self.pages.get().unwrap().this_free_list.get().unwrap(),
+                            self.pages.get(),
+                            self.pages.get().this_free_list.get().unwrap(),
                         );
                     }
                 }
@@ -270,12 +277,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
     ///
     /// Does *NOT* initialize any of the resulting memory
     pub fn alloc(&'arena self) -> &'arena SlabBlock<'arena, T> {
-        // XXX we now have one more branch vs msft
-        if self.pages.get().is_none() {
-            self.new_seg();
-        }
-
-        let fast_page = self.pages.get().unwrap();
+        let fast_page = self.pages.get();
         let fast_block = fast_page.this_free_list.get();
         let (page, block) = match fast_block {
             Some(x) => (fast_page, x), // fast path
@@ -317,12 +319,8 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                 && prev_remote_list != REMOTE_FREE_FLAGS_STATE_NORMAL1
             {
                 seg.pages[page_i].next_page.set(None);
-                self.last_page
-                    .get()
-                    .unwrap()
-                    .next_page
-                    .set(Some(&seg.pages[page_i]));
-                self.last_page.set(Some(&seg.pages[page_i]));
+                self.last_page.get().next_page.set(Some(&seg.pages[page_i]));
+                self.last_page.set(&seg.pages[page_i]);
             }
 
             let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
@@ -429,7 +427,7 @@ impl<'arena, T: Send> Deref for SlabThreadShard<'arena, T> {
 
 impl<'arena, T: Send> Drop for SlabThreadShard<'arena, T> {
     fn drop(&mut self) {
-        let root = self.0.root.unwrap();
+        let root = self.0.root;
         let mask = !(1 << self.0.tid);
         // TODO: relax ordering
         root.thread_inuse.fetch_and(mask, Ordering::SeqCst);
@@ -719,16 +717,16 @@ mod tests {
         assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b1);
         unsafe {
             assert_eq!(
-                slab.per_thread_state.as_ptr().offset(0),
-                *shard1 as *const _
+                slab.per_thread_state.as_ptr().offset(0) as usize,
+                *shard1 as *const _ as usize
             );
         }
         let shard2 = slab.new_thread();
         assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b11);
         unsafe {
             assert_eq!(
-                slab.per_thread_state.as_ptr().offset(1),
-                *shard2 as *const _
+                slab.per_thread_state.as_ptr().offset(1) as usize,
+                *shard2 as *const _ as usize
             );
         }
 
@@ -741,8 +739,8 @@ mod tests {
         assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b11);
         unsafe {
             assert_eq!(
-                slab.per_thread_state.as_ptr().offset(0),
-                *shard1_2 as *const _
+                slab.per_thread_state.as_ptr().offset(0) as usize,
+                *shard1_2 as *const _ as usize
             );
         }
     }
@@ -813,7 +811,7 @@ mod tests {
         unsafe { thread_shard.free(obj_1) };
 
         unsafe {
-            let seg = thread_shard.segments.get().unwrap();
+            let seg = thread_shard.segments.get();
             assert_eq!(
                 seg.pages[0].local_free_list.get().unwrap() as *const _ as usize,
                 obj_1 as *const _ as usize
@@ -840,7 +838,7 @@ mod tests {
         unsafe { thread_shard_1.free(obj_1) };
 
         unsafe {
-            let seg = thread_shard_0.segments.get().unwrap();
+            let seg = thread_shard_0.segments.get();
             print!(
                 "{}",
                 _debug_hexdump(seg as *const _ as *const u8, ALLOC_PAGE_SZ).unwrap()
@@ -995,7 +993,7 @@ mod tests {
 
         // delayed free list tests
         {
-            let seg1 = thread_shard_0.segments.get().unwrap();
+            let seg1 = thread_shard_0.segments.get();
             let seg0 = seg1.next.unwrap();
 
             for page_i in 0..64 {
