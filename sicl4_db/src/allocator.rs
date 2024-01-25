@@ -1021,6 +1021,9 @@ pub union SlabBlock<'arena, T> {
 struct SlabFreeBlock<'arena> {
     next: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
 }
+// safety: only one thread will manipulate this at once
+// according to all of the invariants of this allocator
+unsafe impl<'arena> Sync for SlabFreeBlock<'arena> {}
 
 impl<'arena> Debug for SlabFreeBlock<'arena> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1564,6 +1567,71 @@ mod tests {
                 ._debug_check_missing_blocks();
             assert_eq!(outstanding_blocks.len(), 0);
         })
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn slab_not_loom_smoke_test() {
+        let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000]>::new()));
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        let n_objs = 1_000_000;
+
+        let t0 = std::thread::spawn(move || {
+            let thread_shard_0 = alloc.new_thread();
+            let mut alloc_history = Vec::new();
+            let mut prev = None;
+            for _ in 0..n_objs {
+                let obj = thread_shard_0.alloc();
+                let obj_addr = obj as *const _ as usize;
+                alloc_history.push(obj_addr);
+                // in range
+                let mut in_range = false;
+                let mut seg = thread_shard_0.segments.get();
+                loop {
+                    if (obj_addr >= seg as *const _ as usize)
+                        && (obj_addr < seg as *const _ as usize + SEGMENT_SZ)
+                    {
+                        in_range = true;
+                        break;
+                    }
+
+                    if seg.next.is_some() {
+                        seg = seg.next.unwrap();
+                    } else {
+                        break;
+                    }
+                }
+                assert!(in_range);
+
+                // delay freeing by 1
+                if let Some(prev) = prev {
+                    let prev_addr = prev as *const _ as usize;
+                    // check that we didn't dup allocate a block
+                    assert!(obj_addr != prev_addr);
+                    sender.send(prev).unwrap();
+                }
+                prev = Some(obj);
+            }
+            sender.send(prev.unwrap()).unwrap();
+        });
+
+        let t1 = std::thread::spawn(move || {
+            let thread_shard_1 = alloc.new_thread();
+            for _ in 0..n_objs {
+                let obj = receiver.recv().unwrap();
+                unsafe { thread_shard_1.free(obj) }
+            }
+        });
+
+        t0.join().unwrap();
+        t1.join().unwrap();
+
+        let outstanding_blocks = alloc
+            .try_lock_global()
+            .unwrap()
+            ._debug_check_missing_blocks();
+        assert_eq!(outstanding_blocks.len(), 0);
     }
 
     #[cfg(not(loom))]
