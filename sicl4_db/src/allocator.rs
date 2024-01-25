@@ -19,7 +19,7 @@ use std::{
     mem::{self, size_of, ManuallyDrop, MaybeUninit},
     ops::Deref,
     ptr::{self, addr_of, addr_of_mut},
-    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
 };
 
 use crate::util::divroundup;
@@ -174,6 +174,11 @@ pub struct SlabPerThreadState<'arena, T: Send> {
 // the footgun is contained
 unsafe impl<'arena, T: Send> Sync for SlabPerThreadState<'arena, T> {}
 
+const REMOTE_FREE_FLAGS_STATE_NORMAL0: usize = 0b00;
+const REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST: usize = 0b01;
+const _REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST: usize = 0b11;
+const REMOTE_FREE_FLAGS_STATE_NORMAL1: usize = 0b10;
+
 impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
     /// Initialize state
     pub fn init(self_: &mut MaybeUninit<Self>, tid: u64) -> &mut Self {
@@ -277,6 +282,9 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
 
         if self.tid == (*seg).owning_tid {
             // local free
+
+            // FIXME need to take the page off of the full list
+
             let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
             (*obj_mut).free.next = seg.pages[page_i].local_free_list.get();
             seg.pages[page_i]
@@ -284,20 +292,66 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                 .set(Some(mem::transmute(obj)));
         } else {
             // remote free
-            // TODO: full list
+
+            // when freeing from the normal state, it is not possible to miss
+            // the transition into in-full-list state because this is done atomically.
+            // (so either state is normal and alloc will pick up this block we just freed,
+            // or else state will change to in-full-list and we will add to the thread delayed free list).
+
+            // when freeing from the in-full-list state it *is* possible to miss
+            // the transition into the in-thread-delayed-list state.
+            // the consequence of this is that this block being freed will be added
+            // to the thread delayed free list even though there is already another
+            // block from the same page there. this is not a correctness issue,
+            // it is just less optimal than ideal
+
+            // when freeing from the in-full-list state it FIXME FIXME FIXME
+            // the transition back into the normal state.
+
+            // when freeing from the in-thread-delayed-list state, FIXME FIXME FIXME TODO
+
             let page = &seg.pages[page_i];
             let mut prev_remote_free = page.remote_free_list.load(Ordering::SeqCst);
             loop {
-                let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
-                (*obj_mut).free.next = Some(&*prev_remote_free);
-                match page.remote_free_list.compare_exchange_weak(
-                    prev_remote_free,
-                    obj_ptr as _,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => break,
-                    Err(x) => prev_remote_free = x,
+                let flag_bits = prev_remote_free as usize & 0b11;
+                if flag_bits != REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST {
+                    println!("free from normal or delayed");
+                    // normal state or in-thread-delayed-list state
+                    // push onto remote free list
+                    let next_block_proper_addr = (prev_remote_free as usize & !0b11) as *const _;
+                    let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
+                    (*obj_mut).free.next = Some(&*next_block_proper_addr);
+                    match page.remote_free_list.compare_exchange_weak(
+                        prev_remote_free,
+                        (obj_ptr | flag_bits) as _,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(x) => prev_remote_free = x,
+                    }
+                } else {
+                    println!("free from full");
+                    // in-full-list state
+                    page.remote_free_list.fetch_or(0b10, Ordering::SeqCst);
+                    // push onto thread delayed free
+                    let per_thread = seg.owning_thread_state;
+                    let mut prev_thread_delayed_free =
+                        per_thread.thread_delayed_free.load(Ordering::SeqCst);
+                    loop {
+                        let obj_mut = obj as *const _ as *mut SlabBlock<'arena, T>;
+                        (*obj_mut).free.next = Some(&*prev_thread_delayed_free);
+                        match per_thread.thread_delayed_free.compare_exchange_weak(
+                            prev_thread_delayed_free,
+                            obj_ptr as _,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => break,
+                            Err(x) => prev_thread_delayed_free = x,
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -419,7 +473,7 @@ struct SlabSegmentPageMeta<'arena, T: Send> {
     /// List that we free to from the same thread
     local_free_list: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
     /// List that other threads free onto
-    remote_free_list: AtomicPtr<SlabFreeBlock<'arena>>,
+    remote_free_list: AtomicUsize,
     _p: PhantomData<T>, // FIXME what does "covariant (with drop check)" mean?
 }
 // safety: we carefully use atomic operations on remote_free_list,
@@ -478,18 +532,24 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
         // collect other threads
         let mut prev_remote_free = self.remote_free_list.load(Ordering::SeqCst);
         loop {
-            // state must be normal
-            debug_assert!(prev_remote_free as usize & 0b11 == 0b00);
+            let state = prev_remote_free & 0b11;
+            let ptr = prev_remote_free & !0b11;
 
-            if !prev_remote_free.is_null() {
+            // state must be normal
+            debug_assert!(
+                state == REMOTE_FREE_FLAGS_STATE_NORMAL0
+                    || state == REMOTE_FREE_FLAGS_STATE_NORMAL1
+            );
+
+            if ptr != 0 {
                 is_full = false;
             }
 
             let remote_free_new_ptr_with_flags = if is_full {
-                debug_assert!(prev_remote_free.is_null());
-                0b01 as *mut _
+                debug_assert!(ptr == 0);
+                REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST
             } else {
-                ptr::null_mut()
+                REMOTE_FREE_FLAGS_STATE_NORMAL0
             };
 
             match self.remote_free_list.compare_exchange_weak(
@@ -502,6 +562,8 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
                 Err(x) => prev_remote_free = x,
             }
         }
+
+        let remote_free_list_ptr = (prev_remote_free & !0b11) as *const SlabFreeBlock<'arena>;
 
         // the only possible state transition allowed here for the remote free list is
         // normal -> in-full-list
@@ -516,14 +578,14 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
         // * freeing from the normal state
         // * setting the state to in-full-list is atomic with consuming the remote free list
 
-        if !prev_remote_free.is_null() {
+        if !remote_free_list_ptr.is_null() {
             // append to end of our free list
             if our_free_list.is_none() {
                 // only remote free, none of ours
                 self.this_free_list.set(Some(unsafe {
                     // safety: these blocks should definitely belong to our allocation
                     // assuming we didn't mess up
-                    &*prev_remote_free
+                    &*remote_free_list_ptr
                 }));
             } else {
                 while our_free_list.unwrap().next.is_some() {
@@ -534,7 +596,7 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
                     // assuming we didn't mess up. we can't data race on next because
                     // current thread owns all of the local free list
                     let next = addr_of!(our_free_list.unwrap().next);
-                    *(next as *mut _) = Some(&*prev_remote_free);
+                    *(next as *mut _) = Some(&*remote_free_list_ptr);
                 }
                 self.this_free_list.set(our_free_list);
             }
@@ -858,6 +920,8 @@ mod tests {
             things2.push(obj);
         }
 
+        /*
+        FIXME FIXME FIXME
         // XXX this is a pretty unstable test
         // everything is alloc from the new segment until the 129th item
         // which comes from the existing seg, it just so happens to
@@ -866,5 +930,82 @@ mod tests {
             things2[128] as *const _ as usize,
             things[127] as *const _ as usize
         );
+        */
+    }
+
+    #[test]
+    fn slab_test_remote_free() {
+        let alloc = SlabRoot::<[u8; 30000]>::new();
+        let thread_shard_0 = alloc.new_thread();
+        let thread_shard_1 = alloc.new_thread();
+        let mut things = Vec::new();
+        for i in 0..129 {
+            let obj = thread_shard_0.alloc();
+            println!("Allocated obj {:3} {:?}", i, obj as *const _);
+            things.push(obj);
+        }
+
+        for i in 0..129 {
+            let obj = things[i];
+            unsafe { thread_shard_1.free(obj) };
+            println!("Freed obj {:3}", i);
+        }
+
+        // delayed free list tests
+        {
+            let seg1 = thread_shard_0.segments.get().unwrap();
+            let seg0 = seg1.next.unwrap();
+
+            for page_i in 0..64 {
+                let remote_free_list = seg0.pages[page_i].remote_free_list.load(Ordering::SeqCst);
+
+                // each one of these should contain one block here and one block on the thread delayed free list
+                assert!(remote_free_list & 0b11 == _REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST);
+
+                assert_eq!(
+                    remote_free_list & !0b11,
+                    things[page_i * 2 + 1] as *const _ as usize
+                );
+                unsafe {
+                    assert_eq!(*((remote_free_list & !0b11) as *const usize), 0);
+                }
+            }
+            let remote_free_list_seg1_pg0 = seg1.pages[0].remote_free_list.load(Ordering::SeqCst);
+            assert!(remote_free_list_seg1_pg0 & 0b11 == REMOTE_FREE_FLAGS_STATE_NORMAL0);
+            assert_eq!(
+                remote_free_list_seg1_pg0 & !0b11,
+                things[128] as *const _ as usize
+            );
+        }
+
+        let mut test_thread_delayed_item =
+            thread_shard_0.thread_delayed_free.load(Ordering::SeqCst) as *const usize;
+        for i in (0..64).rev() {
+            assert_eq!(
+                test_thread_delayed_item as usize,
+                things[i * 2] as *const _ as usize
+            );
+            unsafe {
+                test_thread_delayed_item = *test_thread_delayed_item as *const usize;
+            }
+        }
+
+        let mut things2 = Vec::new();
+        for i in 0..129 {
+            let obj = thread_shard_0.alloc();
+            println!("Allocated obj {:3} again {:?}", i, obj as *const _);
+            things2.push(obj);
+        }
+
+        /*
+        // XXX this is a pretty unstable test
+        // everything is alloc from the new segment until the 129th item
+        // which comes from the existing seg, it just so happens to
+        // be the second half of the last block
+        assert_eq!(
+            things2[128] as *const _ as usize,
+            things[127] as *const _ as usize
+        );
+        */
     }
 }
