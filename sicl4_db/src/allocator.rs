@@ -207,9 +207,36 @@ impl<'arena, T: Send> Debug for SlabPerThreadState<'arena, T> {
     }
 }
 
+/// Flags shoved into low bits of [SlabSegmentPageMeta::remote_free_list]
+///
+/// This state is "normal" and indicates that the page is not full
+/// (and is thus part of the owning thread's page linked list).
 const REMOTE_FREE_FLAGS_STATE_NORMAL0: usize = 0b00;
+/// Flags shoved into low bits of [SlabSegmentPageMeta::remote_free_list]
+///
+/// This state is "in-full-list" and indicates that the page is full
+/// (and is thus no longer part of the owning thread's page linked list).
+/// If something is remote freed in this page, that block needs to end
+/// up on the thread delayed free block list.
 const REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST: usize = 0b01;
+/// Flags shoved into low bits of [SlabSegmentPageMeta::remote_free_list]
+///
+/// This state is "in-thread-delayed-free" and indicates that the page is full
+/// (and is thus no longer part of the owning thread's page linked list).
+/// Additionally, it means that something has already been remote freed
+/// inside this page (that previous something is on the
+/// thread delayed free block list of the thread that owns this page).
+/// As an optimization, remote freeing can once again happen onto the
+/// page-local remote free list, because that *previous* something is
+/// sufficient to bring the page back into the linked list where
+/// the rest of the page-local remote free list will be swept eventually.
 const _REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST: usize = 0b11;
+/// Flags shoved into low bits of [SlabSegmentPageMeta::remote_free_list]
+///
+/// This state is "normal" and indicates that the page is not full
+/// (and is thus part of the owning thread's page linked list).
+/// This redundant state allows for a micro-simplification of
+/// the "free onto thread delayed free block list" situation.
 const REMOTE_FREE_FLAGS_STATE_NORMAL1: usize = 0b10;
 
 impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
@@ -239,6 +266,9 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
 
     /// Allocate a new segment, link it into segments list,
     /// and make it the *entirety* of the pages list
+    ///
+    /// Memory unsafety is contained, but this can mess up invariants
+    /// (and thus isn't public)
     fn new_seg(&'arena self) {
         let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
         let old_seg_head = Some(self.segments.get());
@@ -291,10 +321,14 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                 // this page is full, and so has every page we've passed by so far
                 match page.next_page.get() {
                     Some(next_page) => {
+                        // here we actually unlink the full page we just passed
+                        // the remote free list flag update happens inside
+                        // collect_free_lists (where correctness is more carefully explained)
                         self.pages.set(next_page);
                         page = next_page;
                     }
                     None => {
+                        // here we have run out of memory in our heap and need to ask the OS for more
                         self.new_seg();
                         return (
                             self.pages.get(),
@@ -333,7 +367,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         let seg = &*(seg_ptr as *const SlabSegmentHdr<'arena, T>);
         let page_i = (obj_ptr - seg_ptr) >> ALLOC_PAGE_SHIFT;
 
-        // we don't allow freeing null?
+        // we don't allow freeing null so unlike msft we don't need to check for it
 
         if self.tid == (*seg).owning_tid {
             // local free
@@ -341,7 +375,8 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             // if we got here, we *know* we're no longer full
             // (regardless of how we might race the state transition
             // between in-full-list and in-thread-delayed-list)
-            // so take ourselves off if necessary.
+            // so take ourselves off of the full list if necessary
+            // (i.e. link this page back in).
             //
             // it is not possible to race against any other arcs,
             // as they are synchronous with us on our own thread
@@ -687,9 +722,14 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
             debug_assert!(remote_free_list_ptr.is_null());
         }
 
-        // the only possible state transition allowed here for the remote free list is
-        // normal -> in-full-list
-        // the race that needs to be checked for is "we put this page on the full list,
+        // this function can only be called when the state is already
+        // normal (and this page has been linked back in to the linked list)
+        //
+        // we _might_ make a state transition here of normal -> in-full-list
+        // (which other threads need to be aware of)
+        // but there are no valid state transitions that we can miss here
+        //
+        // the race that *actually* needs to be checked for is "we put this page on the full list,
         // but at the same time another thread frees something (making it not full anymore)
         // but we miss that free and thus never manage to access this block again"
         //
@@ -699,6 +739,8 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
         // * freeing from the in-thread-delayed-list state requires moving through the in-full-list state
         // * when freeing from the normal state, setting the state to in-full-list
         //   is atomic with consuming the remote free list
+        //
+        // this last point is the reason why pointer bit packing is required
 
         if !remote_free_list_ptr.is_null() {
             // append to end of our free list
