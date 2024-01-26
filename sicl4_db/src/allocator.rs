@@ -1582,10 +1582,21 @@ mod tests {
                 let thread_shard_0 = alloc.new_thread();
                 let mut alloc_history = Vec::new();
                 let mut prev = None;
-                for _ in 0..n_objs {
+                for i in 0..n_objs {
                     let obj = thread_shard_0.alloc();
                     let obj_addr = obj as *const _ as usize;
                     alloc_history.push(obj_addr);
+                    unsafe {
+                        let obj_ = obj.alloced.as_ptr() as *mut [u8; 30000];
+                        (*obj_)[0] = 0xef;
+                        (*obj_)[1] = 0xbe;
+                        (*obj_)[2] = 0xad;
+                        (*obj_)[3] = 0xde;
+                        (*obj_)[4] = i as u8;
+                        (*obj_)[5] = (i >> 8) as u8;
+                        (*obj_)[6] = (i >> 16) as u8;
+                        (*obj_)[7] = (i >> 24) as u8;
+                    }
                     // in range
                     assert!(obj_addr >= thread_shard_0.segments.get() as *const _ as usize);
                     assert!(
@@ -1606,9 +1617,13 @@ mod tests {
 
             let t1 = loom::thread::spawn(move || {
                 let thread_shard_1 = alloc.new_thread();
-                for _ in 0..n_objs {
+                for i in 0..n_objs {
                     let obj = receiver.recv().unwrap();
-                    unsafe { thread_shard_1.free(obj) }
+                    unsafe {
+                        let obj_ = obj.alloced.as_ptr() as *const u64;
+                        assert_eq!(*obj_, (i << 32) | 0xdeadbeef);
+                        thread_shard_1.free(obj)
+                    }
                 }
             });
 
@@ -1629,15 +1644,26 @@ mod tests {
         let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000]>::new()));
         let (sender, receiver) = std::sync::mpsc::channel();
 
-        let n_objs = 1_000_000;
+        let n_objs = 10_000_000;
 
         let t0 = std::thread::spawn(move || {
             let thread_shard_0 = alloc.new_thread();
             let mut alloc_history = Vec::new();
             let mut prev = None;
-            for _ in 0..n_objs {
+            for i in 0..n_objs {
                 let obj = thread_shard_0.alloc();
                 let obj_addr = obj as *const _ as usize;
+                unsafe {
+                    let obj_ = obj.alloced.as_ptr() as *mut [u8; 30000];
+                    (*obj_)[0] = 0xef;
+                    (*obj_)[1] = 0xbe;
+                    (*obj_)[2] = 0xad;
+                    (*obj_)[3] = 0xde;
+                    (*obj_)[4] = i as u8;
+                    (*obj_)[5] = (i >> 8) as u8;
+                    (*obj_)[6] = (i >> 16) as u8;
+                    (*obj_)[7] = (i >> 24) as u8;
+                }
                 alloc_history.push(obj_addr);
                 // in range
                 let mut in_range = false;
@@ -1672,9 +1698,13 @@ mod tests {
 
         let t1 = std::thread::spawn(move || {
             let thread_shard_1 = alloc.new_thread();
-            for _ in 0..n_objs {
+            for i in 0..n_objs {
                 let obj = receiver.recv().unwrap();
-                unsafe { thread_shard_1.free(obj) }
+                unsafe {
+                    let obj_ = obj.alloced.as_ptr() as *const u64;
+                    assert_eq!(*obj_, (i << 32) | 0xdeadbeef);
+                    thread_shard_1.free(obj)
+                }
             }
         });
 
