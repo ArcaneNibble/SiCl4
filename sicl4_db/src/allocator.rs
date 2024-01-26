@@ -510,13 +510,18 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
         &'arena SlabFreeBlock<'arena>,
     ) {
         // collect thread delayed free block list and free them all
+        // order: on success, we need to see *all* of the writes to the next pointers
+        // that have been set by other threads remote freeing, so order is acquire
+        // this will obviously synchronize-with the most recent write.
+        // as for previous writes, the intermediate updates to thread_delayed_free
+        // are RmW operations, so they will be part of the release sequence of
+        // the previous (now overwritten) writes to thread_delayed_free.
+        // thus this will synchronize-with *all* of those
         let mut thread_delayed_free = self
             .thread_delayed_free
-            .fetch_update(
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-                |_| Some(ptr::null_mut()),
-            )
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |_| {
+                Some(ptr::null_mut())
+            })
             .unwrap();
 
         while !thread_delayed_free.is_null() {
@@ -670,14 +675,18 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                             // we won, so push onto thread delayed free
                             let per_thread = seg.owning_thread_state;
                             let mut prev_thread_delayed_free =
-                                per_thread.thread_delayed_free.load(Ordering::SeqCst);
+                                per_thread.thread_delayed_free.load(Ordering::Relaxed);
                             loop {
                                 obj.free.next.set(Some(&*prev_thread_delayed_free));
+                                // order: on success, we are currently the most recent
+                                // modification to thread_delayed_free
+                                // we use release ordering so that writes to obj.free.next
+                                // happens-before processing of it in the allocation slow path
                                 match per_thread.thread_delayed_free.compare_exchange_weak(
                                     prev_thread_delayed_free,
                                     obj_ptr as _,
-                                    Ordering::SeqCst,
-                                    Ordering::SeqCst,
+                                    Ordering::Release,
+                                    Ordering::Relaxed,
                                 ) {
                                     Ok(_) => break,
                                     Err(x) => prev_thread_delayed_free = x,
