@@ -387,21 +387,29 @@ impl<'guard, 'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
         all_outstanding_blocks
     }
 
-    // FIXME this isn't easily generic to handle both cells and wires
-    pub fn _debug_check_missing_blocks(&'guard self) -> HashSet<usize> {
+    // returns outstanding blocks for cells and wires in separate hashsets
+    pub fn _debug_check_missing_blocks(&'guard self) -> (HashSet<usize>, HashSet<usize>) {
         let mut all_outstanding_blocks_cells = HashSet::new();
+        let mut all_outstanding_blocks_wires = HashSet::new();
 
         for thread_i in 0..MAX_THREADS {
             if self.0.per_thread_state_inited[thread_i].get() {
                 let per_thread = unsafe { &*self.0.per_thread_state[thread_i].as_ptr() };
+                println!("~~~~~ Checking netlist cells ~~~~~");
                 let outstanding_cells_this_thread =
                     Self::__debug_check_ty_missing_blocks(thread_i, &per_thread.netlist_cells);
                 for x in outstanding_cells_this_thread {
                     all_outstanding_blocks_cells.insert(x);
                 }
+                println!("~~~~~ Checking netlist wires ~~~~~");
+                let outstanding_wires_this_thread =
+                    Self::__debug_check_ty_missing_blocks(thread_i, &per_thread.netlist_wires);
+                for x in outstanding_wires_this_thread {
+                    all_outstanding_blocks_wires.insert(x);
+                }
             }
         }
-        all_outstanding_blocks_cells
+        (all_outstanding_blocks_cells, all_outstanding_blocks_wires)
     }
 }
 
@@ -417,8 +425,8 @@ pub struct SlabPerThreadState<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync
     root: &'arena SlabRoot<'arena, CellsTy, WiresTy>,
     /// Manages memory for netlist cells
     netlist_cells: SlabPerThreadPerTyState<'arena, CellsTy>,
-    // fixme
-    _p: PhantomData<WiresTy>,
+    /// Manages memory for netlist wires
+    netlist_wires: SlabPerThreadPerTyState<'arena, WiresTy>,
 }
 
 impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
@@ -430,6 +438,7 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
             .field("tid", &self.tid)
             .field("root", &self.root)
             .field("netlist_cells", &self.netlist_cells)
+            .field("netlist_wires", &self.netlist_wires)
             .finish()
     }
 }
@@ -444,6 +453,7 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
         root: &'arena SlabRoot<'arena, CellsTy, WiresTy>,
     ) {
         SlabPerThreadPerTyState::init(addr_of_mut!((*self_).netlist_cells), tid);
+        SlabPerThreadPerTyState::init(addr_of_mut!((*self_).netlist_wires), tid);
 
         (*self_).tid = tid;
         (*self_).root = root;
@@ -464,6 +474,21 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
     /// and no other references may exist after calling free
     pub unsafe fn free_netlist_cell(&'arena self, obj: &'arena SlabBlock<'arena, CellsTy>) {
         self.netlist_cells.free(self.tid, obj);
+    }
+
+    /// Allocates a netlist wire from this shard
+    ///
+    /// Does *NOT* initialize any of the resulting memory
+    pub fn alloc_netlist_wire(&'arena self) -> &'arena SlabBlock<'arena, WiresTy> {
+        self.netlist_wires.alloc(self.tid)
+    }
+
+    /// Deallocates a netlist wire
+    ///
+    /// Object must be part of this slab, not already be freed,
+    /// and no other references may exist after calling free
+    pub unsafe fn free_netlist_wire(&'arena self, obj: &'arena SlabBlock<'arena, WiresTy>) {
+        self.netlist_wires.free(self.tid, obj);
     }
 }
 
@@ -1318,11 +1343,12 @@ mod tests {
         }
 
         drop(thread_shard);
-        let outstanding_blocks = alloc
+        let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert_eq!(outstanding_blocks.len(), 0);
+        assert_eq!(outstanding_blocks_cells.len(), 0);
+        assert_eq!(outstanding_blocks_wires.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1359,11 +1385,12 @@ mod tests {
 
         drop(thread_shard_0);
         drop(thread_shard_1);
-        let outstanding_blocks = alloc
+        let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert_eq!(outstanding_blocks.len(), 0);
+        assert_eq!(outstanding_blocks_cells.len(), 0);
+        assert_eq!(outstanding_blocks_wires.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1394,13 +1421,14 @@ mod tests {
         );
 
         drop(thread_shard);
-        let mut outstanding_blocks = alloc
+        let (mut outstanding_blocks_cells, outstanding_blocks_wires) = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert!(outstanding_blocks.remove(&(obj_1_2nd_try as *const _ as usize)));
-        assert!(outstanding_blocks.remove(&(obj_2_2nd_try as *const _ as usize)));
-        assert_eq!(outstanding_blocks.len(), 0);
+        assert!(outstanding_blocks_cells.remove(&(obj_1_2nd_try as *const _ as usize)));
+        assert!(outstanding_blocks_cells.remove(&(obj_2_2nd_try as *const _ as usize)));
+        assert_eq!(outstanding_blocks_cells.len(), 0);
+        assert_eq!(outstanding_blocks_wires.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1433,13 +1461,14 @@ mod tests {
 
         drop(thread_shard_0);
         drop(thread_shard_1);
-        let mut outstanding_blocks = alloc
+        let (mut outstanding_blocks_cells, outstanding_blocks_wires) = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert!(outstanding_blocks.remove(&(obj_1_2nd_try as *const _ as usize)));
-        assert!(outstanding_blocks.remove(&(obj_2_2nd_try as *const _ as usize)));
-        assert_eq!(outstanding_blocks.len(), 0);
+        assert!(outstanding_blocks_cells.remove(&(obj_1_2nd_try as *const _ as usize)));
+        assert!(outstanding_blocks_cells.remove(&(obj_2_2nd_try as *const _ as usize)));
+        assert_eq!(outstanding_blocks_cells.len(), 0);
+        assert_eq!(outstanding_blocks_wires.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1472,13 +1501,14 @@ mod tests {
 
         drop(thread_shard_0);
         drop(thread_shard_1);
-        let mut outstanding_blocks = alloc
+        let (mut outstanding_blocks_cells, outstanding_blocks_wires) = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert!(outstanding_blocks.remove(&(obj_1_2nd_try as *const _ as usize)));
-        assert!(outstanding_blocks.remove(&(obj_2_2nd_try as *const _ as usize)));
-        assert_eq!(outstanding_blocks.len(), 0);
+        assert!(outstanding_blocks_cells.remove(&(obj_1_2nd_try as *const _ as usize)));
+        assert!(outstanding_blocks_cells.remove(&(obj_2_2nd_try as *const _ as usize)));
+        assert_eq!(outstanding_blocks_cells.len(), 0);
+        assert_eq!(outstanding_blocks_wires.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1516,14 +1546,15 @@ mod tests {
         );
 
         drop(thread_shard);
-        let mut outstanding_blocks = alloc
+        let (mut outstanding_blocks_cells, outstanding_blocks_wires) = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
         for x in things2 {
-            assert!(outstanding_blocks.remove(&(x as *const _ as usize)));
+            assert!(outstanding_blocks_cells.remove(&(x as *const _ as usize)));
         }
-        assert_eq!(outstanding_blocks.len(), 0);
+        assert_eq!(outstanding_blocks_cells.len(), 0);
+        assert_eq!(outstanding_blocks_wires.len(), 0);
     }
 
     #[cfg(not(loom))]
@@ -1605,21 +1636,24 @@ mod tests {
 
         drop(thread_shard_0);
         drop(thread_shard_1);
-        let mut outstanding_blocks = alloc
+        let (mut outstanding_blocks_cells, outstanding_blocks_wires) = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
         for x in things2 {
-            assert!(outstanding_blocks.remove(&(x as *const _ as usize)));
+            assert!(outstanding_blocks_cells.remove(&(x as *const _ as usize)));
         }
-        assert_eq!(outstanding_blocks.len(), 0);
+        assert_eq!(outstanding_blocks_cells.len(), 0);
+        assert_eq!(outstanding_blocks_wires.len(), 0);
     }
 
     #[cfg(loom)]
     #[test]
     fn slab_loom_new_thread() {
         loom::model(|| {
-            let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000], ()>::new()));
+            let alloc = &*Box::leak(Box::new(
+                SlabRoot::<'static, [u8; 30000], [u8; 30000]>::new(),
+            ));
 
             let t0 = loom::thread::spawn(move || {
                 {
@@ -1658,10 +1692,12 @@ mod tests {
     #[test]
     fn slab_loom_smoke_test() {
         loom::model(|| {
-            let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000], ()>::new()));
+            let alloc = &*Box::leak(Box::new(
+                SlabRoot::<'static, [u8; 30000], [u8; 30000]>::new(),
+            ));
             let (sender, receiver) = loom::sync::mpsc::channel();
 
-            let n_objs = 4;
+            let n_objs = 5;
 
             let t0 = loom::thread::spawn(move || {
                 let thread_shard_0 = alloc.new_thread();
@@ -1720,18 +1756,21 @@ mod tests {
             t0.join().unwrap();
             t1.join().unwrap();
 
-            let outstanding_blocks = alloc
+            let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
                 .try_lock_global()
                 .unwrap()
                 ._debug_check_missing_blocks();
-            assert_eq!(outstanding_blocks.len(), 0);
+            assert_eq!(outstanding_blocks_cells.len(), 0);
+            assert_eq!(outstanding_blocks_wires.len(), 0);
         })
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_not_loom_smoke_test() {
-        let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000], ()>::new()));
+        let alloc = &*Box::leak(Box::new(
+            SlabRoot::<'static, [u8; 30000], [u8; 30000]>::new(),
+        ));
         let (sender, receiver) = std::sync::mpsc::channel();
 
         let n_objs = 10_000_000;
@@ -1801,11 +1840,12 @@ mod tests {
         t0.join().unwrap();
         t1.join().unwrap();
 
-        let outstanding_blocks = alloc
+        let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert_eq!(outstanding_blocks.len(), 0);
+        assert_eq!(outstanding_blocks_cells.len(), 0);
+        assert_eq!(outstanding_blocks_wires.len(), 0);
     }
 
     #[cfg(not(loom))]
