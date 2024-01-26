@@ -601,9 +601,14 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             //
             // it is not possible to race against any other arcs,
             // as they are synchronous with us on our own thread
+            //
+            // order: at this point, we don't (yet) care about any of the
+            // data that other threads might've written to memory that
+            // might've made its way over to us. only the state itself matters.
+            // (this *will* matter in collect_free_lists, but not here)
             let prev_remote_list = seg.pages[page_i]
                 .remote_free_list
-                .fetch_and(!0b11, Ordering::SeqCst);
+                .fetch_and(!0b11, Ordering::Relaxed);
             let prev_remote_list_flags = prev_remote_list & 0b11;
             debug_assert!(prev_remote_list_flags != _REMOTE_FREE_FLAGS_STATE_INVALID);
             if prev_remote_list_flags != REMOTE_FREE_FLAGS_STATE_NORMAL {
@@ -655,7 +660,7 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
             // same page remote free list in either case.
 
             let page = &seg.pages[page_i];
-            let mut prev_remote_free = page.remote_free_list.load(Ordering::SeqCst);
+            let mut prev_remote_free = page.remote_free_list.load(Ordering::Relaxed);
             loop {
                 let flag_bits = prev_remote_free & 0b11;
                 if flag_bits == REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST {
@@ -665,11 +670,15 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                     let new_remote_free =
                         (prev_remote_free & !0b11) | REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST;
 
+                    // order: here we are only making an atomic state transition,
+                    // and we haven't written any memory that needs to be exposed
+                    // (we only do that if we *succeed* at the state transition)
+                    // so order is relaxed
                     match page.remote_free_list.compare_exchange_weak(
                         prev_remote_free,
                         new_remote_free,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
                     ) {
                         Ok(_) => {
                             // we won, so push onto thread delayed free
@@ -703,11 +712,15 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
                     // push onto remote free list
                     let next_block_proper_addr = (prev_remote_free & !0b11) as *const _;
                     obj.free.next.set(Some(&*next_block_proper_addr));
+                    // order: on success, we are currently the most recent
+                    // modification to remote_free_list
+                    // we use release ordering so that writes to obj.free.next
+                    // happens-before processing of it in the allocation slow path
                     match page.remote_free_list.compare_exchange_weak(
                         prev_remote_free,
                         obj_ptr | flag_bits,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
+                        Ordering::Release,
+                        Ordering::Relaxed,
                     ) {
                         Ok(_) => break,
                         Err(x) => prev_remote_free = x,
@@ -940,7 +953,14 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
         }
 
         // collect other threads
-        let mut prev_remote_free = self.remote_free_list.load(Ordering::SeqCst);
+        // order: on success, we need to see *all* of the writes to the next pointers
+        // that have been set by other threads remote freeing, so order is acquire
+        // this will obviously synchronize-with the most recent write.
+        // as for previous writes, the intermediate updates to remote_free_list
+        // are RmW operations, so they will be part of the release sequence of
+        // the previous (now overwritten) writes to remote_free_list.
+        // thus this will synchronize-with *all* of those
+        let mut prev_remote_free = self.remote_free_list.load(Ordering::Relaxed);
         loop {
             let state = prev_remote_free & 0b11;
             let ptr = prev_remote_free & !0b11;
@@ -962,8 +982,8 @@ impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
             match self.remote_free_list.compare_exchange_weak(
                 prev_remote_free,
                 remote_free_new_ptr_with_flags,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
+                Ordering::Acquire,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(x) => prev_remote_free = x,
@@ -1556,11 +1576,13 @@ mod tests {
             let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000]>::new()));
             let (sender, receiver) = loom::sync::mpsc::channel();
 
+            let n_objs = 4;
+
             let t0 = loom::thread::spawn(move || {
                 let thread_shard_0 = alloc.new_thread();
                 let mut alloc_history = Vec::new();
                 let mut prev = None;
-                for _ in 0..5 {
+                for _ in 0..n_objs {
                     let obj = thread_shard_0.alloc();
                     let obj_addr = obj as *const _ as usize;
                     alloc_history.push(obj_addr);
@@ -1584,7 +1606,7 @@ mod tests {
 
             let t1 = loom::thread::spawn(move || {
                 let thread_shard_1 = alloc.new_thread();
-                for _ in 0..5 {
+                for _ in 0..n_objs {
                     let obj = receiver.recv().unwrap();
                     unsafe { thread_shard_1.free(obj) }
                 }
