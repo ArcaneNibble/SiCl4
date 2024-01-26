@@ -205,6 +205,7 @@ impl<'arena, T: Send + Sync> Drop for SlabRootGlobalGuard<'arena, T> {
 }
 
 impl<'guard, 'arena, T: Send + Sync> SlabRootGlobalGuard<'arena, T> {
+    // FIXME this isn't easily generic to handle both cells and wires
     pub fn _debug_check_missing_blocks(&'guard self) -> HashSet<usize> {
         let mut all_outstanding_blocks = HashSet::new();
 
@@ -214,7 +215,10 @@ impl<'guard, 'arena, T: Send + Sync> SlabRootGlobalGuard<'arena, T> {
                 println!("Checking state for thread {}", thread_i);
 
                 let mut thread_delayed_free_blocks = HashSet::new();
-                let mut delayed_free_block = per_thread.thread_delayed_free.load(Ordering::Relaxed);
+                let mut delayed_free_block = per_thread
+                    .netlist_cells
+                    .thread_delayed_free
+                    .load(Ordering::Relaxed);
                 while !delayed_free_block.is_null() {
                     println!("thread delayed free: {:?}", delayed_free_block);
                     thread_delayed_free_blocks.insert(delayed_free_block as usize);
@@ -225,7 +229,7 @@ impl<'guard, 'arena, T: Send + Sync> SlabRootGlobalGuard<'arena, T> {
                 }
 
                 let mut page_linked_list_set = HashSet::new();
-                let mut avail_page = per_thread.pages.get();
+                let mut avail_page = per_thread.netlist_cells.pages.get();
                 loop {
                     println!("Page on linked list: {:?}", avail_page as *const _);
                     page_linked_list_set.insert(avail_page as *const _ as usize);
@@ -233,13 +237,13 @@ impl<'guard, 'arena, T: Send + Sync> SlabRootGlobalGuard<'arena, T> {
                     if avail_page.next_page.get().is_some() {
                         avail_page = avail_page.next_page.get().unwrap();
                     } else {
-                        let last_page = per_thread.last_page.get();
+                        let last_page = per_thread.netlist_cells.last_page.get();
                         assert_eq!(avail_page as *const _, last_page);
                         break;
                     }
                 }
 
-                let mut seg = per_thread.segments.get();
+                let mut seg = per_thread.netlist_cells.segments.get();
                 loop {
                     println!("Checking segment {:?}", seg as *const _);
 
@@ -334,7 +338,7 @@ impl<'guard, 'arena, T: Send + Sync> SlabRootGlobalGuard<'arena, T> {
                             // If the page is normal, it must be in the list
                             assert!(page_linked_list_set.contains(&(page as *const _ as usize)));
                             // it may be full if it's the very first page (i.e. we haven't noticed yet)
-                            if per_thread.pages.get() as *const _ != page {
+                            if per_thread.netlist_cells.pages.get() as *const _ != page {
                                 // it cannot require thread delayed free to become unfull
                                 assert!(!full_without_thread_delayed_free);
                             }
@@ -390,6 +394,50 @@ pub struct SlabPerThreadState<'arena, T: Send + Sync> {
     ///
     /// Can be removed if `offset_of!` gets stabilized
     root: &'arena SlabRoot<'arena, T>,
+    /// Manages memory for netlist cells
+    netlist_cells: SlabPerThreadPerTyState<'arena, T>,
+}
+
+impl<'arena, T: Send + Sync> Debug for SlabPerThreadState<'arena, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlabPerThreadState")
+            .field("@addr", &(self as *const _))
+            .field("tid", &self.tid)
+            .field("root", &self.root)
+            .field("netlist_cells", &self.netlist_cells)
+            .finish()
+    }
+}
+
+impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
+    /// Initialize state
+    pub unsafe fn init(self_: *mut Self, tid: u64, root: &'arena SlabRoot<'arena, T>) {
+        SlabPerThreadPerTyState::init(addr_of_mut!((*self_).netlist_cells), tid);
+
+        (*self_).tid = tid;
+        (*self_).root = root;
+
+        // safety: we initialized everything
+    }
+
+    /// Allocates a netlist cell from this shard
+    ///
+    /// Does *NOT* initialize any of the resulting memory
+    pub fn alloc_netlist_cell(&'arena self) -> &'arena SlabBlock<'arena, T> {
+        self.netlist_cells.alloc(self.tid)
+    }
+
+    /// Deallocates a netlist cell
+    ///
+    /// Object must be part of this slab, not already be freed,
+    /// and no other references may exist after calling free
+    pub unsafe fn free_netlist_cell(&'arena self, obj: &'arena SlabBlock<'arena, T>) {
+        self.netlist_cells.free(self.tid, obj);
+    }
+}
+
+/// Slab allocator per-thread *and* per-type state
+struct SlabPerThreadPerTyState<'arena, T: Send + Sync> {
     /// Pointer to segment list (used for global ops) TODO
     segments: Cell<&'arena SlabSegmentHdr<'arena, T>>,
     /// Pointer to head of (non-full) page list
@@ -407,14 +455,12 @@ pub struct SlabPerThreadState<'arena, T: Send + Sync> {
 //
 // however, because only a SlabThreadShard can get outside this module,
 // the footgun is contained
-unsafe impl<'arena, T: Send + Sync> Sync for SlabPerThreadState<'arena, T> {}
+unsafe impl<'arena, T: Send + Sync> Sync for SlabPerThreadPerTyState<'arena, T> {}
 
-impl<'arena, T: Send + Sync> Debug for SlabPerThreadState<'arena, T> {
+impl<'arena, T: Send + Sync> Debug for SlabPerThreadPerTyState<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SlabPerThreadState")
+        f.debug_struct("SlabPerThreadPerTyState")
             .field("@addr", &(self as *const _))
-            .field("tid", &self.tid)
-            .field("root", &(self.root as *const _))
             .field("segments", &(self.segments.get() as *const _))
             .field("pages", &(self.pages.get() as *const _))
             .field("last_page", &(self.last_page.get() as *const _))
@@ -455,22 +501,20 @@ const REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST: usize = 0b11;
 /// This bit pattern is invalid
 const _REMOTE_FREE_FLAGS_STATE_INVALID: usize = 0b10;
 
-impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
+impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
     /// Initialize state
-    pub unsafe fn init(self_: *mut Self, tid: u64, root: &'arena SlabRoot<'arena, T>) {
+    pub unsafe fn init(self_: *mut Self, tid: u64) {
         // alloc initial segment
         let new_initial_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(tid);
         let new_initial_seg = unsafe {
             // 😱 this is super dangerous wrt uninit memory
             // hopefully it doesn't break
-            (*new_initial_seg).owning_thread_state = mem::transmute(self_);
+            (*new_initial_seg).owning_thread_ty_state = mem::transmute(self_);
             (*new_initial_seg).next = None;
             &*new_initial_seg
         };
 
         unsafe {
-            (*self_).tid = tid;
-            (*self_).root = root;
             (*self_).segments = Cell::new(new_initial_seg);
             (*self_).pages = Cell::new(&new_initial_seg.pages[0]);
             (*self_).last_page = Cell::new(&new_initial_seg.pages[PAGES_PER_SEG - 1]);
@@ -485,14 +529,14 @@ impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
     ///
     /// Memory unsafety is contained, but this can mess up invariants
     /// (and thus isn't public)
-    fn new_seg(&'arena self) {
-        let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(self.tid);
+    fn new_seg(&'arena self, tid: u64) {
+        let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(tid);
         let old_seg_head = Some(self.segments.get());
         let new_seg = unsafe {
-            (*new_seg).owning_thread_state = self;
+            (*new_seg).owning_thread_ty_state = self;
             (*new_seg).next = old_seg_head;
             // safety: at this point we've initialized everything
-            // *including* the owning_thread_state footgun
+            // *including* the owning_thread_ty_state footgun
             &*new_seg
         };
         self.segments.set(new_seg);
@@ -505,6 +549,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
     /// Returns a block, which must be free and ready for use
     fn alloc_slow(
         &'arena self,
+        tid: u64,
     ) -> (
         &'arena SlabSegmentPageMeta<'arena, T>,
         &'arena SlabFreeBlock<'arena>,
@@ -528,7 +573,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
             unsafe {
                 // fixme transmute eww yuck
                 let next = (*thread_delayed_free).next.get();
-                self.free(mem::transmute(thread_delayed_free));
+                self.free(tid, mem::transmute(thread_delayed_free));
                 thread_delayed_free = mem::transmute(next);
             }
         }
@@ -550,7 +595,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
                     }
                     None => {
                         // here we have run out of memory in our heap and need to ask the OS for more
-                        self.new_seg();
+                        self.new_seg(tid);
                         return (
                             self.pages.get(),
                             self.pages.get().this_free_list.get().unwrap(),
@@ -564,12 +609,12 @@ impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
     /// Allocates an object from this shard
     ///
     /// Does *NOT* initialize any of the resulting memory
-    pub fn alloc(&'arena self) -> &'arena SlabBlock<'arena, T> {
+    pub fn alloc(&'arena self, tid: u64) -> &'arena SlabBlock<'arena, T> {
         let fast_page = self.pages.get();
         let fast_block = fast_page.this_free_list.get();
         let (page, block) = match fast_block {
             Some(x) => (fast_page, x), // fast path
-            None => self.alloc_slow(),
+            None => self.alloc_slow(tid),
         };
         page.this_free_list.set(block.next.get());
         unsafe {
@@ -582,7 +627,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
     ///
     /// Object must be part of this slab, not already be freed,
     /// and no other references may exist after calling free
-    pub unsafe fn free(&'arena self, obj: &'arena SlabBlock<'arena, T>) {
+    pub unsafe fn free(&'arena self, tid: u64, obj: &'arena SlabBlock<'arena, T>) {
         let obj_ptr = obj as *const _ as usize;
         let seg_ptr = obj_ptr & !(SEGMENT_SZ - 1);
         let seg = &*(seg_ptr as *const SlabSegmentHdr<'arena, T>);
@@ -590,7 +635,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
 
         // we don't allow freeing null so unlike msft we don't need to check for it
 
-        if self.tid == (*seg).owning_tid {
+        if tid == (*seg).owning_tid {
             // local free (incl. thread delayed free)
 
             // if we got here, we *know* we're no longer full
@@ -682,16 +727,17 @@ impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
                     ) {
                         Ok(_) => {
                             // we won, so push onto thread delayed free
-                            let per_thread = seg.owning_thread_state;
-                            let mut prev_thread_delayed_free =
-                                per_thread.thread_delayed_free.load(Ordering::Relaxed);
+                            let per_thread_per_ty = seg.owning_thread_ty_state;
+                            let mut prev_thread_delayed_free = per_thread_per_ty
+                                .thread_delayed_free
+                                .load(Ordering::Relaxed);
                             loop {
                                 obj.free.next.set(Some(&*prev_thread_delayed_free));
                                 // order: on success, we are currently the most recent
                                 // modification to thread_delayed_free
                                 // we use release ordering so that writes to obj.free.next
                                 // happens-before processing of it in the allocation slow path
-                                match per_thread.thread_delayed_free.compare_exchange_weak(
+                                match per_thread_per_ty.thread_delayed_free.compare_exchange_weak(
                                     prev_thread_delayed_free,
                                     obj_ptr as _,
                                     Ordering::Release,
@@ -777,9 +823,9 @@ impl<'arena, T: Send + Sync> Drop for SlabThreadShard<'arena, T> {
 struct SlabSegmentHdr<'arena, T: Send + Sync> {
     /// Thread that created this segment and owns its "local" data
     owning_tid: u64,
-    /// Per-thread data of the thread that created this
+    /// Per-thread per-type data of the thread that created this
     /// (used for thread delayed free)
-    owning_thread_state: &'arena SlabPerThreadState<'arena, T>,
+    owning_thread_ty_state: &'arena SlabPerThreadPerTyState<'arena, T>,
     /// List of segments (all owned by this thread)
     next: Option<&'arena SlabSegmentHdr<'arena, T>>,
     /// Metadata for each page within the segment
@@ -792,8 +838,8 @@ impl<'arena, T: Send + Sync> Debug for SlabSegmentHdr<'arena, T> {
             .field("@addr", &(self as *const _))
             .field("owning_tid", &self.owning_tid)
             .field(
-                "owning_thread_state",
-                &(self.owning_thread_state as *const _),
+                "owning_thread_ty_state",
+                &(self.owning_thread_ty_state as *const _),
             )
             .field("next", &self.next.map(|x| x as *const _))
             .field("pages", &self.pages)
@@ -817,7 +863,7 @@ impl<'arena, T: Send + Sync> SlabSegmentHdr<'arena, T> {
             }
 
             // safety: we initialized everything EXCEPT
-            // owning_thread_state which remains UNINIT!
+            // owning_thread_ty_state which remains UNINIT!
             seg
         }
     }
@@ -1211,18 +1257,18 @@ mod tests {
     fn slab_basic_single_thread_alloc() {
         let alloc = SlabRoot::<u8>::new();
         let thread_shard = alloc.new_thread();
-        let obj_1 = thread_shard.alloc();
-        let obj_2 = thread_shard.alloc();
+        let obj_1 = thread_shard.alloc_netlist_cell();
+        let obj_2 = thread_shard.alloc_netlist_cell();
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         assert_eq!(obj_1 as *const _ as usize + 8, obj_2 as *const _ as usize);
 
-        unsafe { thread_shard.free(obj_2) };
-        unsafe { thread_shard.free(obj_1) };
+        unsafe { thread_shard.free_netlist_cell(obj_2) };
+        unsafe { thread_shard.free_netlist_cell(obj_1) };
 
         unsafe {
-            let seg = thread_shard.segments.get();
+            let seg = thread_shard.netlist_cells.segments.get();
             assert_eq!(
                 seg.pages[0].local_free_list.get().unwrap() as *const _ as usize,
                 obj_1 as *const _ as usize
@@ -1247,17 +1293,17 @@ mod tests {
     fn slab_basic_fake_remote_free() {
         let alloc = SlabRoot::<u8>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.alloc();
-        let obj_2 = thread_shard_0.alloc();
+        let obj_1 = thread_shard_0.alloc_netlist_cell();
+        let obj_2 = thread_shard_0.alloc_netlist_cell();
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         let thread_shard_1 = alloc.new_thread();
-        unsafe { thread_shard_1.free(obj_2) };
-        unsafe { thread_shard_1.free(obj_1) };
+        unsafe { thread_shard_1.free_netlist_cell(obj_2) };
+        unsafe { thread_shard_1.free_netlist_cell(obj_1) };
 
         unsafe {
-            let seg = thread_shard_0.segments.get();
+            let seg = thread_shard_0.netlist_cells.segments.get();
             print!(
                 "{}",
                 _debug_hexdump(seg as *const _ as *const u8, ALLOC_PAGE_SZ).unwrap()
@@ -1288,16 +1334,16 @@ mod tests {
     fn slab_test_collect_local() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
         let thread_shard = alloc.new_thread();
-        let obj_1 = thread_shard.alloc();
-        let obj_2 = thread_shard.alloc();
+        let obj_1 = thread_shard.alloc_netlist_cell();
+        let obj_2 = thread_shard.alloc_netlist_cell();
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
-        unsafe { thread_shard.free(obj_1) };
-        unsafe { thread_shard.free(obj_2) };
+        unsafe { thread_shard.free_netlist_cell(obj_1) };
+        unsafe { thread_shard.free_netlist_cell(obj_2) };
 
-        let obj_1_2nd_try = thread_shard.alloc();
-        let obj_2_2nd_try = thread_shard.alloc();
+        let obj_1_2nd_try = thread_shard.alloc_netlist_cell();
+        let obj_2_2nd_try = thread_shard.alloc_netlist_cell();
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -1325,17 +1371,17 @@ mod tests {
     fn slab_test_collect_remote() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.alloc();
-        let obj_2 = thread_shard_0.alloc();
+        let obj_1 = thread_shard_0.alloc_netlist_cell();
+        let obj_2 = thread_shard_0.alloc_netlist_cell();
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         let thread_shard_1 = alloc.new_thread();
-        unsafe { thread_shard_1.free(obj_1) };
-        unsafe { thread_shard_1.free(obj_2) };
+        unsafe { thread_shard_1.free_netlist_cell(obj_1) };
+        unsafe { thread_shard_1.free_netlist_cell(obj_2) };
 
-        let obj_1_2nd_try = thread_shard_0.alloc();
-        let obj_2_2nd_try = thread_shard_0.alloc();
+        let obj_1_2nd_try = thread_shard_0.alloc_netlist_cell();
+        let obj_2_2nd_try = thread_shard_0.alloc_netlist_cell();
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -1364,17 +1410,17 @@ mod tests {
     fn slab_test_collect_both() {
         let alloc = SlabRoot::<[u8; 30000]>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.alloc();
-        let obj_2 = thread_shard_0.alloc();
+        let obj_1 = thread_shard_0.alloc_netlist_cell();
+        let obj_2 = thread_shard_0.alloc_netlist_cell();
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         let thread_shard_1 = alloc.new_thread();
-        unsafe { thread_shard_0.free(obj_1) };
-        unsafe { thread_shard_1.free(obj_2) };
+        unsafe { thread_shard_0.free_netlist_cell(obj_1) };
+        unsafe { thread_shard_1.free_netlist_cell(obj_2) };
 
-        let obj_1_2nd_try = thread_shard_0.alloc();
-        let obj_2_2nd_try = thread_shard_0.alloc();
+        let obj_1_2nd_try = thread_shard_0.alloc_netlist_cell();
+        let obj_2_2nd_try = thread_shard_0.alloc_netlist_cell();
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -1405,20 +1451,20 @@ mod tests {
         let thread_shard = alloc.new_thread();
         let mut things = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard.alloc();
+            let obj = thread_shard.alloc_netlist_cell();
             println!("Allocated obj {:3} {:?}", i, obj as *const _);
             things.push(obj);
         }
 
         for i in 0..129 {
             let obj = things[i];
-            unsafe { thread_shard.free(obj) };
+            unsafe { thread_shard.free_netlist_cell(obj) };
             println!("Freed obj {:3}", i);
         }
 
         let mut things2 = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard.alloc();
+            let obj = thread_shard.alloc_netlist_cell();
             println!("Allocated obj {:3} again {:?}", i, obj as *const _);
             things2.push(obj);
         }
@@ -1451,20 +1497,20 @@ mod tests {
         let thread_shard_1 = alloc.new_thread();
         let mut things = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard_0.alloc();
+            let obj = thread_shard_0.alloc_netlist_cell();
             println!("Allocated obj {:3} {:?}", i, obj as *const _);
             things.push(obj);
         }
 
         for i in 0..129 {
             let obj = things[i];
-            unsafe { thread_shard_1.free(obj) };
+            unsafe { thread_shard_1.free_netlist_cell(obj) };
             println!("Freed obj {:3}", i);
         }
 
         // delayed free list tests
         {
-            let seg1 = thread_shard_0.segments.get();
+            let seg1 = thread_shard_0.netlist_cells.segments.get();
             let seg0 = seg1.next.unwrap();
 
             for page_i in 0..64 {
@@ -1489,8 +1535,10 @@ mod tests {
             );
         }
 
-        let mut test_thread_delayed_item =
-            thread_shard_0.thread_delayed_free.load(Ordering::SeqCst) as *const usize;
+        let mut test_thread_delayed_item = thread_shard_0
+            .netlist_cells
+            .thread_delayed_free
+            .load(Ordering::SeqCst) as *const usize;
         for i in (0..64).rev() {
             assert_eq!(
                 test_thread_delayed_item as usize,
@@ -1503,7 +1551,7 @@ mod tests {
 
         let mut things2: Vec<&SlabBlock<'_, [u8; 30000]>> = Vec::new();
         for i in 0..256 {
-            let obj = thread_shard_0.alloc();
+            let obj = thread_shard_0.alloc_netlist_cell();
             println!("Allocated obj {:3} again {:?}", i, obj as *const _);
             things2.push(obj);
         }
@@ -1583,7 +1631,7 @@ mod tests {
                 let mut alloc_history = Vec::new();
                 let mut prev = None;
                 for i in 0..n_objs {
-                    let obj = thread_shard_0.alloc();
+                    let obj = thread_shard_0.alloc_netlist_cell();
                     let obj_addr = obj as *const _ as usize;
                     alloc_history.push(obj_addr);
                     unsafe {
@@ -1598,9 +1646,14 @@ mod tests {
                         (*obj_)[7] = (i >> 24) as u8;
                     }
                     // in range
-                    assert!(obj_addr >= thread_shard_0.segments.get() as *const _ as usize);
                     assert!(
-                        obj_addr < thread_shard_0.segments.get() as *const _ as usize + SEGMENT_SZ
+                        obj_addr
+                            >= thread_shard_0.netlist_cells.segments.get() as *const _ as usize
+                    );
+                    assert!(
+                        obj_addr
+                            < thread_shard_0.netlist_cells.segments.get() as *const _ as usize
+                                + SEGMENT_SZ
                     );
 
                     // delay freeing by 1
@@ -1622,7 +1675,7 @@ mod tests {
                     unsafe {
                         let obj_ = obj.alloced.as_ptr() as *const u64;
                         assert_eq!(*obj_, (i << 32) | 0xdeadbeef);
-                        thread_shard_1.free(obj)
+                        thread_shard_1.free_netlist_cell(obj)
                     }
                 }
             });
@@ -1651,7 +1704,7 @@ mod tests {
             let mut alloc_history = Vec::new();
             let mut prev = None;
             for i in 0..n_objs {
-                let obj = thread_shard_0.alloc();
+                let obj = thread_shard_0.alloc_netlist_cell();
                 let obj_addr = obj as *const _ as usize;
                 unsafe {
                     let obj_ = obj.alloced.as_ptr() as *mut [u8; 30000];
@@ -1667,7 +1720,7 @@ mod tests {
                 alloc_history.push(obj_addr);
                 // in range
                 let mut in_range = false;
-                let mut seg = thread_shard_0.segments.get();
+                let mut seg = thread_shard_0.netlist_cells.segments.get();
                 loop {
                     if (obj_addr >= seg as *const _ as usize)
                         && (obj_addr < seg as *const _ as usize + SEGMENT_SZ)
@@ -1703,7 +1756,7 @@ mod tests {
                 unsafe {
                     let obj_ = obj.alloced.as_ptr() as *const u64;
                     assert_eq!(*obj_, (i << 32) | 0xdeadbeef);
-                    thread_shard_1.free(obj)
+                    thread_shard_1.free_netlist_cell(obj)
                 }
             }
         });
