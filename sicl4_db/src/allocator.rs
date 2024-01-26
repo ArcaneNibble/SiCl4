@@ -19,7 +19,7 @@ use std::{
     marker::PhantomData,
     mem::{self, size_of, ManuallyDrop, MaybeUninit},
     ops::Deref,
-    ptr::{self, addr_of, addr_of_mut},
+    ptr::{self, addr_of_mut},
     sync::atomic::Ordering,
 };
 
@@ -224,16 +224,19 @@ impl<'guard, 'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
         println!("Checking state for thread {}", thread_i);
 
         let mut thread_delayed_free_blocks = HashSet::new();
-        let mut delayed_free_block = per_thread_per_ty
+        let delayed_free_block = per_thread_per_ty
             .thread_delayed_free
             .load(Ordering::Relaxed);
-        while !delayed_free_block.is_null() {
-            println!("thread delayed free: {:?}", delayed_free_block);
-            thread_delayed_free_blocks.insert(delayed_free_block as usize);
-            unsafe {
-                let b = &*delayed_free_block;
-                delayed_free_block = mem::transmute(b.next.get());
-            }
+
+        let mut delayed_free_block = if delayed_free_block.is_null() {
+            None
+        } else {
+            unsafe { Some(&*delayed_free_block) }
+        };
+        while let Some(delayed_free_block_inner) = delayed_free_block {
+            println!("thread delayed free: {:?}", delayed_free_block_inner);
+            thread_delayed_free_blocks.insert(delayed_free_block_inner as *const _ as usize);
+            delayed_free_block = delayed_free_block_inner.next.get();
         }
 
         let mut page_linked_list_set = HashSet::new();
@@ -618,20 +621,30 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
         // are RmW operations, so they will be part of the release sequence of
         // the previous (now overwritten) writes to thread_delayed_free.
         // thus this will synchronize-with *all* of those
-        let mut thread_delayed_free = self
+        let thread_delayed_free = self
             .thread_delayed_free
             .fetch_update(Ordering::Acquire, Ordering::Relaxed, |_| {
                 Some(ptr::null_mut())
             })
             .unwrap();
 
-        while !thread_delayed_free.is_null() {
+        let mut thread_delayed_free = if thread_delayed_free.is_null() {
+            None
+        } else {
             unsafe {
-                // fixme transmute eww yuck
-                let next = (*thread_delayed_free).next.get();
-                self.free(tid, mem::transmute(thread_delayed_free));
-                thread_delayed_free = mem::transmute(next);
+                // safety: these blocks should definitely belong to our allocation
+                // assuming we didn't mess up
+                Some(&*thread_delayed_free)
             }
+        };
+
+        while let Some(thread_delayed_free_inner) = thread_delayed_free {
+            let next = thread_delayed_free_inner.next.get();
+            unsafe {
+                // safety: just coercing between repr(C) union references
+                self.free(tid, mem::transmute(thread_delayed_free_inner))
+            }
+            thread_delayed_free = next;
         }
 
         let mut page = self.pages.get();
@@ -674,7 +687,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
         };
         page.this_free_list.set(block.next.get());
         unsafe {
-            // safety: just coercing to a repr(C) union reference
+            // safety: just coercing between repr(C) union references
             mem::transmute(block)
         }
     }
@@ -719,9 +732,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
             }
 
             obj.free.next.set(seg.pages[page_i].local_free_list.get());
-            seg.pages[page_i]
-                .local_free_list
-                .set(Some(mem::transmute(obj)));
+            seg.pages[page_i].local_free_list.set(Some(&obj.free));
         } else {
             // remote free
 
@@ -1138,13 +1149,12 @@ impl<'arena, T: Send + Sync> SlabSegmentPageMeta<'arena, T> {
                 while our_free_list.unwrap().next.get().is_some() {
                     our_free_list = our_free_list.unwrap().next.get();
                 }
-                unsafe {
+                our_free_list.unwrap().next.set(Some(unsafe {
                     // safety: these blocks should definitely belong to our allocation
                     // assuming we didn't mess up. we can't data race on next because
                     // current thread owns all of the local free list
-                    let next = addr_of!(our_free_list.unwrap().next);
-                    *(next as *mut _) = Some(&*remote_free_list_ptr);
-                }
+                    &*remote_free_list_ptr
+                }));
                 self.this_free_list.set(our_free_list);
             }
         } else {
