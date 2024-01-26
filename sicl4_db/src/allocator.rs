@@ -73,23 +73,28 @@ const fn num_that_fits(layout: Layout, tot_sz: usize) -> usize {
 }
 
 /// Slab allocator root object
-pub struct SlabRoot<'arena, T: Send + Sync> {
+pub struct SlabRoot<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> {
     /// Bitfield, where a `1` bit in position `n` indicates that
     /// a [SlabThreadShard] has been handed out for the nth entry of
     /// [per_thread_state](Self::per_thread_state)
     /// (and it hasn't been dropped yet)
     thread_inuse: AtomicU64,
     /// Actual storage for per-thread data
-    per_thread_state: [MaybeUninit<SlabPerThreadState<'arena, T>>; MAX_THREADS],
+    per_thread_state: [MaybeUninit<SlabPerThreadState<'arena, CellsTy, WiresTy>>; MAX_THREADS],
     /// Indicates whether or not the state has been initialized
     per_thread_state_inited: [Cell<bool>; MAX_THREADS],
     /// Ensure `'arena` lifetime is invariant
     _p: PhantomData<Cell<&'arena ()>>,
 }
 // safety: we carefully use atomic operations on thread_inuse
-unsafe impl<'arena, T: Send + Sync> Sync for SlabRoot<'arena, T> {}
+unsafe impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Sync
+    for SlabRoot<'arena, CellsTy, WiresTy>
+{
+}
 
-impl<'arena, T: Send + Sync> Debug for SlabRoot<'arena, T> {
+impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
+    for SlabRoot<'arena, CellsTy, WiresTy>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut fields = f.debug_struct("SlabRoot");
         fields.field("@addr", &(self as *const _));
@@ -106,7 +111,7 @@ impl<'arena, T: Send + Sync> Debug for SlabRoot<'arena, T> {
     }
 }
 
-impl<'arena, T: Send + Sync> SlabRoot<'arena, T> {
+impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> SlabRoot<'arena, CellsTy, WiresTy> {
     /// Allocate a new root object for a slab memory allocator
     pub fn new() -> Self {
         Self {
@@ -120,7 +125,7 @@ impl<'arena, T: Send + Sync> SlabRoot<'arena, T> {
     /// Get a handle on one per-thread shard of the slab
     ///
     /// Panics if [MAX_THREADS] is reached, or if a global lock exists
-    pub fn new_thread(&'arena self) -> SlabThreadShard<'arena, T> {
+    pub fn new_thread(&'arena self) -> SlabThreadShard<'arena, CellsTy, WiresTy> {
         let allocated_tid;
         // order: need to synchronize-with only the thread that set
         // thread_inuse such that it allows us to (re)allocate a particular thread id
@@ -154,7 +159,7 @@ impl<'arena, T: Send + Sync> SlabRoot<'arena, T> {
         let thread_state = unsafe {
             // safety: current thread now owns this slice of per_thread_state and per_thread_state_inited exclusively
             if !self.per_thread_state_inited[allocated_tid].get() {
-                SlabPerThreadState::<'arena, T>::init(
+                SlabPerThreadState::<'arena, CellsTy, WiresTy>::init(
                     self.per_thread_state[allocated_tid].as_ptr() as *mut _,
                     allocated_tid as u64,
                     self,
@@ -167,7 +172,7 @@ impl<'arena, T: Send + Sync> SlabRoot<'arena, T> {
     }
 
     /// Try and get a handle for performing global operations
-    pub fn try_lock_global(&'arena self) -> Option<SlabRootGlobalGuard<'arena, T>> {
+    pub fn try_lock_global(&'arena self) -> Option<SlabRootGlobalGuard<'arena, CellsTy, WiresTy>> {
         // order: need to synchronize-with only the thread that set
         // thread_inuse to 0, after which we will read/write fresh updated data
         match self
@@ -184,19 +189,23 @@ impl<'arena, T: Send + Sync> SlabRoot<'arena, T> {
 ///
 /// The only way to get one of these is to go through [SlabRoot::try_lock_global]
 /// All the dangerous operations are only implemented on this object.
-pub struct SlabRootGlobalGuard<'arena, T: Send + Sync>(
-    &'arena SlabRoot<'arena, T>,
+pub struct SlabRootGlobalGuard<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>(
+    &'arena SlabRoot<'arena, CellsTy, WiresTy>,
     /// prevent this type from being `Sync`
     PhantomData<UnsafeCell<()>>,
 );
 
-impl<'arena, T: Send + Sync> Debug for SlabRootGlobalGuard<'arena, T> {
+impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
+    for SlabRootGlobalGuard<'arena, CellsTy, WiresTy>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("SlabRootGlobalGuard").field(&self.0).finish()
     }
 }
 
-impl<'arena, T: Send + Sync> Drop for SlabRootGlobalGuard<'arena, T> {
+impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Drop
+    for SlabRootGlobalGuard<'arena, CellsTy, WiresTy>
+{
     fn drop(&mut self) {
         let root = self.0;
         // ordering: need all manipulation of thread-owned data to stick
@@ -204,188 +213,200 @@ impl<'arena, T: Send + Sync> Drop for SlabRootGlobalGuard<'arena, T> {
     }
 }
 
-impl<'guard, 'arena, T: Send + Sync> SlabRootGlobalGuard<'arena, T> {
+impl<'guard, 'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
+    SlabRootGlobalGuard<'arena, CellsTy, WiresTy>
+{
+    fn __debug_check_ty_missing_blocks<ThisTy: Send + Sync>(
+        thread_i: usize,
+        per_thread_per_ty: &'arena SlabPerThreadPerTyState<'arena, ThisTy>,
+    ) -> HashSet<usize> {
+        let mut all_outstanding_blocks = HashSet::new();
+        println!("Checking state for thread {}", thread_i);
+
+        let mut thread_delayed_free_blocks = HashSet::new();
+        let mut delayed_free_block = per_thread_per_ty
+            .thread_delayed_free
+            .load(Ordering::Relaxed);
+        while !delayed_free_block.is_null() {
+            println!("thread delayed free: {:?}", delayed_free_block);
+            thread_delayed_free_blocks.insert(delayed_free_block as usize);
+            unsafe {
+                let b = &*delayed_free_block;
+                delayed_free_block = mem::transmute(b.next.get());
+            }
+        }
+
+        let mut page_linked_list_set = HashSet::new();
+        let mut avail_page = per_thread_per_ty.pages.get();
+        loop {
+            println!("Page on linked list: {:?}", avail_page as *const _);
+            page_linked_list_set.insert(avail_page as *const _ as usize);
+
+            if avail_page.next_page.get().is_some() {
+                avail_page = avail_page.next_page.get().unwrap();
+            } else {
+                let last_page = per_thread_per_ty.last_page.get();
+                assert_eq!(avail_page as *const _, last_page);
+                break;
+            }
+        }
+
+        let mut seg = per_thread_per_ty.segments.get();
+        loop {
+            println!("Checking segment {:?}", seg as *const _);
+
+            for page_i in 0..PAGES_PER_SEG {
+                let page = &seg.pages[page_i];
+                println!("Checking page {} {:?}", page_i, page);
+
+                let num_objects = SlabSegmentHdr::get_num_objects(seg, page_i == 0);
+                let mut outstanding_blocks = HashSet::new();
+
+                for obj_i in 0..num_objects {
+                    let obj_ptr = SlabSegmentHdr::get_addr_of_block(seg, page_i, obj_i);
+                    outstanding_blocks.insert(obj_ptr as usize);
+                }
+
+                let mut this_free = page.this_free_list.get();
+                while let Some(this_free_block) = this_free {
+                    println!("This free list item: {:?}", this_free_block as *const _);
+                    let was_outstanding =
+                        outstanding_blocks.remove(&(this_free_block as *const _ as usize));
+
+                    if !was_outstanding {
+                        panic!("Block not in page or found in multiple free lists!");
+                    }
+
+                    this_free = this_free_block.next.get();
+                }
+
+                let mut local_free = page.local_free_list.get();
+                while let Some(this_free_block) = local_free {
+                    println!("Local free list item: {:?}", this_free_block as *const _);
+                    let was_outstanding =
+                        outstanding_blocks.remove(&(this_free_block as *const _ as usize));
+
+                    if !was_outstanding {
+                        panic!("Block not in page or found in multiple free lists!");
+                    }
+
+                    local_free = this_free_block.next.get();
+                }
+
+                let remote_free = page.remote_free_list.load(Ordering::Relaxed);
+                let mut remote_free_ptr = unsafe {
+                    let ptr = (remote_free & !0b11) as *const SlabFreeBlock;
+                    if ptr.is_null() {
+                        None
+                    } else {
+                        Some(&*ptr)
+                    }
+                };
+                let remote_free_flags = remote_free & 0b11;
+                while let Some(this_free_block) = remote_free_ptr {
+                    println!("Remote free list item: {:?}", this_free_block as *const _);
+                    let was_outstanding =
+                        outstanding_blocks.remove(&(this_free_block as *const _ as usize));
+
+                    if !was_outstanding {
+                        panic!("Block not in page or found in multiple free lists!");
+                    }
+
+                    remote_free_ptr = this_free_block.next.get();
+                }
+
+                let full_without_thread_delayed_free = outstanding_blocks.len() == num_objects;
+
+                let mut delayed_free_block_for_this_page = None;
+                for x in &thread_delayed_free_blocks {
+                    let was_removed = outstanding_blocks.remove(x);
+                    if was_removed {
+                        if delayed_free_block_for_this_page.is_some() {
+                            panic!("ERR: page in thread delayed free multiple times");
+                        }
+                        delayed_free_block_for_this_page = Some(*x);
+                    }
+                }
+                if let Some(x) = delayed_free_block_for_this_page {
+                    thread_delayed_free_blocks.remove(&x);
+                }
+                let was_in_thread_delayed_blocks = delayed_free_block_for_this_page.is_some();
+
+                println!("The following blocks are still allocated:");
+                for x in &outstanding_blocks {
+                    println!("* 0x{:x}", x);
+                    all_outstanding_blocks.insert(*x);
+                }
+
+                let full_actually_full = outstanding_blocks.len() == num_objects;
+
+                if remote_free_flags == REMOTE_FREE_FLAGS_STATE_NORMAL {
+                    // If the page is normal, it must be in the list
+                    assert!(page_linked_list_set.contains(&(page as *const _ as usize)));
+                    // it may be full if it's the very first page (i.e. we haven't noticed yet)
+                    if per_thread_per_ty.pages.get() as *const _ != page {
+                        // it cannot require thread delayed free to become unfull
+                        assert!(!full_without_thread_delayed_free);
+                    }
+                } else if remote_free_flags == REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST {
+                    // If the page is in-full-list it cannot be linked
+                    assert!(!page_linked_list_set.contains(&(page as *const _ as usize)));
+                    // it must be *full* full
+                    assert!(full_actually_full);
+                    // it *cannot* exist in thread delayed blocks yet
+                    assert!(!was_in_thread_delayed_blocks);
+                } else if remote_free_flags == REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST {
+                    // If the page is in-thread-delayed-list it cannot be linked
+                    assert!(!page_linked_list_set.contains(&(page as *const _ as usize)));
+                    // it *must* exist in thread delayed blocks
+                    assert!(was_in_thread_delayed_blocks);
+                    // at this point (stable, no threads running)
+                    // it cannot have any local free blocks
+                    assert!(page.this_free_list.get().is_none());
+                    assert!(page.local_free_list.get().is_none());
+                } else {
+                    panic!("Illegal remote free state encountered");
+                }
+            }
+
+            if seg.next.is_some() {
+                seg = seg.next.unwrap();
+            } else {
+                break;
+            }
+        }
+
+        if thread_delayed_free_blocks.len() > 0 {
+            println!("BAD! thread delayed free blocks exist that don't belong to us!");
+            for x in &thread_delayed_free_blocks {
+                println!("* 0x{:x}", x);
+            }
+            panic!();
+        }
+
+        all_outstanding_blocks
+    }
+
     // FIXME this isn't easily generic to handle both cells and wires
     pub fn _debug_check_missing_blocks(&'guard self) -> HashSet<usize> {
-        let mut all_outstanding_blocks = HashSet::new();
+        let mut all_outstanding_blocks_cells = HashSet::new();
 
         for thread_i in 0..MAX_THREADS {
             if self.0.per_thread_state_inited[thread_i].get() {
                 let per_thread = unsafe { &*self.0.per_thread_state[thread_i].as_ptr() };
-                println!("Checking state for thread {}", thread_i);
-
-                let mut thread_delayed_free_blocks = HashSet::new();
-                let mut delayed_free_block = per_thread
-                    .netlist_cells
-                    .thread_delayed_free
-                    .load(Ordering::Relaxed);
-                while !delayed_free_block.is_null() {
-                    println!("thread delayed free: {:?}", delayed_free_block);
-                    thread_delayed_free_blocks.insert(delayed_free_block as usize);
-                    unsafe {
-                        let b = &*delayed_free_block;
-                        delayed_free_block = mem::transmute(b.next.get());
-                    }
-                }
-
-                let mut page_linked_list_set = HashSet::new();
-                let mut avail_page = per_thread.netlist_cells.pages.get();
-                loop {
-                    println!("Page on linked list: {:?}", avail_page as *const _);
-                    page_linked_list_set.insert(avail_page as *const _ as usize);
-
-                    if avail_page.next_page.get().is_some() {
-                        avail_page = avail_page.next_page.get().unwrap();
-                    } else {
-                        let last_page = per_thread.netlist_cells.last_page.get();
-                        assert_eq!(avail_page as *const _, last_page);
-                        break;
-                    }
-                }
-
-                let mut seg = per_thread.netlist_cells.segments.get();
-                loop {
-                    println!("Checking segment {:?}", seg as *const _);
-
-                    for page_i in 0..PAGES_PER_SEG {
-                        let page = &seg.pages[page_i];
-                        println!("Checking page {} {:?}", page_i, page);
-
-                        let num_objects = SlabSegmentHdr::get_num_objects(seg, page_i == 0);
-                        let mut outstanding_blocks = HashSet::new();
-
-                        for obj_i in 0..num_objects {
-                            let obj_ptr = SlabSegmentHdr::get_addr_of_block(seg, page_i, obj_i);
-                            outstanding_blocks.insert(obj_ptr as usize);
-                        }
-
-                        let mut this_free = page.this_free_list.get();
-                        while let Some(this_free_block) = this_free {
-                            println!("This free list item: {:?}", this_free_block as *const _);
-                            let was_outstanding =
-                                outstanding_blocks.remove(&(this_free_block as *const _ as usize));
-
-                            if !was_outstanding {
-                                panic!("Block not in page or found in multiple free lists!");
-                            }
-
-                            this_free = this_free_block.next.get();
-                        }
-
-                        let mut local_free = page.local_free_list.get();
-                        while let Some(this_free_block) = local_free {
-                            println!("Local free list item: {:?}", this_free_block as *const _);
-                            let was_outstanding =
-                                outstanding_blocks.remove(&(this_free_block as *const _ as usize));
-
-                            if !was_outstanding {
-                                panic!("Block not in page or found in multiple free lists!");
-                            }
-
-                            local_free = this_free_block.next.get();
-                        }
-
-                        let remote_free = page.remote_free_list.load(Ordering::Relaxed);
-                        let mut remote_free_ptr = unsafe {
-                            let ptr = (remote_free & !0b11) as *const SlabFreeBlock;
-                            if ptr.is_null() {
-                                None
-                            } else {
-                                Some(&*ptr)
-                            }
-                        };
-                        let remote_free_flags = remote_free & 0b11;
-                        while let Some(this_free_block) = remote_free_ptr {
-                            println!("Remote free list item: {:?}", this_free_block as *const _);
-                            let was_outstanding =
-                                outstanding_blocks.remove(&(this_free_block as *const _ as usize));
-
-                            if !was_outstanding {
-                                panic!("Block not in page or found in multiple free lists!");
-                            }
-
-                            remote_free_ptr = this_free_block.next.get();
-                        }
-
-                        let full_without_thread_delayed_free =
-                            outstanding_blocks.len() == num_objects;
-
-                        let mut delayed_free_block_for_this_page = None;
-                        for x in &thread_delayed_free_blocks {
-                            let was_removed = outstanding_blocks.remove(x);
-                            if was_removed {
-                                if delayed_free_block_for_this_page.is_some() {
-                                    panic!("ERR: page in thread delayed free multiple times");
-                                }
-                                delayed_free_block_for_this_page = Some(*x);
-                            }
-                        }
-                        if let Some(x) = delayed_free_block_for_this_page {
-                            thread_delayed_free_blocks.remove(&x);
-                        }
-                        let was_in_thread_delayed_blocks =
-                            delayed_free_block_for_this_page.is_some();
-
-                        println!("The following blocks are still allocated:");
-                        for x in &outstanding_blocks {
-                            println!("* 0x{:x}", x);
-                            all_outstanding_blocks.insert(*x);
-                        }
-
-                        let full_actually_full = outstanding_blocks.len() == num_objects;
-
-                        if remote_free_flags == REMOTE_FREE_FLAGS_STATE_NORMAL {
-                            // If the page is normal, it must be in the list
-                            assert!(page_linked_list_set.contains(&(page as *const _ as usize)));
-                            // it may be full if it's the very first page (i.e. we haven't noticed yet)
-                            if per_thread.netlist_cells.pages.get() as *const _ != page {
-                                // it cannot require thread delayed free to become unfull
-                                assert!(!full_without_thread_delayed_free);
-                            }
-                        } else if remote_free_flags == REMOTE_FREE_FLAGS_STATE_IN_FULL_LIST {
-                            // If the page is in-full-list it cannot be linked
-                            assert!(!page_linked_list_set.contains(&(page as *const _ as usize)));
-                            // it must be *full* full
-                            assert!(full_actually_full);
-                            // it *cannot* exist in thread delayed blocks yet
-                            assert!(!was_in_thread_delayed_blocks);
-                        } else if remote_free_flags == REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST
-                        {
-                            // If the page is in-thread-delayed-list it cannot be linked
-                            assert!(!page_linked_list_set.contains(&(page as *const _ as usize)));
-                            // it *must* exist in thread delayed blocks
-                            assert!(was_in_thread_delayed_blocks);
-                            // at this point (stable, no threads running)
-                            // it cannot have any local free blocks
-                            assert!(page.this_free_list.get().is_none());
-                            assert!(page.local_free_list.get().is_none());
-                        } else {
-                            panic!("Illegal remote free state encountered");
-                        }
-                    }
-
-                    if seg.next.is_some() {
-                        seg = seg.next.unwrap();
-                    } else {
-                        break;
-                    }
-                }
-
-                if thread_delayed_free_blocks.len() > 0 {
-                    println!("BAD! thread delayed free blocks exist that don't belong to us!");
-                    for x in &thread_delayed_free_blocks {
-                        println!("* 0x{:x}", x);
-                    }
-                    panic!();
+                let outstanding_cells_this_thread =
+                    Self::__debug_check_ty_missing_blocks(thread_i, &per_thread.netlist_cells);
+                for x in outstanding_cells_this_thread {
+                    all_outstanding_blocks_cells.insert(x);
                 }
             }
         }
-        all_outstanding_blocks
+        all_outstanding_blocks_cells
     }
 }
 
 /// Slab allocator per-thread state (actual contents)
-pub struct SlabPerThreadState<'arena, T: Send + Sync> {
+pub struct SlabPerThreadState<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> {
     /// Identifies this thread
     ///
     /// Current impl: bit position in the [SlabRoot::thread_inuse] bitfield
@@ -393,12 +414,16 @@ pub struct SlabPerThreadState<'arena, T: Send + Sync> {
     /// Pointer to the [SlabRoot] this belongs to
     ///
     /// Can be removed if `offset_of!` gets stabilized
-    root: &'arena SlabRoot<'arena, T>,
+    root: &'arena SlabRoot<'arena, CellsTy, WiresTy>,
     /// Manages memory for netlist cells
-    netlist_cells: SlabPerThreadPerTyState<'arena, T>,
+    netlist_cells: SlabPerThreadPerTyState<'arena, CellsTy>,
+    // fixme
+    _p: PhantomData<WiresTy>,
 }
 
-impl<'arena, T: Send + Sync> Debug for SlabPerThreadState<'arena, T> {
+impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
+    for SlabPerThreadState<'arena, CellsTy, WiresTy>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlabPerThreadState")
             .field("@addr", &(self as *const _))
@@ -409,9 +434,15 @@ impl<'arena, T: Send + Sync> Debug for SlabPerThreadState<'arena, T> {
     }
 }
 
-impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
+impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
+    SlabPerThreadState<'arena, CellsTy, WiresTy>
+{
     /// Initialize state
-    pub unsafe fn init(self_: *mut Self, tid: u64, root: &'arena SlabRoot<'arena, T>) {
+    pub unsafe fn init(
+        self_: *mut Self,
+        tid: u64,
+        root: &'arena SlabRoot<'arena, CellsTy, WiresTy>,
+    ) {
         SlabPerThreadPerTyState::init(addr_of_mut!((*self_).netlist_cells), tid);
 
         (*self_).tid = tid;
@@ -423,7 +454,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
     /// Allocates a netlist cell from this shard
     ///
     /// Does *NOT* initialize any of the resulting memory
-    pub fn alloc_netlist_cell(&'arena self) -> &'arena SlabBlock<'arena, T> {
+    pub fn alloc_netlist_cell(&'arena self) -> &'arena SlabBlock<'arena, CellsTy> {
         self.netlist_cells.alloc(self.tid)
     }
 
@@ -431,7 +462,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
     ///
     /// Object must be part of this slab, not already be freed,
     /// and no other references may exist after calling free
-    pub unsafe fn free_netlist_cell(&'arena self, obj: &'arena SlabBlock<'arena, T>) {
+    pub unsafe fn free_netlist_cell(&'arena self, obj: &'arena SlabBlock<'arena, CellsTy>) {
         self.netlist_cells.free(self.tid, obj);
     }
 }
@@ -789,27 +820,33 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
 ///
 /// It is *not* allowed for a raw `&'arena SlabPerThreadState<'arena, T>`
 /// to escape from this module. Allowing this can cause data races.
-pub struct SlabThreadShard<'arena, T: Send + Sync>(
-    &'arena SlabPerThreadState<'arena, T>,
+pub struct SlabThreadShard<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>(
+    &'arena SlabPerThreadState<'arena, CellsTy, WiresTy>,
     /// prevent this type from being `Sync`
     PhantomData<UnsafeCell<()>>,
 );
 
-impl<'arena, T: Send + Sync> Debug for SlabThreadShard<'arena, T> {
+impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
+    for SlabThreadShard<'arena, CellsTy, WiresTy>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("SlabThreadShard").field(&self.0).finish()
     }
 }
 
-impl<'arena, T: Send + Sync> Deref for SlabThreadShard<'arena, T> {
-    type Target = &'arena SlabPerThreadState<'arena, T>;
+impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Deref
+    for SlabThreadShard<'arena, CellsTy, WiresTy>
+{
+    type Target = &'arena SlabPerThreadState<'arena, CellsTy, WiresTy>;
 
-    fn deref<'guard>(&'guard self) -> &'guard &'arena SlabPerThreadState<'arena, T> {
+    fn deref<'guard>(&'guard self) -> &'guard &'arena SlabPerThreadState<'arena, CellsTy, WiresTy> {
         &self.0
     }
 }
 
-impl<'arena, T: Send + Sync> Drop for SlabThreadShard<'arena, T> {
+impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Drop
+    for SlabThreadShard<'arena, CellsTy, WiresTy>
+{
     fn drop(&mut self) {
         let root = self.0.root;
         let mask = !(1 << self.0.tid);
@@ -1154,19 +1191,19 @@ mod tests {
 
     #[test]
     fn ensure_slab_root_send_sync() {
-        assert_send::<SlabRoot<'_, u8>>();
-        assert_sync::<SlabRoot<'_, u8>>();
+        assert_send::<SlabRoot<'_, u8, ()>>();
+        assert_sync::<SlabRoot<'_, u8, ()>>();
     }
 
     #[test]
     fn ensure_thread_shard_send() {
-        assert_send::<SlabThreadShard<'_, u8>>();
+        assert_send::<SlabThreadShard<'_, u8, ()>>();
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_root_new_thread() {
-        let slab = SlabRoot::<u8>::new();
+        let slab = SlabRoot::<u8, ()>::new();
 
         let shard1 = slab.new_thread();
         assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b1);
@@ -1255,7 +1292,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn slab_basic_single_thread_alloc() {
-        let alloc = SlabRoot::<u8>::new();
+        let alloc = SlabRoot::<u8, ()>::new();
         let thread_shard = alloc.new_thread();
         let obj_1 = thread_shard.alloc_netlist_cell();
         let obj_2 = thread_shard.alloc_netlist_cell();
@@ -1291,7 +1328,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn slab_basic_fake_remote_free() {
-        let alloc = SlabRoot::<u8>::new();
+        let alloc = SlabRoot::<u8, ()>::new();
         let thread_shard_0 = alloc.new_thread();
         let obj_1 = thread_shard_0.alloc_netlist_cell();
         let obj_2 = thread_shard_0.alloc_netlist_cell();
@@ -1332,7 +1369,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn slab_test_collect_local() {
-        let alloc = SlabRoot::<[u8; 30000]>::new();
+        let alloc = SlabRoot::<[u8; 30000], ()>::new();
         let thread_shard = alloc.new_thread();
         let obj_1 = thread_shard.alloc_netlist_cell();
         let obj_2 = thread_shard.alloc_netlist_cell();
@@ -1369,7 +1406,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn slab_test_collect_remote() {
-        let alloc = SlabRoot::<[u8; 30000]>::new();
+        let alloc = SlabRoot::<[u8; 30000], ()>::new();
         let thread_shard_0 = alloc.new_thread();
         let obj_1 = thread_shard_0.alloc_netlist_cell();
         let obj_2 = thread_shard_0.alloc_netlist_cell();
@@ -1408,7 +1445,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn slab_test_collect_both() {
-        let alloc = SlabRoot::<[u8; 30000]>::new();
+        let alloc = SlabRoot::<[u8; 30000], ()>::new();
         let thread_shard_0 = alloc.new_thread();
         let obj_1 = thread_shard_0.alloc_netlist_cell();
         let obj_2 = thread_shard_0.alloc_netlist_cell();
@@ -1447,7 +1484,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn slab_test_new_seg() {
-        let alloc = SlabRoot::<[u8; 30000]>::new();
+        let alloc = SlabRoot::<[u8; 30000], ()>::new();
         let thread_shard = alloc.new_thread();
         let mut things = Vec::new();
         for i in 0..129 {
@@ -1492,7 +1529,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn slab_test_remote_free() {
-        let alloc = SlabRoot::<[u8; 30000]>::new();
+        let alloc = SlabRoot::<[u8; 30000], ()>::new();
         let thread_shard_0 = alloc.new_thread();
         let thread_shard_1 = alloc.new_thread();
         let mut things = Vec::new();
@@ -1582,7 +1619,7 @@ mod tests {
     #[test]
     fn slab_loom_new_thread() {
         loom::model(|| {
-            let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000]>::new()));
+            let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000], ()>::new()));
 
             let t0 = loom::thread::spawn(move || {
                 {
@@ -1621,7 +1658,7 @@ mod tests {
     #[test]
     fn slab_loom_smoke_test() {
         loom::model(|| {
-            let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000]>::new()));
+            let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000], ()>::new()));
             let (sender, receiver) = loom::sync::mpsc::channel();
 
             let n_objs = 4;
@@ -1694,7 +1731,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn slab_not_loom_smoke_test() {
-        let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000]>::new()));
+        let alloc = &*Box::leak(Box::new(SlabRoot::<'static, [u8; 30000], ()>::new()));
         let (sender, receiver) = std::sync::mpsc::channel();
 
         let n_objs = 10_000_000;
@@ -1774,7 +1811,7 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn slab_global_lock_test() {
-        let alloc = SlabRoot::<u8>::new();
+        let alloc = SlabRoot::<u8, ()>::new();
         let thread_shard_0 = alloc.new_thread();
         let thread_shard_1 = alloc.new_thread();
 
@@ -1799,7 +1836,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn slab_global_lock_blocks_threads_test() {
-        let alloc = SlabRoot::<u8>::new();
+        let alloc = SlabRoot::<u8, ()>::new();
         let _global = alloc.try_lock_global().unwrap();
 
         let _thread_shard = alloc.new_thread();
