@@ -73,7 +73,7 @@ const fn num_that_fits(layout: Layout, tot_sz: usize) -> usize {
 }
 
 /// Slab allocator root object
-pub struct SlabRoot<'arena, T: Send> {
+pub struct SlabRoot<'arena, T: Send + Sync> {
     /// Bitfield, where a `1` bit in position `n` indicates that
     /// a [SlabThreadShard] has been handed out for the nth entry of
     /// [per_thread_state](Self::per_thread_state)
@@ -87,9 +87,9 @@ pub struct SlabRoot<'arena, T: Send> {
     _p: PhantomData<Cell<&'arena ()>>,
 }
 // safety: we carefully use atomic operations on thread_inuse
-unsafe impl<'arena, T: Send> Sync for SlabRoot<'arena, T> {}
+unsafe impl<'arena, T: Send + Sync> Sync for SlabRoot<'arena, T> {}
 
-impl<'arena, T: Send> Debug for SlabRoot<'arena, T> {
+impl<'arena, T: Send + Sync> Debug for SlabRoot<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut fields = f.debug_struct("SlabRoot");
         fields.field("@addr", &(self as *const _));
@@ -106,7 +106,7 @@ impl<'arena, T: Send> Debug for SlabRoot<'arena, T> {
     }
 }
 
-impl<'arena, T: Send> SlabRoot<'arena, T> {
+impl<'arena, T: Send + Sync> SlabRoot<'arena, T> {
     /// Allocate a new root object for a slab memory allocator
     pub fn new() -> Self {
         Self {
@@ -184,19 +184,19 @@ impl<'arena, T: Send> SlabRoot<'arena, T> {
 ///
 /// The only way to get one of these is to go through [SlabRoot::try_lock_global]
 /// All the dangerous operations are only implemented on this object.
-pub struct SlabRootGlobalGuard<'arena, T: Send>(
+pub struct SlabRootGlobalGuard<'arena, T: Send + Sync>(
     &'arena SlabRoot<'arena, T>,
     /// prevent this type from being `Sync`
     PhantomData<UnsafeCell<()>>,
 );
 
-impl<'arena, T: Send> Debug for SlabRootGlobalGuard<'arena, T> {
+impl<'arena, T: Send + Sync> Debug for SlabRootGlobalGuard<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("SlabRootGlobalGuard").field(&self.0).finish()
     }
 }
 
-impl<'arena, T: Send> Drop for SlabRootGlobalGuard<'arena, T> {
+impl<'arena, T: Send + Sync> Drop for SlabRootGlobalGuard<'arena, T> {
     fn drop(&mut self) {
         let root = self.0;
         // ordering: need all manipulation of thread-owned data to stick
@@ -204,7 +204,7 @@ impl<'arena, T: Send> Drop for SlabRootGlobalGuard<'arena, T> {
     }
 }
 
-impl<'guard, 'arena, T: Send> SlabRootGlobalGuard<'arena, T> {
+impl<'guard, 'arena, T: Send + Sync> SlabRootGlobalGuard<'arena, T> {
     pub fn _debug_check_missing_blocks(&'guard self) -> HashSet<usize> {
         let mut all_outstanding_blocks = HashSet::new();
 
@@ -381,7 +381,7 @@ impl<'guard, 'arena, T: Send> SlabRootGlobalGuard<'arena, T> {
 }
 
 /// Slab allocator per-thread state (actual contents)
-pub struct SlabPerThreadState<'arena, T: Send> {
+pub struct SlabPerThreadState<'arena, T: Send + Sync> {
     /// Identifies this thread
     ///
     /// Current impl: bit position in the [SlabRoot::thread_inuse] bitfield
@@ -407,9 +407,9 @@ pub struct SlabPerThreadState<'arena, T: Send> {
 //
 // however, because only a SlabThreadShard can get outside this module,
 // the footgun is contained
-unsafe impl<'arena, T: Send> Sync for SlabPerThreadState<'arena, T> {}
+unsafe impl<'arena, T: Send + Sync> Sync for SlabPerThreadState<'arena, T> {}
 
-impl<'arena, T: Send> Debug for SlabPerThreadState<'arena, T> {
+impl<'arena, T: Send + Sync> Debug for SlabPerThreadState<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlabPerThreadState")
             .field("@addr", &(self as *const _))
@@ -455,7 +455,7 @@ const REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST: usize = 0b11;
 /// This bit pattern is invalid
 const _REMOTE_FREE_FLAGS_STATE_INVALID: usize = 0b10;
 
-impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
+impl<'arena, T: Send + Sync> SlabPerThreadState<'arena, T> {
     /// Initialize state
     pub unsafe fn init(self_: *mut Self, tid: u64, root: &'arena SlabRoot<'arena, T>) {
         // alloc initial segment
@@ -743,19 +743,19 @@ impl<'arena, T: Send> SlabPerThreadState<'arena, T> {
 ///
 /// It is *not* allowed for a raw `&'arena SlabPerThreadState<'arena, T>`
 /// to escape from this module. Allowing this can cause data races.
-pub struct SlabThreadShard<'arena, T: Send>(
+pub struct SlabThreadShard<'arena, T: Send + Sync>(
     &'arena SlabPerThreadState<'arena, T>,
     /// prevent this type from being `Sync`
     PhantomData<UnsafeCell<()>>,
 );
 
-impl<'arena, T: Send> Debug for SlabThreadShard<'arena, T> {
+impl<'arena, T: Send + Sync> Debug for SlabThreadShard<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("SlabThreadShard").field(&self.0).finish()
     }
 }
 
-impl<'arena, T: Send> Deref for SlabThreadShard<'arena, T> {
+impl<'arena, T: Send + Sync> Deref for SlabThreadShard<'arena, T> {
     type Target = &'arena SlabPerThreadState<'arena, T>;
 
     fn deref<'guard>(&'guard self) -> &'guard &'arena SlabPerThreadState<'arena, T> {
@@ -763,7 +763,7 @@ impl<'arena, T: Send> Deref for SlabThreadShard<'arena, T> {
     }
 }
 
-impl<'arena, T: Send> Drop for SlabThreadShard<'arena, T> {
+impl<'arena, T: Send + Sync> Drop for SlabThreadShard<'arena, T> {
     fn drop(&mut self) {
         let root = self.0.root;
         let mask = !(1 << self.0.tid);
@@ -774,7 +774,7 @@ impl<'arena, T: Send> Drop for SlabThreadShard<'arena, T> {
 
 /// Header for each (4 M) segment
 #[repr(C)]
-struct SlabSegmentHdr<'arena, T: Send> {
+struct SlabSegmentHdr<'arena, T: Send + Sync> {
     /// Thread that created this segment and owns its "local" data
     owning_tid: u64,
     /// Per-thread data of the thread that created this
@@ -786,7 +786,7 @@ struct SlabSegmentHdr<'arena, T: Send> {
     pages: [SlabSegmentPageMeta<'arena, T>; PAGES_PER_SEG],
 }
 
-impl<'arena, T: Send> Debug for SlabSegmentHdr<'arena, T> {
+impl<'arena, T: Send + Sync> Debug for SlabSegmentHdr<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlabSegmentHdr")
             .field("@addr", &(self as *const _))
@@ -801,7 +801,7 @@ impl<'arena, T: Send> Debug for SlabSegmentHdr<'arena, T> {
     }
 }
 
-impl<'arena, T: Send> SlabSegmentHdr<'arena, T> {
+impl<'arena, T: Send + Sync> SlabSegmentHdr<'arena, T> {
     pub fn alloc_new_seg(owning_tid: u64) -> *mut Self {
         unsafe {
             let seg = alloc::alloc_zeroed(SEGMENT_LAYOUT) as *mut Self;
@@ -873,7 +873,7 @@ impl<'arena, T: Send> SlabSegmentHdr<'arena, T> {
 ///
 /// Note that this is not stored *in* the page, but in the segment header.
 #[repr(C)]
-struct SlabSegmentPageMeta<'arena, T: Send> {
+struct SlabSegmentPageMeta<'arena, T: Send + Sync> {
     /// Linked list of pages
     next_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
     /// List that we allocate from in the fast path
@@ -887,9 +887,9 @@ struct SlabSegmentPageMeta<'arena, T: Send> {
 // safety: we carefully use atomic operations on remote_free_list,
 // and everything else is owned by one specific thread
 // (which is guarded by SlabRoot::thread_inuse)
-unsafe impl<'arena, T: Send> Sync for SlabSegmentPageMeta<'arena, T> {}
+unsafe impl<'arena, T: Send + Sync> Sync for SlabSegmentPageMeta<'arena, T> {}
 
-impl<'arena, T: Send> Debug for SlabSegmentPageMeta<'arena, T> {
+impl<'arena, T: Send + Sync> Debug for SlabSegmentPageMeta<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlabSegmentPageMeta")
             .field("@addr", &(self as *const _))
@@ -910,7 +910,7 @@ impl<'arena, T: Send> Debug for SlabSegmentPageMeta<'arena, T> {
     }
 }
 
-impl<'arena, T: Send> SlabSegmentPageMeta<'arena, T> {
+impl<'arena, T: Send + Sync> SlabSegmentPageMeta<'arena, T> {
     pub unsafe fn init_page(
         self_: *mut Self,
         seg_ptr: *const SlabSegmentHdr<'arena, T>,
@@ -1089,7 +1089,7 @@ struct SlabPayloadWithLock<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{alloc::Layout, cell::UnsafeCell, sync::atomic::Ordering};
+    use std::{alloc::Layout, sync::atomic::Ordering};
 
     use crate::util::_debug_hexdump;
 
@@ -1108,13 +1108,13 @@ mod tests {
 
     #[test]
     fn ensure_slab_root_send_sync() {
-        assert_send::<SlabRoot<'_, UnsafeCell<u8>>>();
-        assert_sync::<SlabRoot<'_, UnsafeCell<u8>>>();
+        assert_send::<SlabRoot<'_, u8>>();
+        assert_sync::<SlabRoot<'_, u8>>();
     }
 
     #[test]
     fn ensure_thread_shard_send() {
-        assert_send::<SlabThreadShard<'_, UnsafeCell<u8>>>();
+        assert_send::<SlabThreadShard<'_, u8>>();
     }
 
     #[cfg(not(loom))]
