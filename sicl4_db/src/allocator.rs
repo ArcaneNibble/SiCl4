@@ -1881,4 +1881,55 @@ mod tests {
 
         let _thread_shard = alloc.new_thread();
     }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn slab_separate_cells_wires_smoke_test() {
+        let alloc = SlabRoot::<[u8; 30000], [u8; 29999]>::new();
+        let thread_shard = alloc.new_thread();
+
+        let cell_obj = thread_shard.alloc_netlist_cell();
+        let wire_obj = thread_shard.alloc_netlist_wire();
+        println!("Allocated cell obj {:?}", cell_obj as *const _);
+        println!("Allocated wire obj {:?}", wire_obj as *const _);
+
+        // in range
+        let cell_obj_addr = cell_obj as *const _ as usize;
+        assert!(cell_obj_addr >= thread_shard.netlist_cells.segments.get() as *const _ as usize);
+        assert!(
+            cell_obj_addr
+                < thread_shard.netlist_cells.segments.get() as *const _ as usize + SEGMENT_SZ
+        );
+        let wire_obj_addr = wire_obj as *const _ as usize;
+        assert!(wire_obj_addr >= thread_shard.netlist_wires.segments.get() as *const _ as usize);
+        assert!(
+            wire_obj_addr
+                < thread_shard.netlist_wires.segments.get() as *const _ as usize + SEGMENT_SZ
+        );
+
+        drop(thread_shard);
+        let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+            .try_lock_global()
+            .unwrap()
+            ._debug_check_missing_blocks();
+        assert_eq!(outstanding_blocks_cells.len(), 1);
+        assert_eq!(outstanding_blocks_wires.len(), 1);
+        assert!(outstanding_blocks_cells.contains(&cell_obj_addr));
+        assert!(outstanding_blocks_wires.contains(&wire_obj_addr));
+
+        // now do a free
+        let thread_shard = alloc.new_thread();
+        unsafe {
+            thread_shard.free_netlist_cell(cell_obj);
+            thread_shard.free_netlist_wire(wire_obj);
+        }
+        println!("Did a free!");
+        drop(thread_shard);
+        let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+            .try_lock_global()
+            .unwrap()
+            ._debug_check_missing_blocks();
+        assert_eq!(outstanding_blocks_cells.len(), 0);
+        assert_eq!(outstanding_blocks_wires.len(), 0);
+    }
 }
