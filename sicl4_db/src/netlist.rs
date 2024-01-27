@@ -1075,10 +1075,6 @@ mod tests {
             "Creating netlist took {:?} MB memory",
             (create_mem.physical_mem - start_mem.physical_mem) as f64 / 1024.0 / 1024.0
         );
-        drop(init_thread_shard);
-        // XXX XXX XXX BAD BAD BAD ???
-        // why is it possible for guards to outlive the per-thread item?
-        // is this actually a problem?
 
         let workqueue = work_queue::Queue::new(NTHREADS, 128);
         {
@@ -1092,6 +1088,7 @@ mod tests {
 
         drop(generate_hax_luts_vec);
         drop(generate_hax_wires_vec);
+        drop(init_thread_shard);
 
         let start_mutate = Instant::now();
         let thread_handles = workqueue
@@ -1100,7 +1097,7 @@ mod tests {
                 let netlist_thread_shard = netlist.new_thread();
                 thread::spawn(move || {
                     while let Some(cell) = local_queue.pop() {
-                        let cell_w = cell.try_write().unwrap();
+                        let cell_w = netlist_thread_shard.try_write(cell).unwrap();
                         if cell_w.is_none() {
                             // dbg!("failed to grab self");
                             local_queue.push(cell);
@@ -1114,7 +1111,7 @@ mod tests {
 
                         if cell_w.cell_type == TEST_BUF_UUID {
                             let inp_wire_i = cell_w.connections[0].unwrap();
-                            let inp_wire_r = inp_wire_i.try_read().unwrap();
+                            let inp_wire_r = netlist_thread_shard.try_read(inp_wire_i).unwrap();
                             if inp_wire_r.is_none() {
                                 // dbg!("failed to grab inp wire for buf");
                                 local_queue.push(cell);
@@ -1136,7 +1133,8 @@ mod tests {
                             for inp_i in 0..4 {
                                 if let Some(inp_wire_ref) = cell_w.connections[inp_i] {
                                     if inp_wire_ref != outwire {
-                                        let inp_wire_r = inp_wire_ref.try_read().unwrap();
+                                        let inp_wire_r =
+                                            netlist_thread_shard.try_read(inp_wire_ref).unwrap();
                                         if inp_wire_r.is_none() {
                                             // dbg!("failed to grab inp {}", inp_i);
                                             local_queue.push(cell);
@@ -1150,7 +1148,7 @@ mod tests {
                             }
 
                             // grab output wire for write
-                            let outwire_w = outwire.try_write().unwrap();
+                            let outwire_w = netlist_thread_shard.try_write(outwire).unwrap();
                             if outwire_w.is_none() {
                                 // dbg!("failed to grab outp");
                                 local_queue.push(cell);
