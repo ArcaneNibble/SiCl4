@@ -1206,22 +1206,6 @@ impl<'arena> Debug for SlabFreeBlock<'arena> {
     }
 }
 
-/// Wrapped payload type, additionally containing a rwlock and generation counter
-/// (for preventing ABA problem)
-#[repr(C)]
-#[derive(Debug)]
-struct SlabPayloadWithLock<T> {
-    /// - Low 8 bits = rwlock
-    ///     - 0 = not locked
-    ///     - !0 = write locked
-    ///     - else contains `n - 1` readers
-    /// - High bits = generation counter
-    // NOTE: current impl restricts MAX_THREADS to never be more than 253
-    lock_and_generation: AtomicU64,
-    /// Inner data
-    payload: T,
-}
-
 #[cfg(test)]
 mod tests {
     use std::{alloc::Layout, sync::atomic::Ordering};
