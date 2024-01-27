@@ -1204,6 +1204,7 @@ impl<'arena, T: Send + Sync> SlabSegmentPageMeta<'arena, T> {
 }
 
 /// A slab block (used to ensure size/align for free chain)
+// fixme: there seems to be no good way to use this without involving transmutes?
 #[repr(C)]
 pub union SlabBlock<'arena, T> {
     free: ManuallyDrop<SlabFreeBlock<'arena>>,

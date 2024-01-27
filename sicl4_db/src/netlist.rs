@@ -9,7 +9,6 @@ use std::{
     marker::PhantomData,
     mem,
     ops::{Deref, DerefMut},
-    ptr::addr_of_mut,
     sync::atomic::Ordering,
 };
 
@@ -415,12 +414,14 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         unsafe {
             // fixme: wtf have we made any rust UB anywhere?
             let maybe_uninit = &*new_obj.alloced;
-            let new_obj_ptr = maybe_uninit.as_ptr() as *mut NetlistNodeWithLock<NetlistCell>;
+            let new_obj_ptr = maybe_uninit.as_ptr();
             // fixme: we will be alternating atomic accesses (here) with non-atomic accesses (when free)
             // how do we fix this UB?
-            (*new_obj_ptr).lock_and_generation =
-                AtomicU64::new(LockAndGeneration::WriteLocked { gen }.into());
-            NetlistCell::init(addr_of_mut!((*new_obj_ptr).payload) as *mut NetlistCell);
+            (*new_obj_ptr).lock_and_generation.store(
+                LockAndGeneration::WriteLocked { gen }.into(),
+                Ordering::Relaxed,
+            );
+            NetlistCell::init((*new_obj_ptr).payload.get());
 
             NetlistCellWriteGuard {
                 p: NetlistCellRef {
@@ -437,12 +438,14 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         unsafe {
             // fixme: wtf have we made any rust UB anywhere?
             let maybe_uninit = &*new_obj.alloced;
-            let new_obj_ptr = maybe_uninit.as_ptr() as *mut NetlistNodeWithLock<NetlistWire>;
+            let new_obj_ptr = maybe_uninit.as_ptr();
             // fixme: we will be alternating atomic accesses (here) with non-atomic accesses (when free)
             // how do we fix this UB?
-            (*new_obj_ptr).lock_and_generation =
-                AtomicU64::new(LockAndGeneration::WriteLocked { gen }.into());
-            NetlistWire::init(addr_of_mut!((*new_obj_ptr).payload) as *mut NetlistWire);
+            (*new_obj_ptr).lock_and_generation.store(
+                LockAndGeneration::WriteLocked { gen }.into(),
+                Ordering::Relaxed,
+            );
+            NetlistWire::init((*new_obj_ptr).payload.get());
 
             NetlistWireWriteGuard {
                 p: NetlistWireRef {
@@ -462,6 +465,7 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         // fixme: fully explain all the synchronizes-with wrt alloc/dealloc
         cell.p.ptr.lock_and_generation.store(0, Ordering::Release);
         unsafe {
+            // safety: just coercing between repr(C) union references
             self.heap_shard
                 .free_netlist_cell(mem::transmute(cell.p.ptr))
         }
@@ -476,6 +480,7 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         // fixme: fully explain all the synchronizes-with wrt alloc/dealloc
         wire.p.ptr.lock_and_generation.store(0, Ordering::Release);
         unsafe {
+            // safety: just coercing between repr(C) union references
             self.heap_shard
                 .free_netlist_wire(mem::transmute(wire.p.ptr))
         }
