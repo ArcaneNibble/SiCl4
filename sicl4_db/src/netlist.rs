@@ -3,7 +3,7 @@
 //! This contains logic for managing locks on netlist nodes
 
 use std::{
-    cell::UnsafeCell,
+    cell::{Cell, UnsafeCell},
     fmt::Debug,
     hash::Hash,
     marker::PhantomData,
@@ -11,6 +11,8 @@ use std::{
     ops::{Deref, DerefMut},
     sync::atomic::Ordering,
 };
+
+use uuid::Uuid;
 
 use crate::{allocator::*, loom_testing::*};
 
@@ -383,7 +385,10 @@ impl<'shard, 'arena, T: Send + Sync> Drop for NetlistNodeReadGuard<'shard, 'aren
 #[derive(Debug)]
 pub struct NetlistCell<'arena> {
     // todo
-    _wire: Option<NetlistWireRef<'arena>>,
+    cell_type: Uuid,
+    debug_id: usize,
+    visited_marker: bool,
+    connections: Vec<Option<NetlistWireRef<'arena>>>,
 }
 pub type NetlistCellRef<'arena> = NetlistNodeRef<'arena, NetlistCell<'arena>>;
 pub type NetlistCellWriteGuard<'shard, 'arena> =
@@ -391,8 +396,16 @@ pub type NetlistCellWriteGuard<'shard, 'arena> =
 pub type NetlistCellReadGuard<'shard, 'arena> =
     NetlistNodeReadGuard<'shard, 'arena, NetlistCell<'arena>>;
 impl<'arena> NetlistCell<'arena> {
-    pub unsafe fn init(self_: *mut Self) -> &'arena mut Self {
-        (*self_)._wire = None;
+    pub unsafe fn init(
+        self_: *mut Self,
+        cell_type: Uuid,
+        debug_id: usize,
+        num_connections: usize,
+    ) -> &'arena mut Self {
+        (*self_).cell_type = cell_type;
+        (*self_).debug_id = debug_id;
+        (*self_).visited_marker = false;
+        (*self_).connections = vec![None; num_connections];
 
         // safety: assert that we initialized everything
         &mut *self_
@@ -403,7 +416,10 @@ impl<'arena> NetlistCell<'arena> {
 #[derive(Debug)]
 pub struct NetlistWire<'arena> {
     // todo
-    _cell: Option<NetlistCellRef<'arena>>,
+    debug_id: usize,
+    drivers: Vec<NetlistCellRef<'arena>>,
+    sinks: Vec<NetlistCellRef<'arena>>,
+    bidirs: Vec<NetlistCellRef<'arena>>,
 }
 pub type NetlistWireRef<'arena> = NetlistNodeRef<'arena, NetlistWire<'arena>>;
 pub type NetlistWireWriteGuard<'shard, 'arena> =
@@ -411,8 +427,11 @@ pub type NetlistWireWriteGuard<'shard, 'arena> =
 pub type NetlistWireReadGuard<'shard, 'arena> =
     NetlistNodeReadGuard<'shard, 'arena, NetlistWire<'arena>>;
 impl<'arena> NetlistWire<'arena> {
-    pub unsafe fn init(self_: *mut Self) -> &'arena mut Self {
-        (*self_)._cell = None;
+    pub unsafe fn init(self_: *mut Self, debug_id: usize) -> &'arena mut Self {
+        (*self_).debug_id = debug_id;
+        (*self_).drivers = Vec::new();
+        (*self_).sinks = Vec::new();
+        (*self_).bidirs = Vec::new();
 
         // safety: assert that we initialized everything
         &mut *self_
@@ -440,6 +459,7 @@ impl<'arena> NetlistModule<'arena> {
     pub fn new_thread(&'arena self) -> NetlistModuleThreadAccessor<'arena> {
         NetlistModuleThreadAccessor {
             heap_shard: self.heap.new_thread(),
+            debug_id: Cell::new(0),
         }
     }
 }
@@ -452,11 +472,16 @@ pub struct NetlistModuleThreadAccessor<'arena> {
         NetlistNodeWithLock<NetlistCell<'arena>>,
         NetlistNodeWithLock<NetlistWire<'arena>>,
     >,
+    debug_id: Cell<usize>,
 }
 
 impl<'arena> NetlistModuleThreadAccessor<'arena> {
     /// Add a new netlist cell
-    pub fn new_cell<'wrapper>(&'wrapper self) -> NetlistCellWriteGuard<'wrapper, 'arena> {
+    pub fn new_cell<'wrapper>(
+        &'wrapper self,
+        cell_type: Uuid,
+        num_connections: usize,
+    ) -> NetlistCellWriteGuard<'wrapper, 'arena> {
         let (new_obj, gen) = self.heap_shard.alloc_netlist_cell();
         unsafe {
             // fixme: wtf have we made any rust UB anywhere?
@@ -493,7 +518,13 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
                 LockAndGeneration::WriteLocked { gen }.into(),
                 Ordering::Relaxed,
             );
-            NetlistCell::init((*new_obj_ptr).payload.get());
+            NetlistCell::init(
+                (*new_obj_ptr).payload.get(),
+                cell_type,
+                self.debug_id.get(),
+                num_connections,
+            );
+            self.debug_id.set(self.debug_id.get() + 1);
 
             NetlistCellWriteGuard {
                 p: NetlistCellRef {
@@ -518,7 +549,8 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
                 LockAndGeneration::WriteLocked { gen }.into(),
                 Ordering::Relaxed,
             );
-            NetlistWire::init((*new_obj_ptr).payload.get());
+            NetlistWire::init((*new_obj_ptr).payload.get(), self.debug_id.get());
+            self.debug_id.set(self.debug_id.get() + 1);
 
             NetlistWireWriteGuard {
                 p: NetlistWireRef {
@@ -681,23 +713,97 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
     }
 }
 
+pub fn connect_driver<'guard, 'thread, 'arena>(
+    cell: &'guard mut NetlistCellWriteGuard<'thread, 'arena>,
+    conn_idx: usize,
+    wire: &'guard mut NetlistWireWriteGuard<'thread, 'arena>,
+) {
+    cell.connections[conn_idx] = Some(wire.p);
+    wire.drivers.push(cell.p);
+}
+
+pub fn connect_sink<'guard, 'thread, 'arena>(
+    cell: &'guard mut NetlistCellWriteGuard<'thread, 'arena>,
+    conn_idx: usize,
+    wire: &'guard mut NetlistWireWriteGuard<'thread, 'arena>,
+) {
+    cell.connections[conn_idx] = Some(wire.p);
+    wire.sinks.push(cell.p);
+}
+
+pub fn connect_bidir<'guard, 'thread, 'arena>(
+    cell: &'guard mut NetlistCellWriteGuard<'thread, 'arena>,
+    conn_idx: usize,
+    wire: &'guard mut NetlistWireWriteGuard<'thread, 'arena>,
+) {
+    cell.connections[conn_idx] = Some(wire.p);
+    wire.bidirs.push(cell.p);
+}
+
+pub fn disconnect_driver<'guard, 'thread, 'arena>(
+    cell: &'guard mut NetlistCellWriteGuard<'thread, 'arena>,
+    conn_idx: usize,
+    wire: &'guard mut NetlistWireWriteGuard<'thread, 'arena>,
+) {
+    let ref_wire_idx = cell.connections[conn_idx].take();
+    assert_eq!(ref_wire_idx, Some(wire.p));
+    let wire_to_cell_idx = wire
+        .drivers
+        .iter()
+        .position(|wire_to_cell| cell.p == *wire_to_cell)
+        .unwrap();
+    wire.drivers.swap_remove(wire_to_cell_idx);
+}
+
+pub fn disconnect_sink<'guard, 'thread, 'arena>(
+    cell: &'guard mut NetlistCellWriteGuard<'thread, 'arena>,
+    conn_idx: usize,
+    wire: &'guard mut NetlistWireWriteGuard<'thread, 'arena>,
+) {
+    let ref_wire_idx = cell.connections[conn_idx].take();
+    assert_eq!(ref_wire_idx, Some(wire.p));
+    let wire_to_cell_idx = wire
+        .sinks
+        .iter()
+        .position(|wire_to_cell| cell.p == *wire_to_cell)
+        .unwrap();
+    wire.drivers.swap_remove(wire_to_cell_idx);
+}
+
+pub fn disconnect_bidir<'guard, 'thread, 'arena>(
+    cell: &'guard mut NetlistCellWriteGuard<'thread, 'arena>,
+    conn_idx: usize,
+    wire: &'guard mut NetlistWireWriteGuard<'thread, 'arena>,
+) {
+    let ref_wire_idx = cell.connections[conn_idx].take();
+    assert_eq!(ref_wire_idx, Some(wire.p));
+    let wire_to_cell_idx = wire
+        .bidirs
+        .iter()
+        .position(|wire_to_cell| cell.p == *wire_to_cell)
+        .unwrap();
+    wire.drivers.swap_remove(wire_to_cell_idx);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::uuid;
+
+    const TEST_LUT_UUID: Uuid = uuid!("00000000-0000-0000-0000-000000000000");
 
     #[test]
     fn netlist_locking_smoke_test() {
         let netlist = NetlistModule::new();
         let thread = netlist.new_thread();
 
-        let mut cell_0 = thread.new_cell();
+        let mut cell_0 = thread.new_cell(TEST_LUT_UUID, 1);
         println!("Allocated new cell, {:?}", cell_0.p);
 
         let mut wire_0 = thread.new_wire();
         println!("Allocated new wire, {:?}", wire_0.p);
 
-        cell_0._wire = Some(wire_0.p);
-        wire_0._cell = Some(cell_0.p);
+        connect_driver(&mut cell_0, 0, &mut wire_0);
 
         let cell_0_p = cell_0.p;
         let wire_0_p = wire_0.p;
@@ -746,8 +852,8 @@ mod tests {
         println!("Re-reading cell: {:?}", *cell_0_r_0);
         println!("Re-reading wire: {:?}", *wire_0_r_0);
 
-        assert_eq!(cell_0_r_0._wire, Some(wire_0_p));
-        assert_eq!(wire_0_r_0._cell, Some(cell_0_p));
+        assert_eq!(cell_0_r_0.connections[0], Some(wire_0_p));
+        assert_eq!(wire_0_r_0.drivers[0], cell_0_p);
 
         let cell_0_r_1 = thread.try_read(cell_0_p).unwrap().unwrap();
         let wire_0_r_1 = thread.try_read(wire_0_p).unwrap().unwrap();
@@ -764,8 +870,8 @@ mod tests {
         println!("Re-reading cell again: {:?}", *cell_0_r_1);
         println!("Re-reading wire again: {:?}", *wire_0_r_1);
 
-        assert_eq!(cell_0_r_1._wire, Some(wire_0_p));
-        assert_eq!(wire_0_r_1._cell, Some(cell_0_p));
+        assert_eq!(cell_0_r_1.connections[0], Some(wire_0_p));
+        assert_eq!(wire_0_r_1.drivers[0], cell_0_p);
 
         let try_write = thread.try_write(cell_0_p);
         assert!(try_write.is_ok());
@@ -811,8 +917,8 @@ mod tests {
         println!("Re-reading cell again through write: {:?}", *cell_0_re_w);
         println!("Re-reading wire again through write: {:?}", *wire_0_re_w);
 
-        assert_eq!(cell_0_re_w._wire, Some(wire_0_p));
-        assert_eq!(wire_0_re_w._cell, Some(cell_0_p));
+        assert_eq!(cell_0_re_w.connections[0], Some(wire_0_p));
+        assert_eq!(wire_0_re_w.drivers[0], cell_0_p);
 
         thread.delete_cell(cell_0_re_w);
 
@@ -836,7 +942,7 @@ mod tests {
         let netlist = NetlistModule::new();
         let thread = netlist.new_thread();
 
-        let cell_0 = thread.new_cell();
+        let cell_0 = thread.new_cell(TEST_LUT_UUID, 0);
         let cell_0_p = cell_0.p;
         println!("Allocated new cell, {:?}", cell_0_p);
         thread.delete_cell(cell_0);
@@ -844,7 +950,7 @@ mod tests {
         let mut num_iters = 0;
 
         loop {
-            let cell_i = thread.new_cell();
+            let cell_i = thread.new_cell(TEST_LUT_UUID, 0);
             let cell_i_p = cell_i.p;
             if cell_0_p.ptr as *const _ == cell_i_p.ptr {
                 println!("Reused pointer detected after {} iters", num_iters);
@@ -867,7 +973,7 @@ mod tests {
         let netlist = NetlistModule::new();
         let thread = netlist.new_thread();
 
-        let cell_0 = thread.new_cell();
+        let cell_0 = thread.new_cell(TEST_LUT_UUID, 0);
         let cell_0_p = cell_0.p;
         println!("Allocated new cell, {:?}", cell_0_p);
 
@@ -916,7 +1022,7 @@ mod tests {
         let thread = netlist.new_thread();
         dbg!(&thread);
 
-        let cell_0 = thread.new_cell();
+        let cell_0 = thread.new_cell(TEST_LUT_UUID, 0);
         dbg!(&cell_0);
         dbg!(&*cell_0);
     }
