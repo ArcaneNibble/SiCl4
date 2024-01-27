@@ -15,25 +15,35 @@ use std::{
 use crate::{allocator::*, loom_testing::*};
 
 const _ONLY_SUPPORTS_64BIT_PLATFORMS: () = assert!(usize::BITS == 64);
-const _: () = assert!(crate::allocator::MAX_THREADS <= 254);
+const _: () = assert!(MAX_THREADS <= 254);
 
+/// Helper for packing/unpacking atomic lock/generation bits
+///
 /// - `bits[7:0]` = rwlock
 ///     - 0 = not locked
 ///     - !0 = write locked
 ///     - else contains `n` readers
 /// - `bits[62:8]` = generation counter
-/// - `bits[63]` = valid
-// NOTE: current impl restricts MAX_THREADS to never be more than 254
-// super dangerous spicy trick: the high bit is used to indicate that this
-// memory block contains valid, allocated data.
-// this will be used for implementing "search through heap, in any order"
-// the reason that this works is because blocks on a free list
-// will contain a pointer which overlaps this field.
-// this pointer is either null or a valid address,
-// which cannot have the high bit set on all platforms we care about
-//
-// the generation counter can indeed be per-thread, as it is combined with
-// the address itself (which will be from different segments across different threads)
+/// - `bits[63]` = valid (i.e. allocated)
+///
+/// NOTE: current impl restricts [MAX_THREADS] to never be more than 254
+///
+/// XXX: The current implementation uses a super dangerous spicy trick
+/// that is also technically UB according to the abstract memory model.
+/// This lock/generation field is stored at the very beginning of a heap
+/// block containing netlist cells/wires, in a location that just so happens
+/// to overlap with the heap free list next pointer once the block gets freed.
+/// When a block is freed, the allocator will either store null or a valid
+/// pointer in this location. Neither of these will have bit 63 set, so
+/// we can detect if code tries to acquire a lock to a deleted object
+/// (as long as the backing segment itself isn't deleted, which we won't do
+/// while any graph algorithms are running).
+///
+/// FIXME: How does this interact with MTE/PAC?
+///
+/// NOTE: Generation counters are per-thread and not global. This is fine as it
+/// is combined with the address itself in order to reference a specific node
+/// (the address will come from different memory segments across different threads)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockAndGeneration {
     Unallocated {
@@ -137,12 +147,14 @@ unsafe impl<T: Send + Sync> Sync for NetlistNodeWithLock<T> {}
 
 /// References to netlist nodes that have a lifetime from a particular heap
 ///
-/// Stores a raw pointer and an ABA generation counter
+/// This is basically a fat pointer. It stores a raw pointer and an ABA generation counter.
+/// They can be freely copied, sent between threads, etc.
+///
+/// These items compare with reference equality, not value equality.
 pub struct NetlistNodeRef<'arena, T: Send + Sync> {
     ptr: &'arena NetlistNodeWithLock<T>,
     gen: u64,
 }
-// these fat references can be freely copied just like a normal reference
 // fixme justify why auto deriving doesn't work
 impl<'arena, T: Send + Sync> Clone for NetlistNodeRef<'arena, T> {
     fn clone(&self) -> Self {
@@ -175,14 +187,32 @@ impl<'arena, T: Send + Sync> Hash for NetlistNodeRef<'arena, T> {
     }
 }
 
+/// Guard object holding exclusive access to a graph node (allowing reads and writes)
 pub struct NetlistNodeWriteGuard<'shard, 'arena, T: Send + Sync> {
+    /// Object that this guard is protecting
     pub p: NetlistNodeRef<'arena, T>,
-    /// prevent this type from being `Sync`
+    /// Prevent this type from being `Sync`
     _pd1: PhantomData<UnsafeCell<()>>,
-    /// prevent this type from outliving thread shard
+    /// Prevent this type from outliving thread shard
+    ///
+    /// Note that there is no safety reason why this is necessary *at this layer of abstraction*.
+    /// Locked objects can be unlocked from any thread without issue.
+    /// In fact, the "Galois system" inspired algorithm executor
+    /// can end up transferring guards across threads.
+    ///
+    /// The purpose of this is to enforce that, when a [SlabRootGlobalGuard] is held,
+    /// not only is there no _allocator_ traffic occurring, but there is *also*
+    /// no activity happening _within_ the netlist itself.
+    /// (Imagine otherwise a situation where *all* thread shards are dropped, so
+    /// nobody can allocate or free everything, but a bunch of threads are running
+    /// in the background mutating the existing netlist.)
     _pd2: PhantomData<&'shard ()>,
 }
 impl<'shard, 'arena, T: Send + Sync> NetlistNodeWriteGuard<'shard, 'arena, T> {
+    /// Downgrades read/write access to read-only access
+    ///
+    /// This will allow other readers to potentially start accessing
+    /// the new data that was written
     pub fn downgrade(self) -> NetlistNodeReadGuard<'shard, 'arena, T> {
         // we have exclusive access
         // we can freely downgrade to a read lock with a single reader
@@ -256,14 +286,24 @@ impl<'shard, 'arena, T: Send + Sync> Drop for NetlistNodeWriteGuard<'shard, 'are
     }
 }
 
+/// Guard object holding read-only access to a graph node (allowing multiple readers)
 pub struct NetlistNodeReadGuard<'shard, 'arena, T: Send + Sync> {
+    /// Object that this guard is protecting
     pub p: NetlistNodeRef<'arena, T>,
-    /// prevent this type from being `Sync`
+    /// Prevent this type from being `Sync`
     _pd1: PhantomData<UnsafeCell<()>>,
-    /// prevent this type from outliving thread shard
+    /// Prevent this type from outliving thread shard
+    ///
+    /// See note under [NetlistNodeWriteGuard::_pd2]
     _pd2: PhantomData<&'shard ()>,
 }
 impl<'shard, 'arena, T: Send + Sync> NetlistNodeReadGuard<'shard, 'arena, T> {
+    /// Try to convert read-only access to exclusive read/write access
+    ///
+    /// If this thread happens to be the only reader accessing the node,
+    /// access will be upgraded to an exclusive read/write lock.
+    ///
+    /// If upgrading fails, returns with a read/only lock still held.
     pub fn try_upgrade(
         self,
     ) -> Result<NetlistNodeWriteGuard<'shard, 'arena, T>, NetlistNodeReadGuard<'shard, 'arena, T>>
@@ -379,6 +419,7 @@ impl<'arena> NetlistWire<'arena> {
     }
 }
 
+/// Top-level netlist data structure
 #[derive(Debug)]
 pub struct NetlistModule<'arena> {
     heap: SlabRoot<
@@ -389,11 +430,13 @@ pub struct NetlistModule<'arena> {
 }
 
 impl<'arena> NetlistModule<'arena> {
+    /// Construct a new netlist
     pub fn new() -> Self {
         Self {
             heap: SlabRoot::new(),
         }
     }
+    /// Get a thread shard for performing operations on the netlist
     pub fn new_thread(&'arena self) -> NetlistModuleThreadAccessor<'arena> {
         NetlistModuleThreadAccessor {
             heap_shard: self.heap.new_thread(),
@@ -401,6 +444,7 @@ impl<'arena> NetlistModule<'arena> {
     }
 }
 
+/// Provides one thread with access to the netlist
 #[derive(Debug)]
 pub struct NetlistModuleThreadAccessor<'arena> {
     heap_shard: SlabThreadShard<
@@ -411,6 +455,7 @@ pub struct NetlistModuleThreadAccessor<'arena> {
 }
 
 impl<'arena> NetlistModuleThreadAccessor<'arena> {
+    /// Add a new netlist cell
     pub fn new_cell<'wrapper>(&'wrapper self) -> NetlistCellWriteGuard<'wrapper, 'arena> {
         let (new_obj, gen) = self.heap_shard.alloc_netlist_cell();
         unsafe {
@@ -461,6 +506,7 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         }
     }
 
+    /// Add a new netlist wire
     pub fn new_wire<'wrapper>(&'wrapper self) -> NetlistWireWriteGuard<'wrapper, 'arena> {
         let (new_obj, gen) = self.heap_shard.alloc_netlist_wire();
         unsafe {
@@ -485,6 +531,10 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         }
     }
 
+    /// Delete a netlist cell
+    ///
+    /// Deletion is only permitted if the caller has exclusive write access to the node,
+    /// which is enforced by consuming the write guard
     pub fn delete_cell<'wrapper>(&'wrapper self, cell: NetlistCellWriteGuard<'wrapper, 'arena>) {
         // XXX we currently have a (unfixable in the current design) source of UB
         // when deallocating: no matter what we do with lock_and_generation here,
@@ -522,6 +572,10 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         mem::forget(cell);
     }
 
+    /// Delete a netlist wire
+    ///
+    /// Deletion is only permitted if the caller has exclusive write access to the node,
+    /// which is enforced by consuming the write guard
     pub fn delete_wire<'wrapper>(&'wrapper self, wire: NetlistWireWriteGuard<'wrapper, 'arena>) {
         // see notes above
         wire.p.ptr.lock_and_generation.store(0, Ordering::Relaxed);
@@ -532,9 +586,13 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         }
         mem::forget(wire);
     }
-    // Err(()) -> wrong generation (obj doesn't exist anymore)
-    // Ok(None) -> acquire failed
-    // Ok(x) -> acquire succeeded
+
+    /// Try to acquire read-only access to a graph node
+    ///
+    /// Return values:
+    /// * `Err(())` -> this object has been deleted (it is definitely gone, do not try again)
+    /// * `Ok(None)` -> lock acquiring failed (contention, can try again)
+    /// * `Ok(_)` -> acquire succeeded
     pub fn try_read<'wrapper, CellOrWireTy: Send + Sync>(
         &'wrapper self,
         p: NetlistNodeRef<'arena, CellOrWireTy>,
@@ -575,6 +633,12 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         }
     }
 
+    /// Try to acquire exclusive read/write access to a graph node
+    ///
+    /// Return values:
+    /// * `Err(())` -> this object has been deleted (it is definitely gone, do not try again)
+    /// * `Ok(None)` -> lock acquiring failed (contention, can try again)
+    /// * `Ok(_)` -> acquire succeeded
     pub fn try_write<'wrapper, CellOrWireTy: Send + Sync>(
         &'wrapper self,
         p: NetlistNodeRef<'arena, CellOrWireTy>,
