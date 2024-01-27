@@ -66,7 +66,8 @@ impl LockAndGeneration {
             LockAndGeneration::Unlocked { .. } => 0,
             LockAndGeneration::ReadLocked { num_readers, .. } => num_readers,
             LockAndGeneration::WriteLocked { .. } | LockAndGeneration::Unallocated { .. } => {
-                unreachable!()
+                // xxx this is a hack for optimizations
+                0
             }
         }
     }
@@ -256,6 +257,34 @@ pub struct NetlistNodeWriteGuard<'arena, T: Send + Sync> {
     /// prevent this type from being `Sync`
     _pd: PhantomData<UnsafeCell<()>>,
 }
+impl<'arena, T: Send + Sync> NetlistNodeWriteGuard<'arena, T> {
+    pub fn downgrade(self) -> NetlistNodeReadGuard<'arena, T> {
+        // we have exclusive access
+        // we can freely downgrade to a read lock with a single reader
+        // we *do* need other threads trying to acquire read locks
+        // to see data we wrote (synchronizes-with)
+        // so we need release ordering
+        // we become read-only to the current thread afterwards,
+        // so the current thread cannot have any writes afterwards
+        // that can be reordered. it *can* have reads afterwards, but those
+        // reads must read data that *we* wrote. so we don't need acquire
+        let old_atomic_val = self
+            .p
+            .ptr
+            .lock_and_generation
+            .fetch_and(!0xfe, Ordering::Release);
+        debug_assert_eq!(
+            LockAndGeneration::from(old_atomic_val),
+            LockAndGeneration::WriteLocked { gen: self.p.gen }
+        );
+        let p = self.p;
+        mem::forget(self);
+        NetlistNodeReadGuard {
+            p,
+            _pd: PhantomData,
+        }
+    }
+}
 impl<'arena, T: Send + Sync> Debug for NetlistNodeWriteGuard<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple(&format!(
@@ -305,6 +334,43 @@ pub struct NetlistNodeReadGuard<'arena, T: Send + Sync> {
     pub p: NetlistNodeRef<'arena, T>,
     /// prevent this type from being `Sync`
     _pd: PhantomData<UnsafeCell<()>>,
+}
+impl<'arena, T: Send + Sync> NetlistNodeReadGuard<'arena, T> {
+    pub fn try_upgrade(
+        self,
+    ) -> Result<NetlistNodeWriteGuard<'arena, T>, NetlistNodeReadGuard<'arena, T>> {
+        let mut old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
+        loop {
+            let old_atomic = LockAndGeneration::from(old_atomic_val);
+            debug_assert!(matches!(
+                old_atomic,
+                LockAndGeneration::ReadLocked { gen, .. } if gen == self.p.gen
+            ));
+            debug_assert!(old_atomic.get_num_readers() >= 1);
+            if old_atomic.get_num_readers() > 1 {
+                // failed to claim
+                return Err(self);
+            }
+            // else try to acquire
+            let new_atomic_val = old_atomic_val | 0xff;
+            match self.p.ptr.lock_and_generation.compare_exchange_weak(
+                old_atomic_val,
+                new_atomic_val,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let p = self.p;
+                    mem::forget(self);
+                    return Ok(NetlistNodeWriteGuard {
+                        p,
+                        _pd: PhantomData,
+                    });
+                }
+                Err(x) => old_atomic_val = x,
+            }
+        }
+    }
 }
 impl<'arena, T: Send + Sync> Debug for NetlistNodeReadGuard<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -711,6 +777,52 @@ mod tests {
             thread.delete_cell(cell_i);
             num_iters += 1;
         }
+    }
+
+    #[test]
+    fn netlist_locking_smoke_test_upgrade_downgrade() {
+        let netlist = NetlistModule::new();
+        let thread = netlist.new_thread();
+
+        let cell_0 = thread.new_cell();
+        let cell_0_p = cell_0.p;
+        println!("Allocated new cell, {:?}", cell_0_p);
+
+        assert_eq!(
+            cell_0_p.ptr.lock_and_generation.load(Ordering::SeqCst),
+            0x80000000000000ff
+        );
+
+        let cell_0_r_0 = cell_0.downgrade();
+        assert_eq!(
+            cell_0_p.ptr.lock_and_generation.load(Ordering::SeqCst),
+            0x8000000000000001
+        );
+
+        let cell_0_r_1 = cell_0_p.try_read().unwrap().unwrap();
+        assert_eq!(
+            cell_0_p.ptr.lock_and_generation.load(Ordering::SeqCst),
+            0x8000000000000002
+        );
+
+        // note: drops
+        assert!(cell_0_r_0.try_upgrade().is_err());
+        assert_eq!(
+            cell_0_p.ptr.lock_and_generation.load(Ordering::SeqCst),
+            0x8000000000000001
+        );
+
+        let cell_0_w_again = cell_0_r_1.try_upgrade().unwrap();
+        assert_eq!(
+            cell_0_p.ptr.lock_and_generation.load(Ordering::SeqCst),
+            0x80000000000000ff
+        );
+
+        drop(cell_0_w_again);
+        assert_eq!(
+            cell_0_p.ptr.lock_and_generation.load(Ordering::SeqCst),
+            0x8000000000000000
+        );
     }
 
     #[test]
