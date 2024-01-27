@@ -256,6 +256,16 @@ pub struct NetlistNodeWriteGuard<'arena, T: Send + Sync> {
     /// prevent this type from being `Sync`
     _pd: PhantomData<UnsafeCell<()>>,
 }
+impl<'arena, T: Send + Sync> Debug for NetlistNodeWriteGuard<'arena, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple(&format!(
+            "NetlistNodeWriteGuard<{}>",
+            std::any::type_name::<T>()
+        ))
+        .field(&self.p)
+        .finish()
+    }
+}
 impl<'arena, T: Send + Sync> Deref for NetlistNodeWriteGuard<'arena, T> {
     type Target = T;
 
@@ -295,6 +305,16 @@ pub struct NetlistNodeReadGuard<'arena, T: Send + Sync> {
     pub p: NetlistNodeRef<'arena, T>,
     /// prevent this type from being `Sync`
     _pd: PhantomData<UnsafeCell<()>>,
+}
+impl<'arena, T: Send + Sync> Debug for NetlistNodeReadGuard<'arena, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple(&format!(
+            "NetlistNodeReadGuard<{}>",
+            std::any::type_name::<T>()
+        ))
+        .field(&self.p)
+        .finish()
+    }
 }
 impl<'arena, T: Send + Sync> Deref for NetlistNodeReadGuard<'arena, T> {
     type Target = T;
@@ -691,5 +711,18 @@ mod tests {
             thread.delete_cell(cell_i);
             num_iters += 1;
         }
+    }
+
+    #[test]
+    #[ignore = "not automated, human eye verified"]
+    fn netlist_locking_debug_tests() {
+        let netlist = NetlistModule::new();
+        dbg!(&netlist);
+        let thread = netlist.new_thread();
+        dbg!(&thread);
+
+        let cell_0 = thread.new_cell();
+        dbg!(&cell_0);
+        dbg!(&*cell_0);
     }
 }
