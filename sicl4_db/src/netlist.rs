@@ -311,33 +311,15 @@ impl<'arena, T: Send + Sync> Drop for NetlistNodeReadGuard<'arena, T> {
         // ordering: in order to prevent reads to data from moving
         // after this atomic update, we *still* need release ordering
         // (even though no data is modified)
-        let mut old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
-        loop {
-            let old_atomic = LockAndGeneration::from(old_atomic_val);
-            let new_atomic = if let LockAndGeneration::ReadLocked {
-                gen: stored_gen,
-                num_readers,
-            } = old_atomic
-            {
-                debug_assert_eq!(stored_gen, self.p.gen);
-                LockAndGeneration::ReadLocked {
-                    gen: stored_gen,
-                    num_readers: num_readers - 1,
-                }
-            } else {
-                panic!("Corrupted atomic lock variable")
-            };
-            let new_atomic_val: u64 = new_atomic.into();
-            match self.p.ptr.lock_and_generation.compare_exchange_weak(
-                old_atomic_val,
-                new_atomic_val,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(x) => old_atomic_val = x,
-            }
-        }
+        let old_atomic_val = self
+            .p
+            .ptr
+            .lock_and_generation
+            .fetch_sub(1, Ordering::Release);
+        debug_assert!(matches!(
+            LockAndGeneration::from(old_atomic_val),
+            LockAndGeneration::ReadLocked { gen, .. } if gen == self.p.gen
+        ));
     }
 }
 
