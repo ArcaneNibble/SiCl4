@@ -7,6 +7,7 @@ use std::{
     fmt::Debug,
     hash::Hash,
     marker::PhantomData,
+    mem,
     ops::{Deref, DerefMut},
     ptr::addr_of_mut,
     sync::atomic::Ordering,
@@ -36,9 +37,19 @@ const _: () = assert!(crate::allocator::MAX_THREADS <= 254);
 // the address itself (which will be from different segments across different threads)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockAndGeneration {
-    Unlocked { gen: u64 },
-    WriteLocked { gen: u64 },
-    ReadLocked { gen: u64, num_readers: u8 },
+    Unallocated {
+        _maybe_free_ptr_super_dangerous: u64,
+    },
+    Unlocked {
+        gen: u64,
+    },
+    WriteLocked {
+        gen: u64,
+    },
+    ReadLocked {
+        gen: u64,
+        num_readers: u8,
+    },
 }
 impl LockAndGeneration {
     #[inline]
@@ -47,6 +58,7 @@ impl LockAndGeneration {
             LockAndGeneration::Unlocked { gen }
             | LockAndGeneration::WriteLocked { gen }
             | LockAndGeneration::ReadLocked { gen, .. } => gen,
+            LockAndGeneration::Unallocated { .. } => unreachable!(),
         }
     }
     #[inline]
@@ -54,14 +66,20 @@ impl LockAndGeneration {
         match self {
             LockAndGeneration::Unlocked { .. } => 0,
             LockAndGeneration::ReadLocked { num_readers, .. } => num_readers,
-            LockAndGeneration::WriteLocked { .. } => unreachable!(),
+            LockAndGeneration::WriteLocked { .. } | LockAndGeneration::Unallocated { .. } => {
+                unreachable!()
+            }
         }
     }
 }
 impl From<u64> for LockAndGeneration {
     #[inline]
     fn from(value: u64) -> Self {
-        debug_assert!(value & 0x8000000000000000 != 0);
+        if value & 0x8000000000000000 == 0 {
+            return LockAndGeneration::Unallocated {
+                _maybe_free_ptr_super_dangerous: value,
+            };
+        }
         let rwlock = value & 0xff;
         let gen = (value >> 8) & 0x7fffffffffffff;
         if rwlock == 0 {
@@ -80,6 +98,12 @@ impl Into<u64> for LockAndGeneration {
     #[inline]
     fn into(self) -> u64 {
         match self {
+            LockAndGeneration::Unallocated {
+                _maybe_free_ptr_super_dangerous,
+            } => {
+                debug_assert!(_maybe_free_ptr_super_dangerous <= 0x7fffffffffffffff);
+                _maybe_free_ptr_super_dangerous
+            }
             LockAndGeneration::Unlocked { gen } => {
                 debug_assert!(gen <= 0x7fffffffffffff);
                 (gen << 8) | 0x8000000000000000
@@ -158,6 +182,10 @@ impl<'arena, T: Send + Sync> NetlistNodeRef<'arena, T> {
         let mut old_atomic_val = self.ptr.lock_and_generation.load(Ordering::Relaxed);
         loop {
             let old_atomic = LockAndGeneration::from(old_atomic_val);
+            if let LockAndGeneration::Unallocated { .. } = old_atomic {
+                // object invalidated (gone, deleted)
+                return Err(());
+            }
             if old_atomic.get_gen() != self.gen {
                 // object invalidated (gone, deleted)
                 return Err(());
@@ -191,6 +219,10 @@ impl<'arena, T: Send + Sync> NetlistNodeRef<'arena, T> {
         let mut old_atomic_val = self.ptr.lock_and_generation.load(Ordering::Relaxed);
         loop {
             let old_atomic = LockAndGeneration::from(old_atomic_val);
+            if let LockAndGeneration::Unallocated { .. } = old_atomic {
+                // object invalidated (gone, deleted)
+                return Err(());
+            }
             if old_atomic.get_gen() != self.gen {
                 // object invalidated (gone, deleted)
                 return Err(());
@@ -421,6 +453,34 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
             }
         }
     }
+
+    pub fn delete_cell<'wrapper>(&'wrapper self, cell: NetlistCellWriteGuard<'arena>) {
+        // explicitly atomic clear (mark as deallocated) this block with release ordering
+        // so no pending writes can move past us and corrupt heap operations
+        //
+        // fixme: we still alternate with non-atomic access inside the allocator itself
+        // fixme: fully explain all the synchronizes-with wrt alloc/dealloc
+        cell.p.ptr.lock_and_generation.store(0, Ordering::Release);
+        unsafe {
+            self.heap_shard
+                .free_netlist_cell(mem::transmute(cell.p.ptr))
+        }
+        mem::forget(cell);
+    }
+
+    pub fn delete_wire<'wrapper>(&'wrapper self, wire: NetlistWireWriteGuard<'arena>) {
+        // explicitly atomic clear (mark as deallocated) this block with release ordering
+        // so no pending writes can move past us and corrupt heap operations
+        //
+        // fixme: we still alternate with non-atomic access inside the allocator itself
+        // fixme: fully explain all the synchronizes-with wrt alloc/dealloc
+        wire.p.ptr.lock_and_generation.store(0, Ordering::Release);
+        unsafe {
+            self.heap_shard
+                .free_netlist_wire(mem::transmute(wire.p.ptr))
+        }
+        mem::forget(wire);
+    }
 }
 
 #[cfg(test)]
@@ -555,5 +615,52 @@ mod tests {
 
         assert_eq!(cell_0_re_w._wire, Some(wire_0_p));
         assert_eq!(wire_0_re_w._cell, Some(cell_0_p));
+
+        thread.delete_cell(cell_0_re_w);
+
+        // xxx reading "freed" memory!
+        assert_eq!(cell_0_p.ptr.lock_and_generation.load(Ordering::SeqCst), 0);
+
+        assert!(cell_0_p.try_write().is_err());
+        assert!(cell_0_p.try_read().is_err());
+
+        thread.delete_wire(wire_0_re_w);
+
+        // xxx reading "freed" memory!
+        assert_eq!(wire_0_p.ptr.lock_and_generation.load(Ordering::SeqCst), 0);
+
+        assert!(wire_0_p.try_write().is_err());
+        assert!(wire_0_p.try_read().is_err());
+    }
+
+    #[test]
+    fn netlist_locking_smoke_test_generation() {
+        let netlist = NetlistModule::new();
+        let thread = netlist.new_thread();
+
+        let cell_0 = thread.new_cell();
+        let cell_0_p = cell_0.p;
+        println!("Allocated new cell, {:?}", cell_0_p);
+        thread.delete_cell(cell_0);
+
+        let mut num_iters = 0;
+
+        loop {
+            let cell_i = thread.new_cell();
+            let cell_i_p = cell_i.p;
+            if cell_0_p.ptr as *const _ == cell_i_p.ptr {
+                println!("Reused pointer detected after {} iters", num_iters);
+                dbg!(cell_0_p);
+                dbg!(cell_i_p);
+                assert_ne!(cell_0_p.gen, cell_i_p.gen);
+
+                assert!(cell_0_p.try_read().is_err());
+                assert!(cell_0_p.try_write().is_err());
+
+                break;
+            }
+            thread.delete_cell(cell_i);
+            num_iters += 1;
+        }
     }
 }
