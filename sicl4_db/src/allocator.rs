@@ -80,7 +80,8 @@ pub struct SlabRoot<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> {
     /// (and it hasn't been dropped yet)
     thread_inuse: AtomicU64,
     /// Actual storage for per-thread data
-    per_thread_state: [MaybeUninit<SlabPerThreadState<'arena, CellsTy, WiresTy>>; MAX_THREADS],
+    per_thread_state:
+        [UnsafeCell<MaybeUninit<SlabPerThreadState<'arena, CellsTy, WiresTy>>>; MAX_THREADS],
     /// Indicates whether or not the state has been initialized
     per_thread_state_inited: [Cell<bool>; MAX_THREADS],
     /// Ensure `'arena` lifetime is invariant
@@ -103,7 +104,7 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
                 fields.field(&format!("per_thread_state[{}]", i), &"<uninit>");
             } else {
                 fields.field(&format!("per_thread_state[{}]", i), unsafe {
-                    self.per_thread_state[i].assume_init_ref()
+                    (&*self.per_thread_state[i].get()).assume_init_ref()
                 });
             }
         }
@@ -158,15 +159,16 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> SlabRoot<'arena, CellsT
 
         let thread_state = unsafe {
             // safety: current thread now owns this slice of per_thread_state and per_thread_state_inited exclusively
+            let per_thread_maybe_uninit = &mut *self.per_thread_state[allocated_tid].get();
             if !self.per_thread_state_inited[allocated_tid].get() {
                 SlabPerThreadState::<'arena, CellsTy, WiresTy>::init(
-                    self.per_thread_state[allocated_tid].as_ptr() as *mut _,
+                    per_thread_maybe_uninit.as_mut_ptr(),
                     allocated_tid as u64,
                     self,
                 );
                 self.per_thread_state_inited[allocated_tid].set(true);
             }
-            &*self.per_thread_state[allocated_tid].as_ptr()
+            per_thread_maybe_uninit.assume_init_ref()
         };
         SlabThreadShard(thread_state, PhantomData)
     }
@@ -397,7 +399,8 @@ impl<'guard, 'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
 
         for thread_i in 0..MAX_THREADS {
             if self.0.per_thread_state_inited[thread_i].get() {
-                let per_thread = unsafe { &*self.0.per_thread_state[thread_i].as_ptr() };
+                let per_thread =
+                    unsafe { (&*self.0.per_thread_state[thread_i].get()).assume_init_ref() };
                 println!("~~~~~ Checking netlist cells ~~~~~");
                 let outstanding_cells_this_thread =
                     Self::__debug_check_ty_missing_blocks(thread_i, &per_thread.netlist_cells);
