@@ -19,7 +19,7 @@ use std::{
     marker::PhantomData,
     mem::{self, size_of, ManuallyDrop, MaybeUninit},
     ops::Deref,
-    ptr::{self, addr_of_mut},
+    ptr::{self, addr_of, addr_of_mut},
     sync::atomic::Ordering,
 };
 
@@ -97,18 +97,11 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
     for SlabRoot<'arena, CellsTy, WiresTy>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut fields = f.debug_struct("SlabRoot");
-        fields.field("@addr", &(self as *const _));
-        for i in 0..MAX_THREADS {
-            if !self.per_thread_state_inited[i].get() {
-                fields.field(&format!("per_thread_state[{}]", i), &"<uninit>");
-            } else {
-                fields.field(&format!("per_thread_state[{}]", i), unsafe {
-                    (&*self.per_thread_state[i].get()).assume_init_ref()
-                });
-            }
-        }
-        fields.finish()
+        // xxx getting the locking correct here seems tricky so just give up and don't bother
+        f.debug_struct("SlabRoot")
+            .field("@addr", &(self as *const _))
+            .field("thread_inuse", &self.thread_inuse.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
@@ -201,7 +194,19 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
     for SlabRootGlobalGuard<'arena, CellsTy, WiresTy>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SlabRootGlobalGuard").field(&self.0).finish()
+        // because we gave up on getting debug correct in SlabRoot,
+        // reach inside and do all the relevant debug printing here instead
+        let mut fields = f.debug_struct(&format!("SlabRootGlobalGuard(@{:?})", self.0 as *const _));
+        for i in 0..MAX_THREADS {
+            if !self.0.per_thread_state_inited[i].get() {
+                fields.field(&format!("per_thread_state[{}]", i), &"<uninit>");
+            } else {
+                fields.field(&format!("per_thread_state[{}]", i), unsafe {
+                    (&*self.0.per_thread_state[i].get()).assume_init_ref()
+                });
+            }
+        }
+        fields.finish()
     }
 }
 
@@ -451,7 +456,7 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
         f.debug_struct("SlabPerThreadState")
             .field("@addr", &(self as *const _))
             .field("tid", &self.tid)
-            .field("root", &self.root)
+            .field("root", &(self.root as *const _))
             .field("netlist_cells", &self.netlist_cells)
             .field("netlist_wires", &self.netlist_wires)
             .field("netlist_cell_alloc_gen", &self.netlist_cell_alloc_gen.get())
@@ -538,16 +543,19 @@ unsafe impl<'arena, T: Send + Sync> Sync for SlabPerThreadPerTyState<'arena, T> 
 
 impl<'arena, T: Send + Sync> Debug for SlabPerThreadPerTyState<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SlabPerThreadPerTyState")
-            .field("@addr", &(self as *const _))
-            .field("segments", &(self.segments.get() as *const _))
-            .field("pages", &(self.pages.get() as *const _))
-            .field("last_page", &(self.last_page.get() as *const _))
-            .field(
-                "thread_delayed_free",
-                &(self.thread_delayed_free.load(Ordering::SeqCst)),
-            )
-            .finish()
+        f.debug_struct(&format!(
+            "SlabPerThreadPerTyState<{}>",
+            std::any::type_name::<T>()
+        ))
+        .field("@addr", &(self as *const _))
+        .field("segments", &(self.segments.get() as *const _))
+        .field("pages", &(self.pages.get() as *const _))
+        .field("last_page", &(self.last_page.get() as *const _))
+        .field(
+            "thread_delayed_free",
+            &(self.thread_delayed_free.load(Ordering::Relaxed)),
+        )
+        .finish()
     }
 }
 
@@ -927,7 +935,7 @@ struct SlabSegmentHdr<'arena, T: Send + Sync> {
 
 impl<'arena, T: Send + Sync> Debug for SlabSegmentHdr<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SlabSegmentHdr")
+        f.debug_struct(&format!("SlabSegmentHdr<{}>", std::any::type_name::<T>()))
             .field("@addr", &(self as *const _))
             .field("owning_tid", &self.owning_tid)
             .field(
@@ -1030,22 +1038,34 @@ unsafe impl<'arena, T: Send + Sync> Sync for SlabSegmentPageMeta<'arena, T> {}
 
 impl<'arena, T: Send + Sync> Debug for SlabSegmentPageMeta<'arena, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SlabSegmentPageMeta")
-            .field("@addr", &(self as *const _))
-            .field("next_page", &self.next_page.get().map(|x| x as *const _))
-            .field(
-                "this_free_list",
-                &self.this_free_list.get().map(|x| x as *const _),
-            )
-            .field(
-                "local_free_list",
-                &self.local_free_list.get().map(|x| x as *const _),
-            )
-            .field(
-                "remote_free_list",
-                &(self.remote_free_list.load(Ordering::SeqCst) as *const ()),
-            )
-            .finish()
+        f.debug_struct(&format!(
+            "SlabSegmentPageMeta<{}>",
+            std::any::type_name::<T>()
+        ))
+        .field("@addr", &(self as *const _))
+        .field("<first data block>", &unsafe {
+            let self_ptr = self as *const SlabSegmentPageMeta<'arena, T>;
+            let self_addr = self as *const _ as usize;
+            let seg_addr = self_addr & !(SEGMENT_SZ - 1);
+            let seg_ptr = seg_addr as *const SlabSegmentHdr<'arena, T>;
+            let first_page_meta_ptr = addr_of!((*seg_ptr).pages[0]);
+            let page_i = self_ptr.offset_from(first_page_meta_ptr) as usize;
+            SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, 0)
+        })
+        .field("next_page", &self.next_page.get().map(|x| x as *const _))
+        .field(
+            "this_free_list",
+            &self.this_free_list.get().map(|x| x as *const _),
+        )
+        .field(
+            "local_free_list",
+            &self.local_free_list.get().map(|x| x as *const _),
+        )
+        .field(
+            "remote_free_list",
+            &(self.remote_free_list.load(Ordering::Relaxed) as *const ()),
+        )
+        .finish()
     }
 }
 
@@ -1945,5 +1965,30 @@ mod tests {
             ._debug_check_missing_blocks();
         assert_eq!(outstanding_blocks_cells.len(), 0);
         assert_eq!(outstanding_blocks_wires.len(), 0);
+    }
+
+    #[test]
+    #[ignore = "not automated, human eye verified"]
+    fn slab_debug_tests() {
+        let alloc = SlabRoot::<u8, ()>::new();
+        println!("Alloc debug:");
+        dbg!(&alloc);
+
+        let thread = alloc.new_thread();
+        println!("Thread debug:");
+        dbg!(&alloc);
+        dbg!(&thread);
+
+        println!("Segment debug:");
+        dbg!(&thread.0.netlist_cells.segments.get());
+
+        println!("dropping...");
+        drop(thread);
+        dbg!(&alloc);
+
+        let global = alloc.try_lock_global().unwrap();
+        println!("Global debug:");
+        dbg!(&global);
+        dbg!(&alloc);
     }
 }
