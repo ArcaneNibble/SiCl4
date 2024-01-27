@@ -397,8 +397,33 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
             // fixme: wtf have we made any rust UB anywhere?
             let maybe_uninit = &*new_obj.alloced;
             let new_obj_ptr = maybe_uninit.as_ptr();
-            // fixme: we will be alternating atomic accesses (here) with non-atomic accesses (when free)
-            // how do we fix this UB?
+            // at this point, the memory allocator has established enough of a
+            // synchronizes-with a potential remote freeing thread
+            // that we can safely reuse the memory block
+            //
+            // the potential concern to think about is
+            // replacing pointers elsewhere in the netlist
+            // with a pointer (w/ new generation) to this block,
+            // and whether or not that can end up reordering with
+            // the following store here, and whether or not that can cause problems
+            //
+            // in order to replace a pointer elsewhere in the netlist,
+            // we have to have a write lock on it. this means that
+            // no other thread can have a read guard on it
+            // until after we drop the write guard (R^W enforced logically).
+            // when we finally do drop the write guard, and another thread
+            // picks up a read guard to that same *other* node
+            // (not this one being allocated here), then a
+            // synchronizes-with is established via *that* node's lock_and_generation.
+            // at that point, *everything* that happens-before
+            // the dropping of the write guard (which includes
+            // *everything* sequenced-before, which includes both
+            // the pointer replacement *and* this following store)
+            // are *all* visible to the other thread
+            //
+            // tl;dr in order for another thread to even be allowed to *see*
+            // the new pointer we are about to return, we have guaranteed
+            // that this following store is also visible
             (*new_obj_ptr).lock_and_generation.store(
                 LockAndGeneration::WriteLocked { gen }.into(),
                 Ordering::Relaxed,
@@ -421,8 +446,7 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
             // fixme: wtf have we made any rust UB anywhere?
             let maybe_uninit = &*new_obj.alloced;
             let new_obj_ptr = maybe_uninit.as_ptr();
-            // fixme: we will be alternating atomic accesses (here) with non-atomic accesses (when free)
-            // how do we fix this UB?
+            // see notes above
             (*new_obj_ptr).lock_and_generation.store(
                 LockAndGeneration::WriteLocked { gen }.into(),
                 Ordering::Relaxed,
@@ -440,12 +464,34 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
     }
 
     pub fn delete_cell<'wrapper>(&'wrapper self, cell: NetlistCellWriteGuard<'arena>) {
-        // explicitly atomic clear (mark as deallocated) this block with release ordering
-        // so no pending writes can move past us and corrupt heap operations
-        //
-        // fixme: we still alternate with non-atomic access inside the allocator itself
-        // fixme: fully explain all the synchronizes-with wrt alloc/dealloc
-        cell.p.ptr.lock_and_generation.store(0, Ordering::Release);
+        // XXX we currently have a (unfixable in the current design) source of UB
+        // when deallocating: no matter what we do with lock_and_generation here,
+        // the allocator itself will write a ->next pointer without using atomic ops.
+        // this should be fine in practice, as it's an aligned pointer store.
+
+        // there are two memory ordering concerns involving the payload when we are freeing:
+        // * another thread reusing the memory for something else
+        // * another thread trying to lock-for-r/w the deleted entry
+
+        // in the first case, *within the allocator itself* there is a synchronizes-with
+        // relation on the page/thread remote free list pointer access.
+        // all the crap that we did on the payload (that we no longer care about, since we're freeing)
+        // as well as all the free list manipulation that the allocator does
+        // happens-before the new thread does any kind of setup of its new payload
+
+        // in the second case, we *never* manage to establish a synchronizes-with relation
+        // (even if we assume that the allocator free list manipulation is a relaxed atomic store instead of UB)
+        // however, each atomic variable does have a total order to modifications
+        // specific to it. this means that, once we invalidate the generation counter,
+        // other threads won't ever be able to successfully acquire a read lock
+        // (either they already notice it's invalid when doing a relaxed load, or else CAS will fail)
+        // so we should be fine in practice, even though we are UB by the formal model
+
+        // just in case, we *should* invalidate the marker ourselves
+        // (rather than depend on the allocator to do it).
+        // we don't need to guarantee any memory ordering ourselves
+        // (what the allocator does is sufficient)
+        cell.p.ptr.lock_and_generation.store(0, Ordering::Relaxed);
         unsafe {
             // safety: just coercing between repr(C) union references
             self.heap_shard
@@ -455,12 +501,8 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
     }
 
     pub fn delete_wire<'wrapper>(&'wrapper self, wire: NetlistWireWriteGuard<'arena>) {
-        // explicitly atomic clear (mark as deallocated) this block with release ordering
-        // so no pending writes can move past us and corrupt heap operations
-        //
-        // fixme: we still alternate with non-atomic access inside the allocator itself
-        // fixme: fully explain all the synchronizes-with wrt alloc/dealloc
-        wire.p.ptr.lock_and_generation.store(0, Ordering::Release);
+        // see notes above
+        wire.p.ptr.lock_and_generation.store(0, Ordering::Relaxed);
         unsafe {
             // safety: just coercing between repr(C) union references
             self.heap_shard
