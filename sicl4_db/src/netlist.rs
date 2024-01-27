@@ -787,10 +787,18 @@ pub fn disconnect_bidir<'guard, 'thread, 'arena>(
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Instant;
+
     use super::*;
+
+    use memory_stats::memory_stats;
+    use rand::Rng;
+    use rand::SeedableRng;
     use uuid::uuid;
 
     const TEST_LUT_UUID: Uuid = uuid!("00000000-0000-0000-0000-000000000000");
+    const TEST_BUF_UUID: Uuid = uuid!("00000000-0000-0000-0000-000000000001");
 
     #[test]
     fn netlist_locking_smoke_test() {
@@ -1025,5 +1033,173 @@ mod tests {
         let cell_0 = thread.new_cell(TEST_LUT_UUID, 0);
         dbg!(&cell_0);
         dbg!(&*cell_0);
+    }
+
+    #[test]
+    fn bench_full_custom_netlist() {
+        const NLUTS: usize = 1_000_000;
+        const AVG_FANIN: f64 = 3.0;
+        const N_INITIAL_WORK: usize = 1000;
+        const NTHREADS: usize = 6;
+
+        // FIXME
+        let netlist = &*Box::leak(Box::new(NetlistModule::new()));
+        let init_thread_shard = netlist.new_thread();
+        let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(0);
+
+        let start_create = Instant::now();
+        let start_mem = memory_stats().unwrap();
+        let mut generate_hax_luts_vec = Vec::new();
+        let mut generate_hax_wires_vec = Vec::new();
+        for _ in 0..NLUTS {
+            let mut lut = init_thread_shard.new_cell(TEST_LUT_UUID, 5);
+            let mut outwire = init_thread_shard.new_wire();
+            connect_driver(&mut lut, 4, &mut outwire);
+            generate_hax_luts_vec.push(lut);
+            generate_hax_wires_vec.push(outwire);
+        }
+        for luti in 0..NLUTS {
+            let lut = &mut generate_hax_luts_vec[luti];
+            for inpi in 0..4 {
+                if rng.gen::<f64>() < (AVG_FANIN / 4.0) {
+                    let inp_wire_i = rng.gen_range(0..NLUTS);
+                    let inp_wire = &mut generate_hax_wires_vec[inp_wire_i];
+                    connect_sink(lut, inpi, inp_wire);
+                }
+            }
+        }
+        let create_duration = start_create.elapsed();
+        let create_mem = memory_stats().unwrap();
+        println!("Creating netlist took {:?}", create_duration);
+        println!(
+            "Creating netlist took {:?} MB memory",
+            (create_mem.physical_mem - start_mem.physical_mem) as f64 / 1024.0 / 1024.0
+        );
+        drop(init_thread_shard);
+        // XXX XXX XXX BAD BAD BAD ???
+        // why is it possible for guards to outlive the per-thread item?
+        // is this actually a problem?
+
+        let workqueue = work_queue::Queue::new(NTHREADS, 128);
+        {
+            for _ in 0..N_INITIAL_WORK {
+                let luti = rng.gen_range(0..NLUTS);
+                let lut = generate_hax_luts_vec[luti].p;
+                // println!("Initial work item: {}", luti);
+                workqueue.push(lut);
+            }
+        }
+
+        drop(generate_hax_luts_vec);
+        drop(generate_hax_wires_vec);
+
+        let start_mutate = Instant::now();
+        let thread_handles = workqueue
+            .local_queues()
+            .map(|mut local_queue| {
+                let netlist_thread_shard = netlist.new_thread();
+                thread::spawn(move || {
+                    while let Some(cell) = local_queue.pop() {
+                        let cell_w = cell.try_write().unwrap();
+                        if cell_w.is_none() {
+                            // dbg!("failed to grab self");
+                            local_queue.push(cell);
+                            continue;
+                        }
+                        let mut cell_w = cell_w.unwrap();
+                        // println!("grabbed cell {}", cell_w.debug_id);
+                        if cell_w.visited_marker {
+                            continue;
+                        }
+
+                        if cell_w.cell_type == TEST_BUF_UUID {
+                            let inp_wire_i = cell_w.connections[0].unwrap();
+                            let inp_wire_r = inp_wire_i.try_read().unwrap();
+                            if inp_wire_r.is_none() {
+                                // dbg!("failed to grab inp wire for buf");
+                                local_queue.push(cell);
+                                continue;
+                            }
+                            let inp_wire_r = inp_wire_r.unwrap();
+                            let driver_cell = inp_wire_r.drivers[0];
+
+                            cell_w.visited_marker = true;
+                            local_queue.push(driver_cell);
+                        } else {
+                            // wtf
+
+                            // hack for self-loop
+                            let outwire = cell_w.connections[4].unwrap();
+
+                            // grab input wires for read
+                            let mut inp_wire_rs = [None, None, None, None];
+                            for inp_i in 0..4 {
+                                if let Some(inp_wire_ref) = cell_w.connections[inp_i] {
+                                    if inp_wire_ref != outwire {
+                                        let inp_wire_r = inp_wire_ref.try_read().unwrap();
+                                        if inp_wire_r.is_none() {
+                                            // dbg!("failed to grab inp {}", inp_i);
+                                            local_queue.push(cell);
+                                            continue;
+                                        }
+                                        let inp_wire_r = inp_wire_r.unwrap();
+                                        // println!("grabbed wire {}", inp_wire_r.debug_id);
+                                        inp_wire_rs[inp_i] = Some(inp_wire_r);
+                                    }
+                                }
+                            }
+
+                            // grab output wire for write
+                            let outwire_w = outwire.try_write().unwrap();
+                            if outwire_w.is_none() {
+                                // dbg!("failed to grab outp");
+                                local_queue.push(cell);
+                                continue;
+                            }
+                            let mut outwire_w = outwire_w.unwrap();
+
+                            let mut added_buf = netlist_thread_shard.new_cell(TEST_BUF_UUID, 2);
+                            let mut added_wire = netlist_thread_shard.new_wire();
+
+                            // actual updates
+                            cell_w.visited_marker = true;
+
+                            for inp_wire_r in &inp_wire_rs {
+                                if let Some(inp_wire_r) = inp_wire_r {
+                                    local_queue.push(inp_wire_r.drivers[0]);
+                                }
+                            }
+
+                            // xxx this is an ad-hoc clusterfuck
+                            let outwire_backlink_idx = outwire_w
+                                .drivers
+                                .iter()
+                                .position(|wire_to_cell| cell == *wire_to_cell)
+                                .unwrap();
+
+                            outwire_w.drivers[outwire_backlink_idx] = added_buf.p;
+                            added_buf.connections[1] = Some(outwire);
+
+                            added_buf.connections[0] = Some(added_wire.p);
+                            added_wire.sinks.push(added_buf.p);
+
+                            cell_w.connections[4] = Some(added_wire.p);
+                            added_wire.drivers.push(cell);
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for t in thread_handles {
+            t.join().unwrap();
+        }
+        let mutate_duration = start_mutate.elapsed();
+        let mutate_ram = memory_stats().unwrap();
+        println!("Mutating netlist took {:?}", mutate_duration);
+        println!(
+            "Final additional usage {:?} MB memory",
+            (mutate_ram.physical_mem - start_mem.physical_mem) as f64 / 1024.0 / 1024.0
+        );
     }
 }

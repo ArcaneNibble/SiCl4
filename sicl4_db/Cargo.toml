@@ -8,5 +8,11 @@ edition = "2021"
 [dependencies]
 uuid = { version = "1.7" }
 
+[dev-dependencies]
+rand = "0.8"
+rand_xorshift = "0.3"
+work-queue = "0.1.4"
+memory-stats = "1.1"
+
 [target.'cfg(loom)'.dependencies]
 loom = { version = "0.7", features = ["checkpoint"] }
