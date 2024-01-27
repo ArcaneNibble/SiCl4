@@ -430,6 +430,15 @@ pub struct SlabPerThreadState<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync
     netlist_cells: SlabPerThreadPerTyState<'arena, CellsTy>,
     /// Manages memory for netlist wires
     netlist_wires: SlabPerThreadPerTyState<'arena, WiresTy>,
+    /// ABA generation counter for cells
+    netlist_cell_alloc_gen: Cell<u64>,
+    /// ABA generation counter for wires
+    netlist_wire_alloc_gen: Cell<u64>,
+}
+// safety: only one thread can have a SlabThreadShard to access any fields here
+unsafe impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Sync
+    for SlabPerThreadState<'arena, CellsTy, WiresTy>
+{
 }
 
 impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
@@ -442,6 +451,8 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
             .field("root", &self.root)
             .field("netlist_cells", &self.netlist_cells)
             .field("netlist_wires", &self.netlist_wires)
+            .field("netlist_cell_alloc_gen", &self.netlist_cell_alloc_gen.get())
+            .field("netlist_wire_alloc_gen", &self.netlist_wire_alloc_gen.get())
             .finish()
     }
 }
@@ -460,6 +471,8 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
 
         (*self_).tid = tid;
         (*self_).root = root;
+        (*self_).netlist_cell_alloc_gen = Cell::new(0);
+        (*self_).netlist_wire_alloc_gen = Cell::new(0);
 
         // safety: we initialized everything
     }
@@ -467,8 +480,10 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
     /// Allocates a netlist cell from this shard
     ///
     /// Does *NOT* initialize any of the resulting memory
-    pub fn alloc_netlist_cell(&'arena self) -> &'arena SlabBlock<'arena, CellsTy> {
-        self.netlist_cells.alloc(self.tid)
+    pub fn alloc_netlist_cell(&'arena self) -> (&'arena SlabBlock<'arena, CellsTy>, u64) {
+        let cur_gen = self.netlist_cell_alloc_gen.get();
+        self.netlist_cell_alloc_gen.set(cur_gen + 1);
+        (self.netlist_cells.alloc(self.tid), cur_gen)
     }
 
     /// Deallocates a netlist cell
@@ -482,8 +497,10 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
     /// Allocates a netlist wire from this shard
     ///
     /// Does *NOT* initialize any of the resulting memory
-    pub fn alloc_netlist_wire(&'arena self) -> &'arena SlabBlock<'arena, WiresTy> {
-        self.netlist_wires.alloc(self.tid)
+    pub fn alloc_netlist_wire(&'arena self) -> (&'arena SlabBlock<'arena, WiresTy>, u64) {
+        let cur_gen = self.netlist_wire_alloc_gen.get();
+        self.netlist_wire_alloc_gen.set(cur_gen + 1);
+        (self.netlist_wires.alloc(self.tid), cur_gen)
     }
 
     /// Deallocates a netlist wire
@@ -1329,8 +1346,8 @@ mod tests {
     fn slab_basic_single_thread_alloc() {
         let alloc = SlabRoot::<u8, ()>::new();
         let thread_shard = alloc.new_thread();
-        let obj_1 = thread_shard.alloc_netlist_cell();
-        let obj_2 = thread_shard.alloc_netlist_cell();
+        let obj_1 = thread_shard.alloc_netlist_cell().0;
+        let obj_2 = thread_shard.alloc_netlist_cell().0;
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
@@ -1366,8 +1383,8 @@ mod tests {
     fn slab_basic_fake_remote_free() {
         let alloc = SlabRoot::<u8, ()>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.alloc_netlist_cell();
-        let obj_2 = thread_shard_0.alloc_netlist_cell();
+        let obj_1 = thread_shard_0.alloc_netlist_cell().0;
+        let obj_2 = thread_shard_0.alloc_netlist_cell().0;
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
@@ -1408,16 +1425,16 @@ mod tests {
     fn slab_test_collect_local() {
         let alloc = SlabRoot::<[u8; 30000], ()>::new();
         let thread_shard = alloc.new_thread();
-        let obj_1 = thread_shard.alloc_netlist_cell();
-        let obj_2 = thread_shard.alloc_netlist_cell();
+        let obj_1 = thread_shard.alloc_netlist_cell().0;
+        let obj_2 = thread_shard.alloc_netlist_cell().0;
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         unsafe { thread_shard.free_netlist_cell(obj_1) };
         unsafe { thread_shard.free_netlist_cell(obj_2) };
 
-        let obj_1_2nd_try = thread_shard.alloc_netlist_cell();
-        let obj_2_2nd_try = thread_shard.alloc_netlist_cell();
+        let obj_1_2nd_try = thread_shard.alloc_netlist_cell().0;
+        let obj_2_2nd_try = thread_shard.alloc_netlist_cell().0;
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -1446,8 +1463,8 @@ mod tests {
     fn slab_test_collect_remote() {
         let alloc = SlabRoot::<[u8; 30000], ()>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.alloc_netlist_cell();
-        let obj_2 = thread_shard_0.alloc_netlist_cell();
+        let obj_1 = thread_shard_0.alloc_netlist_cell().0;
+        let obj_2 = thread_shard_0.alloc_netlist_cell().0;
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
@@ -1455,8 +1472,8 @@ mod tests {
         unsafe { thread_shard_1.free_netlist_cell(obj_1) };
         unsafe { thread_shard_1.free_netlist_cell(obj_2) };
 
-        let obj_1_2nd_try = thread_shard_0.alloc_netlist_cell();
-        let obj_2_2nd_try = thread_shard_0.alloc_netlist_cell();
+        let obj_1_2nd_try = thread_shard_0.alloc_netlist_cell().0;
+        let obj_2_2nd_try = thread_shard_0.alloc_netlist_cell().0;
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -1486,8 +1503,8 @@ mod tests {
     fn slab_test_collect_both() {
         let alloc = SlabRoot::<[u8; 30000], ()>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.alloc_netlist_cell();
-        let obj_2 = thread_shard_0.alloc_netlist_cell();
+        let obj_1 = thread_shard_0.alloc_netlist_cell().0;
+        let obj_2 = thread_shard_0.alloc_netlist_cell().0;
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
@@ -1495,8 +1512,8 @@ mod tests {
         unsafe { thread_shard_0.free_netlist_cell(obj_1) };
         unsafe { thread_shard_1.free_netlist_cell(obj_2) };
 
-        let obj_1_2nd_try = thread_shard_0.alloc_netlist_cell();
-        let obj_2_2nd_try = thread_shard_0.alloc_netlist_cell();
+        let obj_1_2nd_try = thread_shard_0.alloc_netlist_cell().0;
+        let obj_2_2nd_try = thread_shard_0.alloc_netlist_cell().0;
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -1528,7 +1545,7 @@ mod tests {
         let thread_shard = alloc.new_thread();
         let mut things = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard.alloc_netlist_cell();
+            let obj = thread_shard.alloc_netlist_cell().0;
             println!("Allocated obj {:3} {:?}", i, obj as *const _);
             things.push(obj);
         }
@@ -1541,7 +1558,7 @@ mod tests {
 
         let mut things2 = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard.alloc_netlist_cell();
+            let obj = thread_shard.alloc_netlist_cell().0;
             println!("Allocated obj {:3} again {:?}", i, obj as *const _);
             things2.push(obj);
         }
@@ -1575,7 +1592,7 @@ mod tests {
         let thread_shard_1 = alloc.new_thread();
         let mut things = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard_0.alloc_netlist_cell();
+            let obj = thread_shard_0.alloc_netlist_cell().0;
             println!("Allocated obj {:3} {:?}", i, obj as *const _);
             things.push(obj);
         }
@@ -1629,7 +1646,7 @@ mod tests {
 
         let mut things2: Vec<&SlabBlock<'_, [u8; 30000]>> = Vec::new();
         for i in 0..256 {
-            let obj = thread_shard_0.alloc_netlist_cell();
+            let obj = thread_shard_0.alloc_netlist_cell().0;
             println!("Allocated obj {:3} again {:?}", i, obj as *const _);
             things2.push(obj);
         }
@@ -1714,7 +1731,7 @@ mod tests {
                 let mut alloc_history = Vec::new();
                 let mut prev = None;
                 for i in 0..n_objs {
-                    let obj = thread_shard_0.alloc_netlist_cell();
+                    let obj = thread_shard_0.alloc_netlist_cell().0;
                     let obj_addr = obj as *const _ as usize;
                     alloc_history.push(obj_addr);
                     unsafe {
@@ -1790,7 +1807,7 @@ mod tests {
             let mut alloc_history = Vec::new();
             let mut prev = None;
             for i in 0..n_objs {
-                let obj = thread_shard_0.alloc_netlist_cell();
+                let obj = thread_shard_0.alloc_netlist_cell().0;
                 let obj_addr = obj as *const _ as usize;
                 unsafe {
                     let obj_ = obj.alloced.as_ptr() as *mut [u8; 30000];
@@ -1898,8 +1915,8 @@ mod tests {
         let alloc = SlabRoot::<[u8; 30000], [u8; 29999]>::new();
         let thread_shard = alloc.new_thread();
 
-        let cell_obj = thread_shard.alloc_netlist_cell();
-        let wire_obj = thread_shard.alloc_netlist_wire();
+        let cell_obj = thread_shard.alloc_netlist_cell().0;
+        let wire_obj = thread_shard.alloc_netlist_wire().0;
         println!("Allocated cell obj {:?}", cell_obj as *const _);
         println!("Allocated wire obj {:?}", wire_obj as *const _);
 
