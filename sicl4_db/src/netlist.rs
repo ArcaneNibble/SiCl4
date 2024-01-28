@@ -14,7 +14,6 @@ use std::{
 
 use crate::{allocator::*, loom_testing::*};
 
-const _ONLY_SUPPORTS_64BIT_PLATFORMS: () = assert!(usize::BITS == 64);
 const _: () = assert!(MAX_THREADS <= 254);
 
 /// Helper for packing/unpacking atomic lock/generation bits
@@ -28,8 +27,7 @@ const _: () = assert!(MAX_THREADS <= 254);
 ///
 /// NOTE: current impl restricts [MAX_THREADS] to never be more than 254
 ///
-/// XXX: The current implementation uses a super dangerous spicy trick
-/// that is also technically UB according to the abstract memory model.
+/// XXX: The current implementation uses a super dangerous spicy trick.
 /// This lock/generation field is stored at the very beginning of a heap
 /// block containing netlist cells/wires, in a location that just so happens
 /// to overlap with the heap free list next pointer once the block gets freed.
@@ -536,11 +534,6 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
     /// Deletion is only permitted if the caller has exclusive write access to the node,
     /// which is enforced by consuming the write guard
     pub fn delete_cell<'wrapper>(&'wrapper self, cell: NetlistCellWriteGuard<'wrapper, 'arena>) {
-        // XXX we currently have a (unfixable in the current design) source of UB
-        // when deallocating: no matter what we do with lock_and_generation here,
-        // the allocator itself will write a ->next pointer without using atomic ops.
-        // this should be fine in practice, as it's an aligned pointer store.
-
         // there are two memory ordering concerns involving the payload when we are freeing:
         // * another thread reusing the memory for something else
         // * another thread trying to lock-for-r/w the deleted entry
@@ -552,12 +545,10 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         // happens-before the new thread does any kind of setup of its new payload
 
         // in the second case, we *never* manage to establish a synchronizes-with relation
-        // (even if we assume that the allocator free list manipulation is a relaxed atomic store instead of UB)
         // however, each atomic variable does have a total order to modifications
         // specific to it. this means that, once we invalidate the generation counter,
         // other threads won't ever be able to successfully acquire a read lock
         // (either they already notice it's invalid when doing a relaxed load, or else CAS will fail)
-        // so we should be fine in practice, even though we are UB by the formal model
 
         // just in case, we *should* invalidate the marker ourselves
         // (rather than depend on the allocator to do it).

@@ -235,15 +235,11 @@ impl<'guard, 'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
             .thread_delayed_free
             .load(Ordering::Relaxed);
 
-        let mut delayed_free_block = if delayed_free_block.is_null() {
-            None
-        } else {
-            unsafe { Some(&*delayed_free_block) }
-        };
+        let mut delayed_free_block = unsafe { delayed_free_block.as_ref() };
         while let Some(delayed_free_block_inner) = delayed_free_block {
             println!("thread delayed free: {:?}", delayed_free_block_inner);
             thread_delayed_free_blocks.insert(delayed_free_block_inner as *const _ as usize);
-            delayed_free_block = delayed_free_block_inner.next.get();
+            delayed_free_block = delayed_free_block_inner.load_next();
         }
 
         let mut page_linked_list_set = HashSet::new();
@@ -287,7 +283,7 @@ impl<'guard, 'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
                         panic!("Block not in page or found in multiple free lists!");
                     }
 
-                    this_free = this_free_block.next.get();
+                    this_free = this_free_block.load_next();
                 }
 
                 let mut local_free = page.local_free_list.get();
@@ -300,17 +296,13 @@ impl<'guard, 'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
                         panic!("Block not in page or found in multiple free lists!");
                     }
 
-                    local_free = this_free_block.next.get();
+                    local_free = this_free_block.load_next();
                 }
 
                 let remote_free = page.remote_free_list.load(Ordering::Relaxed);
                 let mut remote_free_ptr = unsafe {
                     let ptr = (remote_free & !0b11) as *const SlabFreeBlock;
-                    if ptr.is_null() {
-                        None
-                    } else {
-                        Some(&*ptr)
-                    }
+                    ptr.as_ref()
                 };
                 let remote_free_flags = remote_free & 0b11;
                 while let Some(this_free_block) = remote_free_ptr {
@@ -322,7 +314,7 @@ impl<'guard, 'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
                         panic!("Block not in page or found in multiple free lists!");
                     }
 
-                    remote_free_ptr = this_free_block.next.get();
+                    remote_free_ptr = this_free_block.load_next();
                 }
 
                 let full_without_thread_delayed_free = outstanding_blocks.len() == num_objects;
@@ -656,23 +648,16 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
             })
             .unwrap();
 
-        let mut thread_delayed_free = if thread_delayed_free.is_null() {
-            None
-        } else {
-            unsafe {
-                // safety: these blocks should definitely belong to our allocation
-                // assuming we didn't mess up
-                Some(&*thread_delayed_free)
-            }
-        };
-
-        while let Some(thread_delayed_free_inner) = thread_delayed_free {
-            let next = thread_delayed_free_inner.next.get();
-            unsafe {
+        unsafe {
+            // safety: these blocks should definitely belong to our allocation
+            // assuming we didn't mess up
+            let mut thread_delayed_free = thread_delayed_free.as_ref();
+            while let Some(block) = thread_delayed_free {
+                let next = block.load_next();
                 // safety: just coercing between repr(C) union references
-                self.free(tid, mem::transmute(thread_delayed_free_inner))
+                self.free(tid, mem::transmute(block));
+                thread_delayed_free = next;
             }
-            thread_delayed_free = next;
         }
 
         let mut page = self.pages.get();
@@ -713,7 +698,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
             Some(x) => (fast_page, x), // fast path
             None => self.alloc_slow(tid),
         };
-        page.this_free_list.set(block.next.get());
+        page.this_free_list.set(block.load_next());
         unsafe {
             // safety: just coercing between repr(C) union references
             mem::transmute(block)
@@ -759,7 +744,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
                 self.last_page.set(&seg.pages[page_i]);
             }
 
-            obj.free.next.set(seg.pages[page_i].local_free_list.get());
+            obj.free.store_next(seg.pages[page_i].local_free_list.get());
             seg.pages[page_i].local_free_list.set(Some(&obj.free));
         } else {
             // remote free
@@ -827,7 +812,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
                                 .thread_delayed_free
                                 .load(Ordering::Relaxed);
                             loop {
-                                obj.free.next.set(Some(&*prev_thread_delayed_free));
+                                obj.free.store_next(prev_thread_delayed_free.as_ref());
                                 // order: on success, we are currently the most recent
                                 // modification to thread_delayed_free
                                 // we use release ordering so that writes to obj.free.next
@@ -851,8 +836,9 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
                 {
                     // normal state or in-thread-delayed-list state
                     // push onto remote free list
-                    let next_block_proper_addr = (prev_remote_free & !0b11) as *const _;
-                    obj.free.next.set(Some(&*next_block_proper_addr));
+                    let next_block_proper_addr =
+                        (prev_remote_free & !0b11) as *const SlabFreeBlock<'arena>;
+                    obj.free.store_next(next_block_proper_addr.as_ref());
                     // order: on success, we are currently the most recent
                     // modification to remote_free_list
                     // we use release ordering so that writes to obj.free.next
@@ -959,7 +945,7 @@ impl<'arena, T: Send + Sync> SlabSegmentHdr<'arena, T> {
                 if i != PAGES_PER_SEG - 1 {
                     let next_page_meta_ptr = addr_of_mut!((*seg).pages[i + 1]);
                     // reborrowing is safe because we *never* make &mut
-                    (*seg).pages[i].next_page.set(Some(&*next_page_meta_ptr));
+                    (*seg).pages[i].next_page.set(next_page_meta_ptr.as_ref());
                 }
             }
 
@@ -1086,15 +1072,16 @@ impl<'arena, T: Send + Sync> SlabSegmentPageMeta<'arena, T> {
             let block_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, block_i);
             let next_block_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, block_i + 1);
             let block_ptr = block_ptr as *mut SlabBlock<'arena, T>;
-            let next_block_ptr = next_block_ptr as *mut SlabFreeBlock<'arena>;
 
             (*block_ptr).free = ManuallyDrop::new(SlabFreeBlock {
-                next: Cell::new(Some(&*next_block_ptr)),
+                next: AtomicU64::new(next_block_ptr as u64),
+                _p: PhantomData,
             });
         }
 
-        let block_0_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, 0) as *const _;
-        (*self_).this_free_list.set(Some(&*block_0_ptr));
+        let block_0_ptr =
+            SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, 0) as *const SlabFreeBlock<'arena>;
+        (*self_).this_free_list.set(block_0_ptr.as_ref());
     }
 
     pub fn collect_free_lists(&'arena self) {
@@ -1180,21 +1167,21 @@ impl<'arena, T: Send + Sync> SlabSegmentPageMeta<'arena, T> {
             // append to end of our free list
             if our_free_list.is_none() {
                 // only remote free, none of ours
-                self.this_free_list.set(Some(unsafe {
+                self.this_free_list.set(unsafe {
                     // safety: these blocks should definitely belong to our allocation
                     // assuming we didn't mess up
-                    &*remote_free_list_ptr
-                }));
+                    remote_free_list_ptr.as_ref()
+                });
             } else {
-                while our_free_list.unwrap().next.get().is_some() {
-                    our_free_list = our_free_list.unwrap().next.get();
+                while let Some(next) = our_free_list.unwrap().load_next() {
+                    our_free_list = Some(next);
                 }
-                our_free_list.unwrap().next.set(Some(unsafe {
+                our_free_list.unwrap().store_next(unsafe {
                     // safety: these blocks should definitely belong to our allocation
                     // assuming we didn't mess up. we can't data race on next because
                     // current thread owns all of the local free list
-                    &*remote_free_list_ptr
-                }));
+                    remote_free_list_ptr.as_ref()
+                });
                 self.this_free_list.set(our_free_list);
             }
         } else {
@@ -1218,14 +1205,50 @@ unsafe impl<'arena, T: Sync> Sync for SlabBlock<'arena, T> {}
 /// Contents of a slab block when it is free (i.e. free chain)
 #[repr(C)]
 struct SlabFreeBlock<'arena> {
-    next: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
+    // DO NOT MODIFY
+    // outside code relies on this layout
+    //
+    // note that, even though we use atomic operations here,
+    // we don't end up with problems if the heap payload doesn't
+    // (as long as the external code doesn't *itself* have a data race)
+    // because we only hand out allocations to one thread
+    // and only allow them to be freed one time from one thread
+    // (which may be a different thread), sequenced-before relations
+    // plus the synchronizes-with we establish on the free list pointers
+    // are sufficient to protect *us*
+    next: AtomicU64,
+    _p: PhantomData<&'arena SlabFreeBlock<'arena>>,
+}
+impl<'arena> SlabFreeBlock<'arena> {
+    /// Load next pointer with an atomic op (relaxed)
+    fn load_next(&'arena self) -> Option<&'arena SlabFreeBlock<'arena>> {
+        unsafe {
+            // safety: assuming we didn't mess up, next points to something
+            // within one of "our" allocations
+            let next = self.next.load(Ordering::Relaxed) as usize as *const SlabFreeBlock<'arena>;
+            next.as_ref()
+        }
+    }
+
+    /// Store next pointer with an atomic op (relaxed)
+    fn store_next(&'arena self, x: Option<&'arena SlabFreeBlock<'arena>>) {
+        let next = match x {
+            Some(x) => {
+                let x_addr = x as *const _ as usize as u64;
+                debug_assert!(x_addr <= 0x7fffffffffffffff);
+                x_addr
+            }
+            None => 0,
+        };
+        self.next.store(next, Ordering::Relaxed);
+    }
 }
 
 impl<'arena> Debug for SlabFreeBlock<'arena> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlabFreeBlock")
             .field("@addr", &(self as *const _))
-            .field("next", &self.next.get().map(|x| x as *const _))
+            .field("next", &(self.next.load(Ordering::Relaxed) as *const ()))
             .finish()
     }
 }
