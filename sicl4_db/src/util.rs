@@ -10,6 +10,25 @@ pub fn to_unsafecell<T>(ptr: &T) -> &UnsafeCell<T> {
     unsafe { &*t }
 }
 
+// FIXME this is all hardcoded and terrible
+// (and aarch64 value is designed for M1)
+#[cfg(target_arch = "x86_64")]
+#[macro_export]
+macro_rules! align_to_cache {
+    ($x:item) => {
+        #[repr(align(64))]
+        $x
+    };
+}
+#[cfg(target_arch = "aarch64")]
+#[macro_export]
+macro_rules! align_to_cache {
+    ($x:item) => {
+        #[repr(align(128))]
+        $x
+    };
+}
+
 /// Divide, rounding up
 pub const fn divroundup(num: usize, divisor: usize) -> usize {
     (num + divisor - 1) / divisor
