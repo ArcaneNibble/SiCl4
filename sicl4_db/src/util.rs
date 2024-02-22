@@ -5,6 +5,11 @@ pub const fn divroundup(num: usize, divisor: usize) -> usize {
     (num + divisor - 1) / divisor
 }
 
+/// Round to multiple
+pub const fn roundto(num: usize, multiple: usize) -> usize {
+    divroundup(num, multiple) * multiple
+}
+
 pub unsafe fn _debug_hexdump(p: *const u8, mut sz: usize) -> Result<String, fmt::Error> {
     let mut s = String::new();
     let mut off = 0;
@@ -48,6 +53,13 @@ mod tests {
         assert_eq!(divroundup(0, 4), 0);
         assert_eq!(divroundup(4, 4), 1);
         assert_eq!(divroundup(5, 4), 2);
+    }
+
+    #[test]
+    fn roundto_test() {
+        assert_eq!(roundto(0, 4), 0);
+        assert_eq!(roundto(4, 4), 4);
+        assert_eq!(roundto(5, 4), 8);
     }
 
     #[test]

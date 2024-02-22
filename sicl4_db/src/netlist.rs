@@ -3,6 +3,7 @@
 //! This contains logic for managing locks on netlist nodes
 
 use std::{
+    alloc::Layout,
     cell::UnsafeCell,
     fmt::Debug,
     hash::Hash,
@@ -420,11 +421,7 @@ impl<'arena> NetlistWire<'arena> {
 /// Top-level netlist data structure
 #[derive(Debug)]
 pub struct NetlistModule<'arena> {
-    heap: SlabRoot<
-        'arena,
-        NetlistNodeWithLock<NetlistCell<'arena>>,
-        NetlistNodeWithLock<NetlistWire<'arena>>,
-    >,
+    heap: SlabRoot<'arena, NetlistTypeMapper>,
 }
 
 impl<'arena> NetlistModule<'arena> {
@@ -442,24 +439,37 @@ impl<'arena> NetlistModule<'arena> {
     }
 }
 
+/// Separate cells/wires into separate type bins
+struct NetlistTypeMapper {}
+impl TypeMapper for NetlistTypeMapper {
+    type BinsArrayTy<T> = [T; 2];
+    const LAYOUTS: &'static [&'static [Layout]] = &[
+        &[Layout::new::<NetlistNodeWithLock<NetlistCell>>()],
+        &[Layout::new::<NetlistNodeWithLock<NetlistWire>>()],
+    ];
+}
+impl<'arena> TypeMappable<NetlistTypeMapper> for NetlistNodeWithLock<NetlistCell<'arena>> {
+    const I: usize = 0;
+}
+impl<'arena> TypeMappable<NetlistTypeMapper> for NetlistNodeWithLock<NetlistWire<'arena>> {
+    const I: usize = 1;
+}
+
 /// Provides one thread with access to the netlist
 #[derive(Debug)]
 pub struct NetlistModuleThreadAccessor<'arena> {
-    heap_shard: SlabThreadShard<
-        'arena,
-        NetlistNodeWithLock<NetlistCell<'arena>>,
-        NetlistNodeWithLock<NetlistWire<'arena>>,
-    >,
+    heap_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
 }
 
 impl<'arena> NetlistModuleThreadAccessor<'arena> {
     /// Add a new netlist cell
     pub fn new_cell<'wrapper>(&'wrapper self) -> NetlistCellWriteGuard<'wrapper, 'arena> {
-        let (new_obj, gen) = self.heap_shard.alloc_netlist_cell();
+        let (new_obj, gen) = self
+            .heap_shard
+            .allocate::<NetlistNodeWithLock<NetlistCell<'arena>>>();
         unsafe {
             // fixme: wtf have we made any rust UB anywhere?
-            let maybe_uninit = &*new_obj.alloced;
-            let new_obj_ptr = maybe_uninit.as_ptr();
+            let new_obj_ptr = new_obj.as_ptr();
             // at this point, the memory allocator has established enough of a
             // synchronizes-with a potential remote freeing thread
             // that we can safely reuse the memory block
@@ -495,7 +505,7 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
 
             NetlistCellWriteGuard {
                 p: NetlistCellRef {
-                    ptr: maybe_uninit.assume_init_ref(),
+                    ptr: new_obj.assume_init_ref(),
                     gen,
                 },
                 _pd1: PhantomData,
@@ -506,11 +516,12 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
 
     /// Add a new netlist wire
     pub fn new_wire<'wrapper>(&'wrapper self) -> NetlistWireWriteGuard<'wrapper, 'arena> {
-        let (new_obj, gen) = self.heap_shard.alloc_netlist_wire();
+        let (new_obj, gen) = self
+            .heap_shard
+            .allocate::<NetlistNodeWithLock<NetlistWire<'arena>>>();
         unsafe {
             // fixme: wtf have we made any rust UB anywhere?
-            let maybe_uninit = &*new_obj.alloced;
-            let new_obj_ptr = maybe_uninit.as_ptr();
+            let new_obj_ptr = new_obj.as_ptr();
             // see notes above
             (*new_obj_ptr).lock_and_generation.store(
                 LockAndGeneration::WriteLocked { gen }.into(),
@@ -520,7 +531,7 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
 
             NetlistWireWriteGuard {
                 p: NetlistWireRef {
-                    ptr: maybe_uninit.assume_init_ref(),
+                    ptr: new_obj.assume_init_ref(),
                     gen,
                 },
                 _pd1: PhantomData,
@@ -557,8 +568,7 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         cell.p.ptr.lock_and_generation.store(0, Ordering::Relaxed);
         unsafe {
             // safety: just coercing between repr(C) union references
-            self.heap_shard
-                .free_netlist_cell(mem::transmute(cell.p.ptr))
+            self.heap_shard.free(cell.p.ptr)
         }
         mem::forget(cell);
     }
@@ -572,8 +582,7 @@ impl<'arena> NetlistModuleThreadAccessor<'arena> {
         wire.p.ptr.lock_and_generation.store(0, Ordering::Relaxed);
         unsafe {
             // safety: just coercing between repr(C) union references
-            self.heap_shard
-                .free_netlist_wire(mem::transmute(wire.p.ptr))
+            self.heap_shard.free(wire.p.ptr)
         }
         mem::forget(wire);
     }

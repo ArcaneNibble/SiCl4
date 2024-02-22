@@ -6,25 +6,27 @@
 //! [Mimalloc](https://www.microsoft.com/en-us/research/uploads/prod/2019/06/mimalloc-tr-v1.pdf)
 //! allocator from Microsoft Research.
 //!
+//! The implementation is much closer to the original Microsoft implementation than the Rust crate.
+//!
 //! This code has tighter integration between memory allocation and object locking.
 //! Some notes as to why have been written
-//! [here](https://arcanenibble.github.io/drafts/parallel-capable-netlist-data-structures-part-2.html)
-//! (TODO CHANGE THIS WHEN PUBLISHED).
+//! [here](https://arcanenibble.github.io/parallel-capable-netlist-data-structures-part-2.html)
 
 use std::{
     alloc::{self, Layout},
+    borrow::{Borrow, BorrowMut},
     cell::{Cell, UnsafeCell},
+    cmp,
     collections::HashSet,
     fmt::Debug,
     marker::PhantomData,
-    mem::{self, size_of, ManuallyDrop, MaybeUninit},
+    mem::{self, size_of, MaybeUninit},
     ops::Deref,
     ptr::{self, addr_of, addr_of_mut},
     sync::atomic::Ordering,
 };
 
-use crate::loom_testing::*;
-use crate::util::divroundup;
+use crate::{loom_testing::*, util::roundto};
 
 /// Absolute maximum number of threads that can be supported.
 ///
@@ -72,30 +74,112 @@ const fn num_that_fits(layout: Layout, tot_sz: usize) -> usize {
     tot_sz / layout.size()
 }
 
+/// Workaround for inadequate const generics
+///
+/// Holds all of the other random functions we might need
+pub trait ConstGenericsHackWorkaround<T>: BorrowMut<[T]> {
+    fn init(x: T) -> Self
+    where
+        T: Copy;
+
+    fn as_mut_ptr(self_: *mut Self) -> *mut T;
+}
+impl<T, const N: usize> ConstGenericsHackWorkaround<T> for [T; N] {
+    #[inline]
+    fn init(x: T) -> Self
+    where
+        T: Copy,
+    {
+        [x; N]
+    }
+
+    #[inline]
+    fn as_mut_ptr(self_: *mut Self) -> *mut T {
+        // safety: assume that it doesn't matter if metadata is invalid for a slice pointer
+        unsafe { addr_of_mut!((*self_)[0]) }
+    }
+}
+
+/// Trait that maps (types which can be allocated) -> (allocator bin index)
+///
+/// Mapping multiple types to the same bin is allowed,
+/// but each bin will be sized to contain the *largest* item
+///
+/// Example:
+///
+/// ```
+/// use core::alloc::Layout;
+/// use sicl4_db::allocator::{TypeMapper, TypeMappable};
+///
+/// struct ExampleMapper {}
+/// impl TypeMapper for ExampleMapper {
+///     type BinsArrayTy<T> = [T; 2];
+///     const LAYOUTS: &'static [&'static [Layout]] = &[
+///         &[Layout::new::<u8>()],
+///         &[Layout::new::<u16>(), Layout::new::<u32>()],
+///     ];
+/// }
+/// impl TypeMappable<ExampleMapper> for u8 {
+///     const I: usize = 0;
+/// }
+/// impl TypeMappable<ExampleMapper> for u16 {
+///     const I: usize = 1;
+/// }
+/// impl TypeMappable<ExampleMapper> for u32 {
+///     const I: usize = 1;
+/// }
+/// ```
+pub trait TypeMapper {
+    /// GAT array with size equal to the number of allocator bins
+    /// (i.e. this many unique types)
+    ///
+    /// GAT is needed to work around limitations of const generics
+    type BinsArrayTy<T>: ConstGenericsHackWorkaround<T>;
+
+    /// Layouts contained in each bin
+    const LAYOUTS: &'static [&'static [Layout]];
+
+    fn type_to_bin<T: TypeMappable<Self>>() -> usize
+    where
+        Self: Sized,
+    {
+        T::I
+    }
+}
+/// Trait that maps (type which can be allocated) -> (allocator bin index)
+///
+/// Also helps ensure that allocator only stores `Send + Sync` items
+pub trait TypeMappable<M>: Send + Sync {
+    const I: usize;
+}
+
+// xxx fixme
+impl TypeMapper for () {
+    type BinsArrayTy<T> = [T; 0];
+    const LAYOUTS: &'static [&'static [Layout]] = &[];
+}
+
 /// Slab allocator root object
-pub struct SlabRoot<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> {
+pub struct SlabRoot<'arena, Mapper: TypeMapper> {
     /// Bitfield, where a `1` bit in position `n` indicates that
     /// a [SlabThreadShard] has been handed out for the nth entry of
     /// [per_thread_state](Self::per_thread_state)
     /// (and it hasn't been dropped yet)
     thread_inuse: AtomicU64,
     /// Actual storage for per-thread data
-    per_thread_state:
-        [UnsafeCell<MaybeUninit<SlabPerThreadState<'arena, CellsTy, WiresTy>>>; MAX_THREADS],
+    per_thread_state: [UnsafeCell<MaybeUninit<SlabPerThreadState<'arena, Mapper>>>; MAX_THREADS],
     /// Indicates whether or not the state has been initialized
     per_thread_state_inited: [Cell<bool>; MAX_THREADS],
     /// Ensure `'arena` lifetime is invariant
     _p: PhantomData<Cell<&'arena ()>>,
 }
+// safety: nothing requires that we stay on the same thread
+// (the borrow of 'arena takes care of pinning as necessary)
+unsafe impl<'arena, Mapper: TypeMapper> Send for SlabRoot<'arena, Mapper> {}
 // safety: we carefully use atomic operations on thread_inuse
-unsafe impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Sync
-    for SlabRoot<'arena, CellsTy, WiresTy>
-{
-}
+unsafe impl<'arena, Mapper: TypeMapper> Sync for SlabRoot<'arena, Mapper> {}
 
-impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
-    for SlabRoot<'arena, CellsTy, WiresTy>
-{
+impl<'arena, Mapper: TypeMapper> Debug for SlabRoot<'arena, Mapper> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // xxx getting the locking correct here seems tricky so just give up and don't bother
         f.debug_struct("SlabRoot")
@@ -105,7 +189,7 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
     }
 }
 
-impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> SlabRoot<'arena, CellsTy, WiresTy> {
+impl<'arena, Mapper: TypeMapper> SlabRoot<'arena, Mapper> {
     /// Allocate a new root object for a slab memory allocator
     pub fn new() -> Self {
         Self {
@@ -119,7 +203,7 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> SlabRoot<'arena, CellsT
     /// Get a handle on one per-thread shard of the slab
     ///
     /// Panics if [MAX_THREADS] is reached, or if a global lock exists
-    pub fn new_thread(&'arena self) -> SlabThreadShard<'arena, CellsTy, WiresTy> {
+    pub fn new_thread(&'arena self) -> SlabThreadShard<'arena, Mapper> {
         let allocated_tid;
         // order: need to synchronize-with only the thread that set
         // thread_inuse such that it allows us to (re)allocate a particular thread id
@@ -154,7 +238,7 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> SlabRoot<'arena, CellsT
             // safety: current thread now owns this slice of per_thread_state and per_thread_state_inited exclusively
             let per_thread_maybe_uninit = &mut *self.per_thread_state[allocated_tid].get();
             if !self.per_thread_state_inited[allocated_tid].get() {
-                SlabPerThreadState::<'arena, CellsTy, WiresTy>::init(
+                SlabPerThreadState::<'arena, Mapper>::init(
                     per_thread_maybe_uninit.as_mut_ptr(),
                     allocated_tid as u64,
                     self,
@@ -167,7 +251,7 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> SlabRoot<'arena, CellsT
     }
 
     /// Try and get a handle for performing global operations
-    pub fn try_lock_global(&'arena self) -> Option<SlabRootGlobalGuard<'arena, CellsTy, WiresTy>> {
+    pub fn try_lock_global(&'arena self) -> Option<SlabRootGlobalGuard<'arena, Mapper>> {
         // order: need to synchronize-with only the thread that set
         // thread_inuse to 0, after which we will read/write fresh updated data
         match self
@@ -184,15 +268,13 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> SlabRoot<'arena, CellsT
 ///
 /// The only way to get one of these is to go through [SlabRoot::try_lock_global]
 /// All the dangerous operations are only implemented on this object.
-pub struct SlabRootGlobalGuard<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>(
-    &'arena SlabRoot<'arena, CellsTy, WiresTy>,
+pub struct SlabRootGlobalGuard<'arena, Mapper: TypeMapper>(
+    &'arena SlabRoot<'arena, Mapper>,
     /// prevent this type from being `Sync`
     PhantomData<UnsafeCell<()>>,
 );
 
-impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
-    for SlabRootGlobalGuard<'arena, CellsTy, WiresTy>
-{
+impl<'arena, Mapper: TypeMapper> Debug for SlabRootGlobalGuard<'arena, Mapper> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // because we gave up on getting debug correct in SlabRoot,
         // reach inside and do all the relevant debug printing here instead
@@ -210,9 +292,7 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
     }
 }
 
-impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Drop
-    for SlabRootGlobalGuard<'arena, CellsTy, WiresTy>
-{
+impl<'arena, Mapper: TypeMapper> Drop for SlabRootGlobalGuard<'arena, Mapper> {
     fn drop(&mut self) {
         let root = self.0;
         // ordering: need all manipulation of thread-owned data to stick
@@ -220,12 +300,10 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Drop
     }
 }
 
-impl<'guard, 'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
-    SlabRootGlobalGuard<'arena, CellsTy, WiresTy>
-{
-    fn __debug_check_ty_missing_blocks<ThisTy: Send + Sync>(
+impl<'guard, 'arena, Mapper: TypeMapper> SlabRootGlobalGuard<'arena, Mapper> {
+    fn __debug_check_ty_missing_blocks(
         thread_i: usize,
-        per_thread_per_ty: &'arena SlabPerThreadPerTyState<'arena, ThisTy>,
+        per_thread_per_ty: &'arena SlabPerThreadPerTyState<'arena>,
     ) -> HashSet<usize> {
         let mut all_outstanding_blocks = HashSet::new();
         println!("Checking state for thread {}", thread_i);
@@ -390,34 +468,34 @@ impl<'guard, 'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
     }
 
     // returns outstanding blocks for cells and wires in separate hashsets
-    pub fn _debug_check_missing_blocks(&'guard self) -> (HashSet<usize>, HashSet<usize>) {
-        let mut all_outstanding_blocks_cells = HashSet::new();
-        let mut all_outstanding_blocks_wires = HashSet::new();
+    pub fn _debug_check_missing_blocks(&'guard self) -> Vec<HashSet<usize>> {
+        let mut all_outstanding_blocks = Vec::new();
+        let num_tys = Mapper::BinsArrayTy::<()>::init(()).borrow().len();
+        for _ in 0..num_tys {
+            all_outstanding_blocks.push(HashSet::new());
+        }
 
         for thread_i in 0..MAX_THREADS {
             if self.0.per_thread_state_inited[thread_i].get() {
                 let per_thread =
                     unsafe { (&*self.0.per_thread_state[thread_i].get()).assume_init_ref() };
-                println!("~~~~~ Checking netlist cells ~~~~~");
-                let outstanding_cells_this_thread =
-                    Self::__debug_check_ty_missing_blocks(thread_i, &per_thread.netlist_cells);
-                for x in outstanding_cells_this_thread {
-                    all_outstanding_blocks_cells.insert(x);
-                }
-                println!("~~~~~ Checking netlist wires ~~~~~");
-                let outstanding_wires_this_thread =
-                    Self::__debug_check_ty_missing_blocks(thread_i, &per_thread.netlist_wires);
-                for x in outstanding_wires_this_thread {
-                    all_outstanding_blocks_wires.insert(x);
+                let per_tys = per_thread.per_ty_state.borrow();
+                for type_bin_i in 0..num_tys {
+                    println!("~~~~~ Checking type bin {} ~~~~~", type_bin_i);
+                    let outstanding_cells_this_thread =
+                        Self::__debug_check_ty_missing_blocks(thread_i, &per_tys[type_bin_i]);
+                    for x in outstanding_cells_this_thread {
+                        all_outstanding_blocks[type_bin_i].insert(x);
+                    }
                 }
             }
         }
-        (all_outstanding_blocks_cells, all_outstanding_blocks_wires)
+        all_outstanding_blocks
     }
 }
 
 /// Slab allocator per-thread state (actual contents)
-pub struct SlabPerThreadState<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> {
+pub struct SlabPerThreadState<'arena, Mapper: TypeMapper> {
     /// Identifies this thread
     ///
     /// Current impl: bit position in the [SlabRoot::thread_inuse] bitfield
@@ -425,129 +503,124 @@ pub struct SlabPerThreadState<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync
     /// Pointer to the [SlabRoot] this belongs to
     ///
     /// Can be removed if `offset_of!` gets stabilized
-    root: &'arena SlabRoot<'arena, CellsTy, WiresTy>,
-    /// Manages memory for netlist cells
-    netlist_cells: SlabPerThreadPerTyState<'arena, CellsTy>,
-    /// Manages memory for netlist wires
-    netlist_wires: SlabPerThreadPerTyState<'arena, WiresTy>,
-    /// ABA generation counter for cells
-    netlist_cell_alloc_gen: Cell<u64>,
-    /// ABA generation counter for wires
-    netlist_wire_alloc_gen: Cell<u64>,
+    root: &'arena SlabRoot<'arena, Mapper>,
+    /// Manages the memory for each type
+    per_ty_state: Mapper::BinsArrayTy<SlabPerThreadPerTyState<'arena>>,
+    /// ABA generation counter for each type
+    generation: Mapper::BinsArrayTy<Cell<u64>>,
 }
 // safety: only one thread can have a SlabThreadShard to access any fields here
-unsafe impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Sync
-    for SlabPerThreadState<'arena, CellsTy, WiresTy>
-{
-}
+unsafe impl<'arena, Mapper: TypeMapper> Sync for SlabPerThreadState<'arena, Mapper> {}
 
-impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
-    for SlabPerThreadState<'arena, CellsTy, WiresTy>
-{
+impl<'arena, Mapper: TypeMapper> Debug for SlabPerThreadState<'arena, Mapper> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlabPerThreadState")
             .field("@addr", &(self as *const _))
             .field("tid", &self.tid)
             .field("root", &(self.root as *const _))
-            .field("netlist_cells", &self.netlist_cells)
-            .field("netlist_wires", &self.netlist_wires)
-            .field("netlist_cell_alloc_gen", &self.netlist_cell_alloc_gen.get())
-            .field("netlist_wire_alloc_gen", &self.netlist_wire_alloc_gen.get())
+            .field("per_ty_state", &self.per_ty_state.borrow())
+            .field("generation", &self.generation.borrow())
             .finish()
     }
 }
 
-impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>
-    SlabPerThreadState<'arena, CellsTy, WiresTy>
-{
+impl<'arena, Mapper: TypeMapper> SlabPerThreadState<'arena, Mapper> {
     /// Initialize state
-    pub unsafe fn init(
-        self_: *mut Self,
-        tid: u64,
-        root: &'arena SlabRoot<'arena, CellsTy, WiresTy>,
-    ) {
-        SlabPerThreadPerTyState::init(addr_of_mut!((*self_).netlist_cells), tid);
-        SlabPerThreadPerTyState::init(addr_of_mut!((*self_).netlist_wires), tid);
+    pub unsafe fn init(self_: *mut Self, tid: u64, root: &'arena SlabRoot<'arena, Mapper>) {
+        // calculate layouts
+        let mut layouts = Mapper::BinsArrayTy::<(usize, usize)>::init((0, 0));
+        let layouts = layouts.borrow_mut();
+        for type_bin_i in 0..layouts.len() {
+            let mut sz = Layout::new::<SlabFreeBlock>().size();
+            let mut align = Layout::new::<SlabFreeBlock>().align();
+
+            for layout in Mapper::LAYOUTS[type_bin_i] {
+                sz = cmp::max(sz, layout.size());
+                align = cmp::max(align, layout.align());
+            }
+
+            sz = roundto(sz, align);
+
+            layouts[type_bin_i] = (sz, align);
+        }
+
+        let ty_states = Mapper::BinsArrayTy::<SlabPerThreadPerTyState<'arena>>::as_mut_ptr(
+            addr_of_mut!((*self_).per_ty_state),
+        );
+        for type_bin_i in 0..layouts.len() {
+            let layout_i =
+                Layout::from_size_align(layouts[type_bin_i].0, layouts[type_bin_i].1).unwrap();
+            SlabPerThreadPerTyState::init(ty_states.add(type_bin_i), tid, layout_i);
+        }
 
         (*self_).tid = tid;
         (*self_).root = root;
-        (*self_).netlist_cell_alloc_gen = Cell::new(0);
-        (*self_).netlist_wire_alloc_gen = Cell::new(0);
+
+        let generations =
+            Mapper::BinsArrayTy::<Cell<u64>>::as_mut_ptr(addr_of_mut!((*self_).generation));
+        for type_bin_i in 0..layouts.len() {
+            (*generations.add(type_bin_i)) = Cell::new(0);
+        }
 
         // safety: we initialized everything
     }
 
-    /// Allocates a netlist cell from this shard
+    /// Allocate an object from this shard
     ///
     /// Does *NOT* initialize any of the resulting memory
-    pub fn alloc_netlist_cell(&'arena self) -> (&'arena SlabBlock<'arena, CellsTy>, u64) {
-        let cur_gen = self.netlist_cell_alloc_gen.get();
-        self.netlist_cell_alloc_gen.set(cur_gen + 1);
-        (self.netlist_cells.alloc(self.tid), cur_gen)
+    pub fn allocate<T: TypeMappable<Mapper>>(&'arena self) -> (&'arena MaybeUninit<T>, u64) {
+        let type_bin = Mapper::type_to_bin::<T>();
+        let ty_state = &self.per_ty_state.borrow()[type_bin];
+        let gen_ent = &self.generation.borrow()[type_bin];
+
+        let cur_gen = gen_ent.get();
+        gen_ent.set(cur_gen + 1);
+        // safety: when object leaves us, it's big enough and aligned enough for a T
+        // we don't try to use it as a SlabFreeBlock until it comes back
+        (unsafe { mem::transmute(ty_state.alloc(self.tid)) }, cur_gen)
     }
 
-    /// Deallocates a netlist cell
+    /// Deallocates an object from this shard
     ///
     /// Object must be part of this slab, not already be freed,
     /// and no other references may exist after calling free
-    pub unsafe fn free_netlist_cell(&'arena self, obj: &'arena SlabBlock<'arena, CellsTy>) {
-        self.netlist_cells.free(self.tid, obj);
-    }
+    pub unsafe fn free<T: TypeMappable<Mapper>>(&'arena self, obj: &'arena T) {
+        let type_bin = Mapper::type_to_bin::<T>();
+        let ty_state = &self.per_ty_state.borrow()[type_bin];
 
-    /// Allocates a netlist wire from this shard
-    ///
-    /// Does *NOT* initialize any of the resulting memory
-    pub fn alloc_netlist_wire(&'arena self) -> (&'arena SlabBlock<'arena, WiresTy>, u64) {
-        let cur_gen = self.netlist_wire_alloc_gen.get();
-        self.netlist_wire_alloc_gen.set(cur_gen + 1);
-        (self.netlist_wires.alloc(self.tid), cur_gen)
-    }
-
-    /// Deallocates a netlist wire
-    ///
-    /// Object must be part of this slab, not already be freed,
-    /// and no other references may exist after calling free
-    pub unsafe fn free_netlist_wire(&'arena self, obj: &'arena SlabBlock<'arena, WiresTy>) {
-        self.netlist_wires.free(self.tid, obj);
+        ty_state.free(self.tid, obj as *const T as *mut ());
     }
 }
 
 /// Slab allocator per-thread *and* per-type state
-struct SlabPerThreadPerTyState<'arena, T: Send + Sync> {
+struct SlabPerThreadPerTyState<'arena> {
+    /// The layout to use when allocating
+    layout: Layout,
     /// Pointer to segment list (used for global ops) TODO
-    segments: Cell<&'arena SlabSegmentHdr<'arena, T>>,
+    segments: Cell<&'arena SlabSegmentHdr<'arena>>,
     /// Pointer to head of (non-full) page list
-    pages: Cell<&'arena SlabSegmentPageMeta<'arena, T>>,
+    pages: Cell<&'arena SlabSegmentPageMeta<'arena>>,
     /// Pointer to end of (non-full) page list
-    last_page: Cell<&'arena SlabSegmentPageMeta<'arena, T>>,
+    last_page: Cell<&'arena SlabSegmentPageMeta<'arena>>,
     /// List of blocks freed by another thread when the containing page was full
     ///
     /// This is an optimization to prevent having to search through many full pages
     thread_delayed_free: AtomicPtr<SlabFreeBlock<'arena>>,
 }
-// safety: this is a *huge* footgun. this is marked Sync so that it is possible
-// for multiple threads to get access to it so that they can access the
-// thread delayed free block list. it is *not* otherwise safe.
-//
-// however, because only a SlabThreadShard can get outside this module,
-// the footgun is contained
-unsafe impl<'arena, T: Send + Sync> Sync for SlabPerThreadPerTyState<'arena, T> {}
 
-impl<'arena, T: Send + Sync> Debug for SlabPerThreadPerTyState<'arena, T> {
+impl<'arena> Debug for SlabPerThreadPerTyState<'arena> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(&format!(
-            "SlabPerThreadPerTyState<{}>",
-            std::any::type_name::<T>()
-        ))
-        .field("@addr", &(self as *const _))
-        .field("segments", &(self.segments.get() as *const _))
-        .field("pages", &(self.pages.get() as *const _))
-        .field("last_page", &(self.last_page.get() as *const _))
-        .field(
-            "thread_delayed_free",
-            &(self.thread_delayed_free.load(Ordering::Relaxed)),
-        )
-        .finish()
+        f.debug_struct("SlabPerThreadPerTyState")
+            .field("@addr", &(self as *const _))
+            .field("layout", &self.layout)
+            .field("segments", &(self.segments.get() as *const _))
+            .field("pages", &(self.pages.get() as *const _))
+            .field("last_page", &(self.last_page.get() as *const _))
+            .field(
+                "thread_delayed_free",
+                &(self.thread_delayed_free.load(Ordering::Relaxed)),
+            )
+            .finish()
     }
 }
 
@@ -580,25 +653,30 @@ const REMOTE_FREE_FLAGS_STATE_IN_DELAYED_FREE_LIST: usize = 0b11;
 /// This bit pattern is invalid
 const _REMOTE_FREE_FLAGS_STATE_INVALID: usize = 0b10;
 
-impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
+impl<'arena> SlabPerThreadPerTyState<'arena> {
     /// Initialize state
-    pub unsafe fn init(self_: *mut Self, tid: u64) {
+    pub unsafe fn init(self_: *mut Self, tid: u64, layout: Layout) {
+        // this is needed at the very beginning
+        // because init_new_seg requires it
+        (*self_).layout = layout;
+
         // alloc initial segment
-        let new_initial_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(tid);
+        let new_initial_seg = alloc::alloc_zeroed(SEGMENT_LAYOUT) as *mut SlabSegmentHdr<'arena>;
         let new_initial_seg = unsafe {
             // 😱 this is super dangerous wrt uninit memory
             // hopefully it doesn't break
             (*new_initial_seg).owning_thread_ty_state = mem::transmute(self_);
             (*new_initial_seg).next = None;
+            SlabSegmentHdr::init_new_seg(new_initial_seg, tid);
+            // safety: at this point we've initialized everything
+            // *including* the owning_thread_ty_state footgun
             &*new_initial_seg
         };
 
-        unsafe {
-            (*self_).segments = Cell::new(new_initial_seg);
-            (*self_).pages = Cell::new(&new_initial_seg.pages[0]);
-            (*self_).last_page = Cell::new(&new_initial_seg.pages[PAGES_PER_SEG - 1]);
-            (*self_).thread_delayed_free = AtomicPtr::new(ptr::null_mut());
-        }
+        (*self_).segments = Cell::new(new_initial_seg);
+        (*self_).pages = Cell::new(&new_initial_seg.pages[0]);
+        (*self_).last_page = Cell::new(&new_initial_seg.pages[PAGES_PER_SEG - 1]);
+        (*self_).thread_delayed_free = AtomicPtr::new(ptr::null_mut());
 
         // safety: we initialized everything
     }
@@ -609,11 +687,12 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
     /// Memory unsafety is contained, but this can mess up invariants
     /// (and thus isn't public)
     fn new_seg(&'arena self, tid: u64) {
-        let new_seg = SlabSegmentHdr::<'arena, T>::alloc_new_seg(tid);
+        let new_seg = unsafe { alloc::alloc_zeroed(SEGMENT_LAYOUT) as *mut SlabSegmentHdr<'arena> };
         let old_seg_head = Some(self.segments.get());
         let new_seg = unsafe {
             (*new_seg).owning_thread_ty_state = self;
             (*new_seg).next = old_seg_head;
+            SlabSegmentHdr::init_new_seg(new_seg, tid);
             // safety: at this point we've initialized everything
             // *including* the owning_thread_ty_state footgun
             &*new_seg
@@ -630,7 +709,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
         &'arena self,
         tid: u64,
     ) -> (
-        &'arena SlabSegmentPageMeta<'arena, T>,
+        &'arena SlabSegmentPageMeta<'arena>,
         &'arena SlabFreeBlock<'arena>,
     ) {
         // collect thread delayed free block list and free them all
@@ -654,8 +733,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
             let mut thread_delayed_free = thread_delayed_free.as_ref();
             while let Some(block) = thread_delayed_free {
                 let next = block.load_next();
-                // safety: just coercing between repr(C) union references
-                self.free(tid, mem::transmute(block));
+                self.free(tid, block as *const _ as *mut ());
                 thread_delayed_free = next;
             }
         }
@@ -691,7 +769,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
     /// Allocates an object from this shard
     ///
     /// Does *NOT* initialize any of the resulting memory
-    pub fn alloc(&'arena self, tid: u64) -> &'arena SlabBlock<'arena, T> {
+    pub fn alloc(&'arena self, tid: u64) -> *mut () {
         let fast_page = self.pages.get();
         let fast_block = fast_page.this_free_list.get();
         let (page, block) = match fast_block {
@@ -699,21 +777,25 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
             None => self.alloc_slow(tid),
         };
         page.this_free_list.set(block.load_next());
-        unsafe {
-            // safety: just coercing between repr(C) union references
-            mem::transmute(block)
-        }
+        block as *const _ as *mut ()
     }
 
     /// Deallocates an object
     ///
     /// Object must be part of this slab, not already be freed,
     /// and no other references may exist after calling free
-    pub unsafe fn free(&'arena self, tid: u64, obj: &'arena SlabBlock<'arena, T>) {
-        let obj_ptr = obj as *const _ as usize;
+    pub unsafe fn free(&'arena self, tid: u64, obj: *mut ()) {
+        // sigh
+        #[cfg(loom)]
+        unsafe {
+            (*(obj as *mut SlabFreeBlock)).next = AtomicU64::new(0);
+        }
+
+        let obj_ptr = obj as usize;
         let seg_ptr = obj_ptr & !(SEGMENT_SZ - 1);
-        let seg = &*(seg_ptr as *const SlabSegmentHdr<'arena, T>);
+        let seg = &*(seg_ptr as *const SlabSegmentHdr<'arena>);
         let page_i = (obj_ptr - seg_ptr) >> ALLOC_PAGE_SHIFT;
+        let obj = &*(obj as *const SlabFreeBlock);
 
         // we don't allow freeing null so unlike msft we don't need to check for it
 
@@ -744,8 +826,8 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
                 self.last_page.set(&seg.pages[page_i]);
             }
 
-            obj.free.store_next(seg.pages[page_i].local_free_list.get());
-            seg.pages[page_i].local_free_list.set(Some(&obj.free));
+            obj.store_next(seg.pages[page_i].local_free_list.get());
+            seg.pages[page_i].local_free_list.set(Some(obj));
         } else {
             // remote free
 
@@ -812,7 +894,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
                                 .thread_delayed_free
                                 .load(Ordering::Relaxed);
                             loop {
-                                obj.free.store_next(prev_thread_delayed_free.as_ref());
+                                obj.store_next(prev_thread_delayed_free.as_ref());
                                 // order: on success, we are currently the most recent
                                 // modification to thread_delayed_free
                                 // we use release ordering so that writes to obj.free.next
@@ -838,7 +920,7 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
                     // push onto remote free list
                     let next_block_proper_addr =
                         (prev_remote_free & !0b11) as *const SlabFreeBlock<'arena>;
-                    obj.free.store_next(next_block_proper_addr.as_ref());
+                    obj.store_next(next_block_proper_addr.as_ref());
                     // order: on success, we are currently the most recent
                     // modification to remote_free_list
                     // we use release ordering so that writes to obj.free.next
@@ -870,33 +952,27 @@ impl<'arena, T: Send + Sync> SlabPerThreadPerTyState<'arena, T> {
 ///
 /// It is *not* allowed for a raw `&'arena SlabPerThreadState<'arena, T>`
 /// to escape from this module. Allowing this can cause data races.
-pub struct SlabThreadShard<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync>(
-    &'arena SlabPerThreadState<'arena, CellsTy, WiresTy>,
+pub struct SlabThreadShard<'arena, Mapper: TypeMapper>(
+    &'arena SlabPerThreadState<'arena, Mapper>,
     /// prevent this type from being `Sync`
     PhantomData<UnsafeCell<()>>,
 );
 
-impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Debug
-    for SlabThreadShard<'arena, CellsTy, WiresTy>
-{
+impl<'arena, Mapper: TypeMapper> Debug for SlabThreadShard<'arena, Mapper> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("SlabThreadShard").field(&self.0).finish()
     }
 }
 
-impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Deref
-    for SlabThreadShard<'arena, CellsTy, WiresTy>
-{
-    type Target = &'arena SlabPerThreadState<'arena, CellsTy, WiresTy>;
+impl<'arena, Mapper: TypeMapper> Deref for SlabThreadShard<'arena, Mapper> {
+    type Target = &'arena SlabPerThreadState<'arena, Mapper>;
 
-    fn deref<'guard>(&'guard self) -> &'guard &'arena SlabPerThreadState<'arena, CellsTy, WiresTy> {
+    fn deref<'guard>(&'guard self) -> &'guard &'arena SlabPerThreadState<'arena, Mapper> {
         &self.0
     }
 }
 
-impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Drop
-    for SlabThreadShard<'arena, CellsTy, WiresTy>
-{
+impl<'arena, Mapper: TypeMapper> Drop for SlabThreadShard<'arena, Mapper> {
     fn drop(&mut self) {
         let root = self.0.root;
         let mask = !(1 << self.0.tid);
@@ -907,21 +983,21 @@ impl<'arena, CellsTy: Send + Sync, WiresTy: Send + Sync> Drop
 
 /// Header for each (4 M) segment
 #[repr(C)]
-struct SlabSegmentHdr<'arena, T: Send + Sync> {
+struct SlabSegmentHdr<'arena> {
     /// Thread that created this segment and owns its "local" data
     owning_tid: u64,
     /// Per-thread per-type data of the thread that created this
     /// (used for thread delayed free)
-    owning_thread_ty_state: &'arena SlabPerThreadPerTyState<'arena, T>,
+    owning_thread_ty_state: &'arena SlabPerThreadPerTyState<'arena>,
     /// List of segments (all owned by this thread)
-    next: Option<&'arena SlabSegmentHdr<'arena, T>>,
+    next: Option<&'arena SlabSegmentHdr<'arena>>,
     /// Metadata for each page within the segment
-    pages: [SlabSegmentPageMeta<'arena, T>; PAGES_PER_SEG],
+    pages: [SlabSegmentPageMeta<'arena>; PAGES_PER_SEG],
 }
 
-impl<'arena, T: Send + Sync> Debug for SlabSegmentHdr<'arena, T> {
+impl<'arena> Debug for SlabSegmentHdr<'arena> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(&format!("SlabSegmentHdr<{}>", std::any::type_name::<T>()))
+        f.debug_struct("SlabSegmentHdr")
             .field("@addr", &(self as *const _))
             .field("owning_tid", &self.owning_tid)
             .field(
@@ -934,65 +1010,56 @@ impl<'arena, T: Send + Sync> Debug for SlabSegmentHdr<'arena, T> {
     }
 }
 
-impl<'arena, T: Send + Sync> SlabSegmentHdr<'arena, T> {
-    pub fn alloc_new_seg(owning_tid: u64) -> *mut Self {
-        unsafe {
-            let seg = alloc::alloc_zeroed(SEGMENT_LAYOUT) as *mut Self;
-            (*seg).owning_tid = owning_tid;
+impl<'arena> SlabSegmentHdr<'arena> {
+    pub unsafe fn init_new_seg(self_: *mut Self, owning_tid: u64) {
+        (*self_).owning_tid = owning_tid;
 
-            for i in 0..PAGES_PER_SEG {
-                SlabSegmentPageMeta::init_page(addr_of_mut!((*seg).pages[i]), seg, i);
-                if i != PAGES_PER_SEG - 1 {
-                    let next_page_meta_ptr = addr_of_mut!((*seg).pages[i + 1]);
-                    // reborrowing is safe because we *never* make &mut
-                    (*seg).pages[i].next_page.set(next_page_meta_ptr.as_ref());
-                }
+        for i in 0..PAGES_PER_SEG {
+            SlabSegmentPageMeta::init_page(addr_of_mut!((*self_).pages[i]), self_, i);
+            if i != PAGES_PER_SEG - 1 {
+                let next_page_meta_ptr = addr_of_mut!((*self_).pages[i + 1]);
+                // reborrowing is safe because we *never* make &mut
+                (*self_).pages[i].next_page.set(next_page_meta_ptr.as_ref());
             }
-
-            // safety: we initialized everything EXCEPT
-            // owning_thread_ty_state which remains UNINIT!
-            seg
         }
+
+        // safety: we initialized everything EXCEPT
+        // owning_thread_ty_state which remains UNINIT!
     }
 
     #[inline]
-    pub fn get_hdr_rounded_sz() -> usize {
-        let t_layout = Layout::new::<SlabBlock<T>>();
-        let seg_hdr_size = size_of::<SlabSegmentHdr<T>>();
-        let rounded_seg_hdr_sz = divroundup(seg_hdr_size, t_layout.align()) * t_layout.align();
+    pub fn get_hdr_rounded_sz(self_: *const Self) -> usize {
+        let t_layout = unsafe { (*self_).owning_thread_ty_state.layout };
+        let seg_hdr_size = size_of::<SlabSegmentHdr>();
+        let rounded_seg_hdr_sz = roundto(seg_hdr_size, t_layout.align());
         rounded_seg_hdr_sz
     }
 
     #[inline]
-    pub fn get_num_objects(_: *const Self, is_first_page: bool) -> usize {
+    pub fn get_num_objects(self_: *const Self, is_first_page: bool) -> usize {
+        let t_layout = unsafe { (*self_).owning_thread_ty_state.layout };
         let start_unusable = if is_first_page {
-            Self::get_hdr_rounded_sz()
+            Self::get_hdr_rounded_sz(self_)
         } else {
             0
         };
-        let num_objects = num_that_fits(
-            Layout::new::<SlabBlock<T>>(),
-            ALLOC_PAGE_SZ - start_unusable,
-        );
+        let num_objects = num_that_fits(t_layout, ALLOC_PAGE_SZ - start_unusable);
         num_objects
     }
 
     #[inline]
     pub fn get_addr_of_block(self_: *const Self, page_i: usize, block_i: usize) -> *const u8 {
         assert!(page_i < PAGES_PER_SEG);
+        let t_layout = unsafe { (*self_).owning_thread_ty_state.layout };
         let start_unusable = if page_i == 0 {
-            Self::get_hdr_rounded_sz()
+            Self::get_hdr_rounded_sz(self_)
         } else {
             0
         };
         let start_offs = page_i * ALLOC_PAGE_SZ + start_unusable;
-        let num_objects = num_that_fits(
-            Layout::new::<SlabBlock<T>>(),
-            ALLOC_PAGE_SZ - start_unusable,
-        );
+        let num_objects = num_that_fits(t_layout, ALLOC_PAGE_SZ - start_unusable);
         assert!(block_i < num_objects);
-        let t_layout_padded = Layout::new::<SlabBlock<T>>().pad_to_align();
-        let tot_offs = start_offs + block_i * t_layout_padded.size();
+        let tot_offs = start_offs + block_i * t_layout.size();
         let seg_ptr = self_ as *const u8;
         debug_assert!(tot_offs <= SEGMENT_SZ);
         unsafe {
@@ -1006,59 +1073,51 @@ impl<'arena, T: Send + Sync> SlabSegmentHdr<'arena, T> {
 ///
 /// Note that this is not stored *in* the page, but in the segment header.
 #[repr(C)]
-struct SlabSegmentPageMeta<'arena, T: Send + Sync> {
+struct SlabSegmentPageMeta<'arena> {
     /// Linked list of pages
-    next_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena, T>>>,
+    next_page: Cell<Option<&'arena SlabSegmentPageMeta<'arena>>>,
     /// List that we allocate from in the fast path
     this_free_list: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
     /// List that we free to from the same thread
     local_free_list: Cell<Option<&'arena SlabFreeBlock<'arena>>>,
     /// List that other threads free onto
     remote_free_list: AtomicUsize,
-    _p: PhantomData<T>, // FIXME what does "covariant (with drop check)" mean?
 }
-// safety: we carefully use atomic operations on remote_free_list,
-// and everything else is owned by one specific thread
-// (which is guarded by SlabRoot::thread_inuse)
-unsafe impl<'arena, T: Send + Sync> Sync for SlabSegmentPageMeta<'arena, T> {}
 
-impl<'arena, T: Send + Sync> Debug for SlabSegmentPageMeta<'arena, T> {
+impl<'arena> Debug for SlabSegmentPageMeta<'arena> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(&format!(
-            "SlabSegmentPageMeta<{}>",
-            std::any::type_name::<T>()
-        ))
-        .field("@addr", &(self as *const _))
-        .field("<first data block>", &unsafe {
-            let self_ptr = self as *const SlabSegmentPageMeta<'arena, T>;
-            let self_addr = self as *const _ as usize;
-            let seg_addr = self_addr & !(SEGMENT_SZ - 1);
-            let seg_ptr = seg_addr as *const SlabSegmentHdr<'arena, T>;
-            let first_page_meta_ptr = addr_of!((*seg_ptr).pages[0]);
-            let page_i = self_ptr.offset_from(first_page_meta_ptr) as usize;
-            SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, 0)
-        })
-        .field("next_page", &self.next_page.get().map(|x| x as *const _))
-        .field(
-            "this_free_list",
-            &self.this_free_list.get().map(|x| x as *const _),
-        )
-        .field(
-            "local_free_list",
-            &self.local_free_list.get().map(|x| x as *const _),
-        )
-        .field(
-            "remote_free_list",
-            &(self.remote_free_list.load(Ordering::Relaxed) as *const ()),
-        )
-        .finish()
+        f.debug_struct("SlabSegmentPageMeta")
+            .field("@addr", &(self as *const _))
+            .field("<first data block>", &unsafe {
+                let self_ptr = self as *const SlabSegmentPageMeta<'arena>;
+                let self_addr = self as *const _ as usize;
+                let seg_addr = self_addr & !(SEGMENT_SZ - 1);
+                let seg_ptr = seg_addr as *const SlabSegmentHdr<'arena>;
+                let first_page_meta_ptr = addr_of!((*seg_ptr).pages[0]);
+                let page_i = self_ptr.offset_from(first_page_meta_ptr) as usize;
+                SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, 0)
+            })
+            .field("next_page", &self.next_page.get().map(|x| x as *const _))
+            .field(
+                "this_free_list",
+                &self.this_free_list.get().map(|x| x as *const _),
+            )
+            .field(
+                "local_free_list",
+                &self.local_free_list.get().map(|x| x as *const _),
+            )
+            .field(
+                "remote_free_list",
+                &(self.remote_free_list.load(Ordering::Relaxed) as *const ()),
+            )
+            .finish()
     }
 }
 
-impl<'arena, T: Send + Sync> SlabSegmentPageMeta<'arena, T> {
+impl<'arena> SlabSegmentPageMeta<'arena> {
     pub unsafe fn init_page(
         self_: *mut Self,
-        seg_ptr: *const SlabSegmentHdr<'arena, T>,
+        seg_ptr: *const SlabSegmentHdr<'arena>,
         page_i: usize,
     ) {
         // XXX makes assumptions about niche optimization and layout of Option<&_>
@@ -1071,13 +1130,15 @@ impl<'arena, T: Send + Sync> SlabSegmentPageMeta<'arena, T> {
         for block_i in 0..(num_objects - 1) {
             let block_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, block_i);
             let next_block_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, block_i + 1);
-            let block_ptr = block_ptr as *mut SlabBlock<'arena, T>;
+            let block_ptr = block_ptr as *mut SlabFreeBlock<'arena>;
 
-            (*block_ptr).free = ManuallyDrop::new(SlabFreeBlock {
-                next: AtomicU64::new(next_block_ptr as u64),
-                _p: PhantomData,
-            });
+            (*block_ptr).next = AtomicU64::new(next_block_ptr as u64);
         }
+
+        // loom crashes without this
+        let last_block_ptr = SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, num_objects - 1);
+        let last_block_ptr = last_block_ptr as *mut SlabFreeBlock<'arena>;
+        (*last_block_ptr).next = AtomicU64::new(0);
 
         let block_0_ptr =
             SlabSegmentHdr::get_addr_of_block(seg_ptr, page_i, 0) as *const SlabFreeBlock<'arena>;
@@ -1190,18 +1251,6 @@ impl<'arena, T: Send + Sync> SlabSegmentPageMeta<'arena, T> {
     }
 }
 
-/// A slab block (used to ensure size/align for free chain)
-// fixme: there seems to be no good way to use this without involving transmutes?
-#[repr(C)]
-pub union SlabBlock<'arena, T> {
-    free: ManuallyDrop<SlabFreeBlock<'arena>>,
-    pub alloced: ManuallyDrop<MaybeUninit<T>>,
-}
-// safety: this is a wrapper for T
-// if exposed outside of this module, the free variant (where the danger lies) is inaccessible
-unsafe impl<'arena, T: Send> Send for SlabBlock<'arena, T> {}
-unsafe impl<'arena, T: Sync> Sync for SlabBlock<'arena, T> {}
-
 /// Contents of a slab block when it is free (i.e. free chain)
 #[repr(C)]
 struct SlabFreeBlock<'arena> {
@@ -1264,6 +1313,68 @@ mod tests {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
 
+    struct JustU8Mapper {}
+    impl TypeMapper for JustU8Mapper {
+        type BinsArrayTy<T> = [T; 1];
+        const LAYOUTS: &'static [&'static [Layout]] = &[&[Layout::new::<u8>()]];
+    }
+    impl TypeMappable<JustU8Mapper> for u8 {
+        const I: usize = 0;
+    }
+
+    struct JustBigArrayMapper {}
+    impl TypeMapper for JustBigArrayMapper {
+        type BinsArrayTy<T> = [T; 1];
+        const LAYOUTS: &'static [&'static [Layout]] = &[&[Layout::new::<[u8; 30000]>()]];
+    }
+    impl TypeMappable<JustBigArrayMapper> for [u8; 30000] {
+        const I: usize = 0;
+    }
+
+    struct TwoBigArrayMapper {}
+    impl TypeMapper for TwoBigArrayMapper {
+        type BinsArrayTy<T> = [T; 2];
+        const LAYOUTS: &'static [&'static [Layout]] = &[
+            &[Layout::new::<[u8; 30000]>()],
+            &[Layout::new::<[u8; 29999]>()],
+        ];
+    }
+    impl TypeMappable<TwoBigArrayMapper> for [u8; 30000] {
+        const I: usize = 0;
+    }
+    impl TypeMappable<TwoBigArrayMapper> for [u8; 29999] {
+        const I: usize = 1;
+    }
+
+    #[cfg(not(loom))]
+    #[test]
+    fn alloc_layout_compute() {
+        struct LayoutComputeTest {}
+        impl TypeMapper for LayoutComputeTest {
+            type BinsArrayTy<T> = [T; 2];
+
+            const LAYOUTS: &'static [&'static [Layout]] = &[
+                &[Layout::new::<[u8; 9]>()],
+                &[match Layout::from_size_align(1, 32) {
+                    Ok(x) => x,
+                    Err(_) => unreachable!(),
+                }],
+            ];
+        }
+
+        let slab = SlabRoot::<LayoutComputeTest>::new();
+        let shard1 = slab.new_thread();
+
+        assert_eq!(
+            shard1.per_ty_state[0].layout,
+            Layout::from_size_align(16, 8).unwrap()
+        );
+        assert_eq!(
+            shard1.per_ty_state[1].layout,
+            Layout::from_size_align(32, 32).unwrap()
+        );
+    }
+
     #[test]
     fn test_num_that_fits() {
         assert_eq!(num_that_fits(Layout::new::<u32>(), 256), 256 / 4);
@@ -1274,19 +1385,19 @@ mod tests {
 
     #[test]
     fn ensure_slab_root_send_sync() {
-        assert_send::<SlabRoot<'_, u8, ()>>();
-        assert_sync::<SlabRoot<'_, u8, ()>>();
+        assert_send::<SlabRoot<'_, JustU8Mapper>>();
+        assert_sync::<SlabRoot<'_, JustU8Mapper>>();
     }
 
     #[test]
     fn ensure_thread_shard_send() {
-        assert_send::<SlabThreadShard<'_, u8, ()>>();
+        assert_send::<SlabThreadShard<'_, JustU8Mapper>>();
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_root_new_thread() {
-        let slab = SlabRoot::<u8, ()>::new();
+        let slab = SlabRoot::<JustU8Mapper>::new();
 
         let shard1 = slab.new_thread();
         assert_eq!(slab.thread_inuse.load(Ordering::SeqCst), 0b1);
@@ -1323,72 +1434,87 @@ mod tests {
     #[test]
     #[ignore = "not automated, human eye verified"]
     fn slab_seg_init() {
-        let x = SlabSegmentHdr::<u8>::alloc_new_seg(0);
+        let slab = SlabRoot::<JustU8Mapper>::new();
+        let shard = slab.new_thread();
+        drop(shard);
         unsafe {
-            print!("{}", _debug_hexdump(x as *const u8, SEGMENT_SZ).unwrap());
+            let seg = (*((&*slab.per_thread_state[0].get()).as_ptr())).per_ty_state[0]
+                .segments
+                .get();
+            print!(
+                "{}",
+                _debug_hexdump(seg as *const _ as *const u8, SEGMENT_SZ).unwrap()
+            );
         }
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_pointer_manip_check() {
-        let x = SlabSegmentHdr::<u8>::alloc_new_seg(0);
+        let slab = SlabRoot::<JustU8Mapper>::new();
+        let shard = slab.new_thread();
+        drop(shard);
+        let x = unsafe {
+            (*((&*slab.per_thread_state[0].get()).as_ptr())).per_ty_state[0]
+                .segments
+                .get()
+        };
         // we have min sz and align of 8
 
         // first object
         assert_eq!(
             SlabSegmentHdr::get_addr_of_block(x, 0, 0) as usize,
-            (x as usize) + SlabSegmentHdr::<u8>::get_hdr_rounded_sz()
+            (x as *const _ as usize) + SlabSegmentHdr::get_hdr_rounded_sz(x)
         );
         assert_eq!(
             SlabSegmentHdr::get_addr_of_block(x, 1, 0) as usize,
-            (x as usize) + ALLOC_PAGE_SZ
+            (x as *const _ as usize) + ALLOC_PAGE_SZ
         );
         assert_eq!(
             SlabSegmentHdr::get_addr_of_block(x, 2, 0) as usize,
-            (x as usize) + ALLOC_PAGE_SZ * 2
+            (x as *const _ as usize) + ALLOC_PAGE_SZ * 2
         );
         assert_eq!(
             SlabSegmentHdr::get_addr_of_block(x, 63, 0) as usize,
-            (x as usize) + ALLOC_PAGE_SZ * 63
+            (x as *const _ as usize) + ALLOC_PAGE_SZ * 63
         );
 
         // one object in
         assert_eq!(
             SlabSegmentHdr::get_addr_of_block(x, 0, 1) as usize,
-            (x as usize) + SlabSegmentHdr::<u8>::get_hdr_rounded_sz() + 8
+            (x as *const _ as usize) + SlabSegmentHdr::get_hdr_rounded_sz(x) + 8
         );
         assert_eq!(
             SlabSegmentHdr::get_addr_of_block(x, 1, 1) as usize,
-            (x as usize) + ALLOC_PAGE_SZ + 8
+            (x as *const _ as usize) + ALLOC_PAGE_SZ + 8
         );
         assert_eq!(
             SlabSegmentHdr::get_addr_of_block(x, 2, 1) as usize,
-            (x as usize) + ALLOC_PAGE_SZ * 2 + 8
+            (x as *const _ as usize) + ALLOC_PAGE_SZ * 2 + 8
         );
         assert_eq!(
             SlabSegmentHdr::get_addr_of_block(x, 63, 1) as usize,
-            (x as usize) + ALLOC_PAGE_SZ * 63 + 8
+            (x as *const _ as usize) + ALLOC_PAGE_SZ * 63 + 8
         );
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_basic_single_thread_alloc() {
-        let alloc = SlabRoot::<u8, ()>::new();
+        let alloc = SlabRoot::<JustU8Mapper>::new();
         let thread_shard = alloc.new_thread();
-        let obj_1 = thread_shard.alloc_netlist_cell().0;
-        let obj_2 = thread_shard.alloc_netlist_cell().0;
+        let obj_1 = unsafe { thread_shard.allocate::<u8>().0.assume_init_ref() };
+        let obj_2 = unsafe { thread_shard.allocate::<u8>().0.assume_init_ref() };
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         assert_eq!(obj_1 as *const _ as usize + 8, obj_2 as *const _ as usize);
 
-        unsafe { thread_shard.free_netlist_cell(obj_2) };
-        unsafe { thread_shard.free_netlist_cell(obj_1) };
+        unsafe { thread_shard.free(obj_2) };
+        unsafe { thread_shard.free(obj_1) };
 
         unsafe {
-            let seg = thread_shard.netlist_cells.segments.get();
+            let seg = thread_shard.per_ty_state[0].segments.get();
             assert_eq!(
                 seg.pages[0].local_free_list.get().unwrap() as *const _ as usize,
                 obj_1 as *const _ as usize
@@ -1401,30 +1527,29 @@ mod tests {
         }
 
         drop(thread_shard);
-        let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+        let outstanding_blocks = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert_eq!(outstanding_blocks_cells.len(), 0);
-        assert_eq!(outstanding_blocks_wires.len(), 0);
+        assert_eq!(outstanding_blocks[0].len(), 0);
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_basic_fake_remote_free() {
-        let alloc = SlabRoot::<u8, ()>::new();
+        let alloc = SlabRoot::<JustU8Mapper>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.alloc_netlist_cell().0;
-        let obj_2 = thread_shard_0.alloc_netlist_cell().0;
+        let obj_1 = unsafe { thread_shard_0.allocate::<u8>().0.assume_init_ref() };
+        let obj_2 = unsafe { thread_shard_0.allocate::<u8>().0.assume_init_ref() };
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         let thread_shard_1 = alloc.new_thread();
-        unsafe { thread_shard_1.free_netlist_cell(obj_2) };
-        unsafe { thread_shard_1.free_netlist_cell(obj_1) };
+        unsafe { thread_shard_1.free(obj_2) };
+        unsafe { thread_shard_1.free(obj_1) };
 
         unsafe {
-            let seg = thread_shard_0.netlist_cells.segments.get();
+            let seg = thread_shard_0.per_ty_state[0].segments.get();
             print!(
                 "{}",
                 _debug_hexdump(seg as *const _ as *const u8, ALLOC_PAGE_SZ).unwrap()
@@ -1443,29 +1568,28 @@ mod tests {
 
         drop(thread_shard_0);
         drop(thread_shard_1);
-        let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+        let outstanding_blocks = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert_eq!(outstanding_blocks_cells.len(), 0);
-        assert_eq!(outstanding_blocks_wires.len(), 0);
+        assert_eq!(outstanding_blocks[0].len(), 0);
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_test_collect_local() {
-        let alloc = SlabRoot::<[u8; 30000], ()>::new();
+        let alloc = SlabRoot::<JustBigArrayMapper>::new();
         let thread_shard = alloc.new_thread();
-        let obj_1 = thread_shard.alloc_netlist_cell().0;
-        let obj_2 = thread_shard.alloc_netlist_cell().0;
+        let obj_1 = unsafe { thread_shard.allocate::<[u8; 30000]>().0.assume_init_ref() };
+        let obj_2 = unsafe { thread_shard.allocate::<[u8; 30000]>().0.assume_init_ref() };
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
-        unsafe { thread_shard.free_netlist_cell(obj_1) };
-        unsafe { thread_shard.free_netlist_cell(obj_2) };
+        unsafe { thread_shard.free(obj_1) };
+        unsafe { thread_shard.free(obj_2) };
 
-        let obj_1_2nd_try = thread_shard.alloc_netlist_cell().0;
-        let obj_2_2nd_try = thread_shard.alloc_netlist_cell().0;
+        let obj_1_2nd_try = unsafe { thread_shard.allocate::<[u8; 30000]>().0.assume_init_ref() };
+        let obj_2_2nd_try = unsafe { thread_shard.allocate::<[u8; 30000]>().0.assume_init_ref() };
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -1479,32 +1603,31 @@ mod tests {
         );
 
         drop(thread_shard);
-        let (mut outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+        let mut outstanding_blocks = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert!(outstanding_blocks_cells.remove(&(obj_1_2nd_try as *const _ as usize)));
-        assert!(outstanding_blocks_cells.remove(&(obj_2_2nd_try as *const _ as usize)));
-        assert_eq!(outstanding_blocks_cells.len(), 0);
-        assert_eq!(outstanding_blocks_wires.len(), 0);
+        assert!(outstanding_blocks[0].remove(&(obj_1_2nd_try as *const _ as usize)));
+        assert!(outstanding_blocks[0].remove(&(obj_2_2nd_try as *const _ as usize)));
+        assert_eq!(outstanding_blocks[0].len(), 0);
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_test_collect_remote() {
-        let alloc = SlabRoot::<[u8; 30000], ()>::new();
+        let alloc = SlabRoot::<JustBigArrayMapper>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.alloc_netlist_cell().0;
-        let obj_2 = thread_shard_0.alloc_netlist_cell().0;
+        let obj_1 = unsafe { thread_shard_0.allocate::<[u8; 30000]>().0.assume_init_ref() };
+        let obj_2 = unsafe { thread_shard_0.allocate::<[u8; 30000]>().0.assume_init_ref() };
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         let thread_shard_1 = alloc.new_thread();
-        unsafe { thread_shard_1.free_netlist_cell(obj_1) };
-        unsafe { thread_shard_1.free_netlist_cell(obj_2) };
+        unsafe { thread_shard_1.free(obj_1) };
+        unsafe { thread_shard_1.free(obj_2) };
 
-        let obj_1_2nd_try = thread_shard_0.alloc_netlist_cell().0;
-        let obj_2_2nd_try = thread_shard_0.alloc_netlist_cell().0;
+        let obj_1_2nd_try = unsafe { thread_shard_0.allocate::<[u8; 30000]>().0.assume_init_ref() };
+        let obj_2_2nd_try = unsafe { thread_shard_0.allocate::<[u8; 30000]>().0.assume_init_ref() };
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -1519,32 +1642,31 @@ mod tests {
 
         drop(thread_shard_0);
         drop(thread_shard_1);
-        let (mut outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+        let mut outstanding_blocks = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert!(outstanding_blocks_cells.remove(&(obj_1_2nd_try as *const _ as usize)));
-        assert!(outstanding_blocks_cells.remove(&(obj_2_2nd_try as *const _ as usize)));
-        assert_eq!(outstanding_blocks_cells.len(), 0);
-        assert_eq!(outstanding_blocks_wires.len(), 0);
+        assert!(outstanding_blocks[0].remove(&(obj_1_2nd_try as *const _ as usize)));
+        assert!(outstanding_blocks[0].remove(&(obj_2_2nd_try as *const _ as usize)));
+        assert_eq!(outstanding_blocks[0].len(), 0);
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_test_collect_both() {
-        let alloc = SlabRoot::<[u8; 30000], ()>::new();
+        let alloc = SlabRoot::<JustBigArrayMapper>::new();
         let thread_shard_0 = alloc.new_thread();
-        let obj_1 = thread_shard_0.alloc_netlist_cell().0;
-        let obj_2 = thread_shard_0.alloc_netlist_cell().0;
+        let obj_1 = unsafe { thread_shard_0.allocate::<[u8; 30000]>().0.assume_init_ref() };
+        let obj_2 = unsafe { thread_shard_0.allocate::<[u8; 30000]>().0.assume_init_ref() };
         println!("Allocated obj 1 {:?}", obj_1 as *const _);
         println!("Allocated obj 2 {:?}", obj_2 as *const _);
 
         let thread_shard_1 = alloc.new_thread();
-        unsafe { thread_shard_0.free_netlist_cell(obj_1) };
-        unsafe { thread_shard_1.free_netlist_cell(obj_2) };
+        unsafe { thread_shard_0.free(obj_1) };
+        unsafe { thread_shard_1.free(obj_2) };
 
-        let obj_1_2nd_try = thread_shard_0.alloc_netlist_cell().0;
-        let obj_2_2nd_try = thread_shard_0.alloc_netlist_cell().0;
+        let obj_1_2nd_try = unsafe { thread_shard_0.allocate::<[u8; 30000]>().0.assume_init_ref() };
+        let obj_2_2nd_try = unsafe { thread_shard_0.allocate::<[u8; 30000]>().0.assume_init_ref() };
         println!("Allocated obj 1 again {:?}", obj_1_2nd_try as *const _);
         println!("Allocated obj 2 again {:?}", obj_2_2nd_try as *const _);
 
@@ -1559,37 +1681,36 @@ mod tests {
 
         drop(thread_shard_0);
         drop(thread_shard_1);
-        let (mut outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+        let mut outstanding_blocks = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert!(outstanding_blocks_cells.remove(&(obj_1_2nd_try as *const _ as usize)));
-        assert!(outstanding_blocks_cells.remove(&(obj_2_2nd_try as *const _ as usize)));
-        assert_eq!(outstanding_blocks_cells.len(), 0);
-        assert_eq!(outstanding_blocks_wires.len(), 0);
+        assert!(outstanding_blocks[0].remove(&(obj_1_2nd_try as *const _ as usize)));
+        assert!(outstanding_blocks[0].remove(&(obj_2_2nd_try as *const _ as usize)));
+        assert_eq!(outstanding_blocks[0].len(), 0);
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_test_new_seg() {
-        let alloc = SlabRoot::<[u8; 30000], ()>::new();
+        let alloc = SlabRoot::<JustBigArrayMapper>::new();
         let thread_shard = alloc.new_thread();
         let mut things = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard.alloc_netlist_cell().0;
+            let obj = unsafe { thread_shard.allocate::<[u8; 30000]>().0.assume_init_ref() };
             println!("Allocated obj {:3} {:?}", i, obj as *const _);
             things.push(obj);
         }
 
         for i in 0..129 {
             let obj = things[i];
-            unsafe { thread_shard.free_netlist_cell(obj) };
+            unsafe { thread_shard.free(obj) };
             println!("Freed obj {:3}", i);
         }
 
         let mut things2 = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard.alloc_netlist_cell().0;
+            let obj = unsafe { thread_shard.allocate::<[u8; 30000]>().0.assume_init_ref() };
             println!("Allocated obj {:3} again {:?}", i, obj as *const _);
             things2.push(obj);
         }
@@ -1604,39 +1725,38 @@ mod tests {
         );
 
         drop(thread_shard);
-        let (mut outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+        let mut outstanding_blocks = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
         for x in things2 {
-            assert!(outstanding_blocks_cells.remove(&(x as *const _ as usize)));
+            assert!(outstanding_blocks[0].remove(&(x as *const _ as usize)));
         }
-        assert_eq!(outstanding_blocks_cells.len(), 0);
-        assert_eq!(outstanding_blocks_wires.len(), 0);
+        assert_eq!(outstanding_blocks[0].len(), 0);
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_test_remote_free() {
-        let alloc = SlabRoot::<[u8; 30000], ()>::new();
+        let alloc = SlabRoot::<JustBigArrayMapper>::new();
         let thread_shard_0 = alloc.new_thread();
         let thread_shard_1 = alloc.new_thread();
         let mut things = Vec::new();
         for i in 0..129 {
-            let obj = thread_shard_0.alloc_netlist_cell().0;
+            let obj = unsafe { thread_shard_0.allocate::<[u8; 30000]>().0.assume_init_ref() };
             println!("Allocated obj {:3} {:?}", i, obj as *const _);
             things.push(obj);
         }
 
         for i in 0..129 {
             let obj = things[i];
-            unsafe { thread_shard_1.free_netlist_cell(obj) };
+            unsafe { thread_shard_1.free(obj) };
             println!("Freed obj {:3}", i);
         }
 
         // delayed free list tests
         {
-            let seg1 = thread_shard_0.netlist_cells.segments.get();
+            let seg1 = thread_shard_0.per_ty_state[0].segments.get();
             let seg0 = seg1.next.unwrap();
 
             for page_i in 0..64 {
@@ -1661,8 +1781,7 @@ mod tests {
             );
         }
 
-        let mut test_thread_delayed_item = thread_shard_0
-            .netlist_cells
+        let mut test_thread_delayed_item = thread_shard_0.per_ty_state[0]
             .thread_delayed_free
             .load(Ordering::SeqCst) as *const usize;
         for i in (0..64).rev() {
@@ -1675,9 +1794,9 @@ mod tests {
             }
         }
 
-        let mut things2: Vec<&SlabBlock<'_, [u8; 30000]>> = Vec::new();
+        let mut things2: Vec<&[u8; 30000]> = Vec::new();
         for i in 0..256 {
-            let obj = thread_shard_0.alloc_netlist_cell().0;
+            let obj = unsafe { thread_shard_0.allocate::<[u8; 30000]>().0.assume_init_ref() };
             println!("Allocated obj {:3} again {:?}", i, obj as *const _);
             things2.push(obj);
         }
@@ -1694,24 +1813,21 @@ mod tests {
 
         drop(thread_shard_0);
         drop(thread_shard_1);
-        let (mut outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+        let mut outstanding_blocks = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
         for x in things2 {
-            assert!(outstanding_blocks_cells.remove(&(x as *const _ as usize)));
+            assert!(outstanding_blocks[0].remove(&(x as *const _ as usize)));
         }
-        assert_eq!(outstanding_blocks_cells.len(), 0);
-        assert_eq!(outstanding_blocks_wires.len(), 0);
+        assert_eq!(outstanding_blocks[0].len(), 0);
     }
 
     #[cfg(loom)]
     #[test]
     fn slab_loom_new_thread() {
         loom::model(|| {
-            let alloc = &*Box::leak(Box::new(
-                SlabRoot::<'static, [u8; 30000], [u8; 30000]>::new(),
-            ));
+            let alloc = &*Box::leak(Box::new(SlabRoot::<'static, JustBigArrayMapper>::new()));
 
             let t0 = loom::thread::spawn(move || {
                 {
@@ -1750,23 +1866,21 @@ mod tests {
     #[test]
     fn slab_loom_smoke_test() {
         loom::model(|| {
-            let alloc = &*Box::leak(Box::new(
-                SlabRoot::<'static, [u8; 30000], [u8; 30000]>::new(),
-            ));
+            let alloc = &*Box::leak(Box::new(SlabRoot::<'static, JustBigArrayMapper>::new()));
             let (sender, receiver) = loom::sync::mpsc::channel();
 
-            let n_objs = 5;
+            let n_objs = 4;
 
             let t0 = loom::thread::spawn(move || {
                 let thread_shard_0 = alloc.new_thread();
                 let mut alloc_history = Vec::new();
                 let mut prev = None;
                 for i in 0..n_objs {
-                    let obj = thread_shard_0.alloc_netlist_cell().0;
-                    let obj_addr = obj as *const _ as usize;
+                    let obj = thread_shard_0.allocate::<[u8; 30000]>().0;
+                    let obj_addr = obj.as_ptr() as usize;
                     alloc_history.push(obj_addr);
                     unsafe {
-                        let obj_ = obj.alloced.as_ptr() as *mut [u8; 30000];
+                        let obj_ = obj.as_ptr() as *mut [u8; 30000];
                         (*obj_)[0] = 0xef;
                         (*obj_)[1] = 0xbe;
                         (*obj_)[2] = 0xad;
@@ -1779,11 +1893,11 @@ mod tests {
                     // in range
                     assert!(
                         obj_addr
-                            >= thread_shard_0.netlist_cells.segments.get() as *const _ as usize
+                            >= thread_shard_0.per_ty_state[0].segments.get() as *const _ as usize
                     );
                     assert!(
                         obj_addr
-                            < thread_shard_0.netlist_cells.segments.get() as *const _ as usize
+                            < thread_shard_0.per_ty_state[0].segments.get() as *const _ as usize
                                 + SEGMENT_SZ
                     );
 
@@ -1804,31 +1918,22 @@ mod tests {
                 for i in 0..n_objs {
                     let obj = receiver.recv().unwrap();
                     unsafe {
-                        let obj_ = obj.alloced.as_ptr() as *const u64;
+                        let obj_ = obj.as_ptr() as *const u64;
                         assert_eq!(*obj_, (i << 32) | 0xdeadbeef);
-                        thread_shard_1.free_netlist_cell(obj)
+                        thread_shard_1.free(obj.assume_init_ref())
                     }
                 }
             });
 
             t0.join().unwrap();
             t1.join().unwrap();
-
-            let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
-                .try_lock_global()
-                .unwrap()
-                ._debug_check_missing_blocks();
-            assert_eq!(outstanding_blocks_cells.len(), 0);
-            assert_eq!(outstanding_blocks_wires.len(), 0);
         })
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_not_loom_smoke_test() {
-        let alloc = &*Box::leak(Box::new(
-            SlabRoot::<'static, [u8; 30000], [u8; 30000]>::new(),
-        ));
+        let alloc = &*Box::leak(Box::new(SlabRoot::<'static, JustBigArrayMapper>::new()));
         let (sender, receiver) = std::sync::mpsc::channel();
 
         let n_objs = 10_000_000;
@@ -1838,10 +1943,10 @@ mod tests {
             let mut alloc_history = Vec::new();
             let mut prev = None;
             for i in 0..n_objs {
-                let obj = thread_shard_0.alloc_netlist_cell().0;
+                let obj = thread_shard_0.allocate::<[u8; 30000]>().0;
                 let obj_addr = obj as *const _ as usize;
                 unsafe {
-                    let obj_ = obj.alloced.as_ptr() as *mut [u8; 30000];
+                    let obj_ = obj.as_ptr() as *mut [u8; 30000];
                     (*obj_)[0] = 0xef;
                     (*obj_)[1] = 0xbe;
                     (*obj_)[2] = 0xad;
@@ -1854,7 +1959,7 @@ mod tests {
                 alloc_history.push(obj_addr);
                 // in range
                 let mut in_range = false;
-                let mut seg = thread_shard_0.netlist_cells.segments.get();
+                let mut seg = thread_shard_0.per_ty_state[0].segments.get();
                 loop {
                     if (obj_addr >= seg as *const _ as usize)
                         && (obj_addr < seg as *const _ as usize + SEGMENT_SZ)
@@ -1888,9 +1993,9 @@ mod tests {
             for i in 0..n_objs {
                 let obj = receiver.recv().unwrap();
                 unsafe {
-                    let obj_ = obj.alloced.as_ptr() as *const u64;
+                    let obj_ = obj.as_ptr() as *const u64;
                     assert_eq!(*obj_, (i << 32) | 0xdeadbeef);
-                    thread_shard_1.free_netlist_cell(obj)
+                    thread_shard_1.free(obj.assume_init_ref())
                 }
             }
         });
@@ -1898,18 +2003,17 @@ mod tests {
         t0.join().unwrap();
         t1.join().unwrap();
 
-        let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+        let outstanding_blocks = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert_eq!(outstanding_blocks_cells.len(), 0);
-        assert_eq!(outstanding_blocks_wires.len(), 0);
+        assert_eq!(outstanding_blocks[0].len(), 0);
     }
 
     #[cfg(not(loom))]
     #[test]
     fn slab_global_lock_test() {
-        let alloc = SlabRoot::<u8, ()>::new();
+        let alloc = SlabRoot::<JustU8Mapper>::new();
         let thread_shard_0 = alloc.new_thread();
         let thread_shard_1 = alloc.new_thread();
 
@@ -1934,7 +2038,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn slab_global_lock_blocks_threads_test() {
-        let alloc = SlabRoot::<u8, ()>::new();
+        let alloc = SlabRoot::<JustU8Mapper>::new();
         let _global = alloc.try_lock_global().unwrap();
 
         let _thread_shard = alloc.new_thread();
@@ -1943,58 +2047,58 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn slab_separate_cells_wires_smoke_test() {
-        let alloc = SlabRoot::<[u8; 30000], [u8; 29999]>::new();
+        let alloc = SlabRoot::<TwoBigArrayMapper>::new();
         let thread_shard = alloc.new_thread();
 
-        let cell_obj = thread_shard.alloc_netlist_cell().0;
-        let wire_obj = thread_shard.alloc_netlist_wire().0;
+        let cell_obj = unsafe { thread_shard.allocate::<[u8; 30000]>().0.assume_init_ref() };
+        let wire_obj = unsafe { thread_shard.allocate::<[u8; 29999]>().0.assume_init_ref() };
         println!("Allocated cell obj {:?}", cell_obj as *const _);
         println!("Allocated wire obj {:?}", wire_obj as *const _);
 
         // in range
         let cell_obj_addr = cell_obj as *const _ as usize;
-        assert!(cell_obj_addr >= thread_shard.netlist_cells.segments.get() as *const _ as usize);
+        assert!(cell_obj_addr >= thread_shard.per_ty_state[0].segments.get() as *const _ as usize);
         assert!(
             cell_obj_addr
-                < thread_shard.netlist_cells.segments.get() as *const _ as usize + SEGMENT_SZ
+                < thread_shard.per_ty_state[0].segments.get() as *const _ as usize + SEGMENT_SZ
         );
         let wire_obj_addr = wire_obj as *const _ as usize;
-        assert!(wire_obj_addr >= thread_shard.netlist_wires.segments.get() as *const _ as usize);
+        assert!(wire_obj_addr >= thread_shard.per_ty_state[1].segments.get() as *const _ as usize);
         assert!(
             wire_obj_addr
-                < thread_shard.netlist_wires.segments.get() as *const _ as usize + SEGMENT_SZ
+                < thread_shard.per_ty_state[1].segments.get() as *const _ as usize + SEGMENT_SZ
         );
 
         drop(thread_shard);
-        let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+        let outstanding_blocks = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert_eq!(outstanding_blocks_cells.len(), 1);
-        assert_eq!(outstanding_blocks_wires.len(), 1);
-        assert!(outstanding_blocks_cells.contains(&cell_obj_addr));
-        assert!(outstanding_blocks_wires.contains(&wire_obj_addr));
+        assert_eq!(outstanding_blocks[0].len(), 1);
+        assert_eq!(outstanding_blocks[1].len(), 1);
+        assert!(outstanding_blocks[0].contains(&cell_obj_addr));
+        assert!(outstanding_blocks[1].contains(&wire_obj_addr));
 
         // now do a free
         let thread_shard = alloc.new_thread();
         unsafe {
-            thread_shard.free_netlist_cell(cell_obj);
-            thread_shard.free_netlist_wire(wire_obj);
+            thread_shard.free(cell_obj);
+            thread_shard.free(wire_obj);
         }
         println!("Did a free!");
         drop(thread_shard);
-        let (outstanding_blocks_cells, outstanding_blocks_wires) = alloc
+        let outstanding_blocks = alloc
             .try_lock_global()
             .unwrap()
             ._debug_check_missing_blocks();
-        assert_eq!(outstanding_blocks_cells.len(), 0);
-        assert_eq!(outstanding_blocks_wires.len(), 0);
+        assert_eq!(outstanding_blocks[0].len(), 0);
+        assert_eq!(outstanding_blocks[1].len(), 0);
     }
 
     #[test]
     #[ignore = "not automated, human eye verified"]
     fn slab_debug_tests() {
-        let alloc = SlabRoot::<u8, ()>::new();
+        let alloc = SlabRoot::<JustU8Mapper>::new();
         println!("Alloc debug:");
         dbg!(&alloc);
 
@@ -2004,7 +2108,7 @@ mod tests {
         dbg!(&thread);
 
         println!("Segment debug:");
-        dbg!(&thread.0.netlist_cells.segments.get());
+        dbg!(&thread.0.per_ty_state[0].segments.get());
 
         println!("dropping...");
         drop(thread);
