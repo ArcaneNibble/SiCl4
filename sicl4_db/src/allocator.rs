@@ -153,12 +153,6 @@ pub trait TypeMappable<M>: Send + Sync {
     const I: usize;
 }
 
-// xxx fixme
-impl TypeMapper for () {
-    type BinsArrayTy<T> = [T; 0];
-    const LAYOUTS: &'static [&'static [Layout]] = &[];
-}
-
 /// Slab allocator root object
 pub struct SlabRoot<'arena, Mapper: TypeMapper> {
     /// Bitfield, where a `1` bit in position `n` indicates that
