@@ -562,7 +562,7 @@ impl<'arena, Mapper: TypeMapper> SlabPerThreadState<'arena, Mapper> {
     /// Allocate an object from this shard
     ///
     /// Does *NOT* initialize any of the resulting memory
-    pub fn allocate<T: TypeMappable<Mapper>>(&'arena self) -> (&'arena MaybeUninit<T>, u64) {
+    pub fn allocate<T: TypeMappable<Mapper>>(&'arena self) -> (&'arena mut MaybeUninit<T>, u64) {
         let type_bin = Mapper::type_to_bin::<T>();
         let ty_state = &self.per_ty_state.borrow()[type_bin];
         let gen_ent = &self.generation.borrow()[type_bin];
