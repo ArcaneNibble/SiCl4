@@ -75,19 +75,27 @@ const SPIN_LIMIT: usize = 1;
 #[derive(Debug)]
 pub struct LockedObj<T> {
     /// R/W lock
-    lock_and_generation: AtomicU64,
+    pub(crate) lock_and_generation: AtomicU64,
     /// Number of readers/writers, only when priority is used
     ///
     /// `bits[63]` = has a writer
     /// `bits[62:0]` = readers
     num_rw: UnsafeCell<u64>,
     /// Inner data
-    payload: UnsafeCell<T>,
+    pub(crate) payload: UnsafeCell<T>,
 }
 // safety: this is a wrapper for T where we manually enforce the
 // shared xor mutable rules using atomics
 unsafe impl<T: Send + Sync> Send for LockedObj<T> {}
 unsafe impl<T: Send + Sync> Sync for LockedObj<T> {}
+impl<T> LockedObj<T> {
+    pub unsafe fn init(self_: *mut Self, gen: u64, xtra: u64) {
+        (*self_)
+            .lock_and_generation
+            .store(LOCK_GEN_VALID_BIT | (gen << 8) | xtra, Ordering::Relaxed);
+        *(*self_).num_rw.get() = 0;
+    }
+}
 
 /// References to a node that has a lifetime from a particular heap
 ///
@@ -96,8 +104,8 @@ unsafe impl<T: Send + Sync> Sync for LockedObj<T> {}
 ///
 /// These items compare with reference equality, not value equality.
 pub struct ObjRef<'arena, T> {
-    ptr: &'arena LockedObj<T>,
-    gen: u64,
+    pub ptr: &'arena LockedObj<T>,
+    pub gen: u64,
 }
 // fixme justify why auto deriving doesn't work
 impl<'arena, T> Clone for ObjRef<'arena, T> {
