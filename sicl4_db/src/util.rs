@@ -1,4 +1,11 @@
-use std::{fmt, fmt::Write};
+use std::{cell::UnsafeCell, fmt, fmt::Write};
+
+/// Convert `&T` to `&UnsafeCell<T>`
+pub fn to_unsafecell<T>(ptr: &T) -> &UnsafeCell<T> {
+    let t = ptr as *const T as *const UnsafeCell<T>;
+    // SAFETY: `T` and `UnsafeCell<T>` have the same memory layout
+    unsafe { &*t }
+}
 
 /// Divide, rounding up
 pub const fn divroundup(num: usize, divisor: usize) -> usize {
