@@ -73,7 +73,7 @@ const SPIN_LIMIT: usize = 1;
 /// (for preventing ABA problem)
 #[repr(C)]
 #[derive(Debug)]
-struct LockedObj<T> {
+pub struct LockedObj<T> {
     /// R/W lock
     lock_and_generation: AtomicU64,
     /// Number of readers/writers, only when priority is used
