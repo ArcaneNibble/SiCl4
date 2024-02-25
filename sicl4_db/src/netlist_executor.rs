@@ -12,15 +12,11 @@ use std::{
 use crate::{allocator::*, locking::*, netlist::*, stroad::*};
 
 pub trait UnorderedAlgorithm: Send + Sync {
-    fn asdf<'algo_state, 'view, 'arena>(
-        &'algo_state self,
-        view: &'view mut UnorderedAlgorithmThreadView,
-    );
-
-    fn process_node<'algo_state, 'view, 'arena>(
+    fn process_node<'algo_state, 'view, 'arena, 'work_item>(
         &'algo_state self,
         view: &'view mut UnorderedAlgorithmThreadView,
         node: NetlistRef<'arena>,
+        work_item: &'work_item mut WorkItem<'arena, 'work_item>,
     ) -> Result<(), ()>;
 }
 
@@ -77,11 +73,11 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         &mut *self_
     }
 
-    pub fn unpark(&'work_item self) {
+    fn unpark(&'work_item self) {
         todo!()
     }
 
-    pub fn cancel(&'work_item self) {
+    fn cancel(&'work_item self) {
         todo!()
     }
 }
@@ -116,11 +112,15 @@ impl<'arena> NetlistManager<'arena> {
         }
     }
 
-    pub fn run_unordered_algorithm<A: UnorderedAlgorithm>(&'arena self, algo: &A) {
+    pub fn run_unordered_algorithm<A: UnorderedAlgorithm>(
+        &'arena self,
+        algo: &A,
+        queue: &work_queue::Queue<&'arena mut WorkItem<'arena, 'arena>>,
+    ) {
         assert!(!self.in_use.get());
         self.in_use.set(true);
         thread::scope(|s| {
-            for _ in 0..NUM_THREADS_FOR_NOW {
+            for mut local_queue in queue.local_queues() {
                 let heap_thread_shard = self.heap.new_thread();
                 let stroad = &self.stroad;
                 s.spawn(move || {
@@ -128,7 +128,9 @@ impl<'arena> NetlistManager<'arena> {
                         stroad,
                         heap_thread_shard,
                     };
-                    algo.asdf(&mut view);
+                    while let Some(work_item) = local_queue.pop() {
+                        let _ret = algo.process_node(&mut view, work_item.seed_node, work_item);
+                    }
                 });
             }
         });
@@ -141,6 +143,7 @@ pub struct UnorderedAlgorithmThreadView<'arena> {
     stroad: &'arena Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>,
     heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
 }
+impl<'arena> UnorderedAlgorithmThreadView<'arena> {}
 
 #[derive(Debug)]
 pub struct SingleThreadedView<'arena> {
