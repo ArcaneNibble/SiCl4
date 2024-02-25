@@ -47,19 +47,19 @@ const LOCK_GEN_VALID_BIT: u64 = 1 << 63;
 /// Indicates that there *might* be parked work items, only for unordered algorithms
 const LOCK_GEN_MAYBE_PARKED_BIT: u64 = 1 << 7;
 /// Extract the valid bit
-const fn lock_gen_valid(x: u64) -> bool {
+pub const fn lock_gen_valid(x: u64) -> bool {
     x & LOCK_GEN_VALID_BIT != 0
 }
 /// Extract the generation counter
-const fn lock_gen_gen(x: u64) -> u64 {
+pub const fn lock_gen_gen(x: u64) -> u64 {
     (x >> 8) & 0x7FFFFFFFFFFFFF
 }
 /// Extract the "maybe has parked" bit
-const fn lock_gen_maybe_parked(x: u64) -> bool {
+pub const fn lock_gen_maybe_parked(x: u64) -> bool {
     x & LOCK_GEN_MAYBE_PARKED_BIT != 0
 }
 /// Extracts the reader/writer count, only for unordered algorithms
-const fn lock_gen_rwlock(x: u64) -> u8 {
+pub const fn lock_gen_rwlock(x: u64) -> u8 {
     (x & 0x7F) as u8
 }
 
@@ -73,16 +73,16 @@ const SPIN_LIMIT: usize = 1;
 /// (for preventing ABA problem)
 #[repr(C)]
 #[derive(Debug)]
-struct LockedObj<T> {
+pub struct LockedObj<T> {
     /// R/W lock
-    lock_and_generation: AtomicU64,
+    pub(crate) lock_and_generation: AtomicU64,
     /// Number of readers/writers, only when priority is used
     ///
     /// `bits[63]` = has a writer
     /// `bits[62:0]` = readers
     num_rw: UnsafeCell<u64>,
     /// Inner data
-    payload: UnsafeCell<T>,
+    pub(crate) payload: UnsafeCell<T>,
 }
 // safety: this is a wrapper for T where we manually enforce the
 // shared xor mutable rules using atomics
@@ -96,8 +96,8 @@ unsafe impl<T: Send + Sync> Sync for LockedObj<T> {}
 ///
 /// These items compare with reference equality, not value equality.
 pub struct ObjRef<'arena, T> {
-    ptr: &'arena LockedObj<T>,
-    gen: u64,
+    pub ptr: &'arena LockedObj<T>,
+    pub gen: u64,
 }
 // fixme justify why auto deriving doesn't work
 impl<'arena, T> Clone for ObjRef<'arena, T> {
