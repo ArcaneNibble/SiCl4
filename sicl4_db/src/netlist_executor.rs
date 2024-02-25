@@ -6,13 +6,20 @@ use std::{
     mem::{self, MaybeUninit},
     ops::{Deref, DerefMut},
     sync::atomic::Ordering,
+    thread,
 };
 
 use crate::{allocator::*, locking::*, netlist::*, stroad::*};
 
-pub trait UnorderedAlgorithm {
-    fn process_node<'algo_state, 'arena>(
+pub trait UnorderedAlgorithm: Send + Sync {
+    fn asdf<'algo_state, 'view, 'arena>(
         &'algo_state self,
+        view: &'view mut UnorderedAlgorithmThreadView,
+    );
+
+    fn process_node<'algo_state, 'view, 'arena>(
+        &'algo_state self,
+        view: &'view mut UnorderedAlgorithmThreadView,
         node: NetlistRef<'arena>,
     ) -> Result<(), ()>;
 }
@@ -44,14 +51,14 @@ impl<'arena, 'work_item> LockInstPayload for WorkItemPayload<'arena, 'work_item>
     where
         Self: Sized,
     {
-        todo!()
+        e.payload.w.cancel()
     }
 
     fn unpark<'lock_inst, K>(e: &'lock_inst mut LockInstance<'lock_inst, K, Self>)
     where
         Self: Sized,
     {
-        todo!()
+        e.payload.w.unpark()
     }
 }
 
@@ -69,6 +76,14 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         (*self_).seed_node = node;
         &mut *self_
     }
+
+    pub fn unpark(&'work_item self) {
+        todo!()
+    }
+
+    pub fn cancel(&'work_item self) {
+        todo!()
+    }
 }
 
 /// Top-level netlist + work items unified data structure
@@ -77,7 +92,7 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
 #[derive(Debug)]
 pub struct NetlistManager<'arena> {
     heap: SlabRoot<'arena, NetlistTypeMapper>,
-    // stroad: Box<Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>>,
+    stroad: Box<Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>>,
     /// Ensure that this isn't Sync (only various sub-accessors are),
     /// and that only one algorithm can be running at once
     in_use: Cell<bool>,
@@ -87,7 +102,7 @@ impl<'arena> NetlistManager<'arena> {
     pub fn new() -> Self {
         Self {
             heap: SlabRoot::new(),
-            // stroad: Stroad::new(),
+            stroad: Stroad::new(),
             in_use: Cell::new(false),
         }
     }
@@ -101,23 +116,30 @@ impl<'arena> NetlistManager<'arena> {
         }
     }
 
-    // pub fn run_unordered_algorithm<A: UnorderedAlgorithm>(&'arena self, algo: A) {
-    //     thread::scope(|s| {
-    //         for _ in 0..NUM_THREADS_FOR_NOW {
-    //             s.spawn(move || {
-    //                 let thread_heap_shard = self.new_thread();
-    //             });
-    //         }
-    //     })
-    // }
+    pub fn run_unordered_algorithm<A: UnorderedAlgorithm>(&'arena self, algo: &A) {
+        assert!(!self.in_use.get());
+        self.in_use.set(true);
+        thread::scope(|s| {
+            for _ in 0..NUM_THREADS_FOR_NOW {
+                let heap_thread_shard = self.heap.new_thread();
+                let stroad = &self.stroad;
+                s.spawn(move || {
+                    let mut view = UnorderedAlgorithmThreadView {
+                        stroad,
+                        heap_thread_shard,
+                    };
+                    algo.asdf(&mut view);
+                });
+            }
+        });
+        self.in_use.set(false);
+    }
+}
 
-    // /// Get a thread shard for performing operations on the netlist
-    // pub fn new_thread(&'arena self) -> NetlistManagerThread<'arena> {
-    //     NetlistManagerThread {
-    //         heap_shard: self.heap.new_thread(),
-    //         stroad: &self.stroad,
-    //     }
-    // }
+#[derive(Debug)]
+pub struct UnorderedAlgorithmThreadView<'arena> {
+    stroad: &'arena Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>,
+    heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
 }
 
 #[derive(Debug)]
@@ -267,5 +289,7 @@ mod tests {
         dbg!(&*wire);
         let work_item = view.new_work_item(cell.x.into());
         dbg!(work_item);
+        drop(view);
+        let _ = cell.x;
     }
 }
