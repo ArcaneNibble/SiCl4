@@ -35,6 +35,8 @@ use std::cell::{Cell, UnsafeCell};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::mem;
+use std::ptr::addr_of_mut;
 use std::sync::atomic::Ordering;
 
 use crate::allocator::*;
@@ -80,7 +82,7 @@ pub struct LockedObj<T> {
     ///
     /// `bits[63]` = has a writer
     /// `bits[62:0]` = readers
-    num_rw: UnsafeCell<u64>,
+    pub(crate) num_rw: UnsafeCell<u64>,
     /// Inner data
     pub(crate) payload: UnsafeCell<T>,
 }
@@ -106,6 +108,15 @@ impl<T> LockedObj<T> {
 pub struct ObjRef<'arena, T> {
     pub ptr: &'arena LockedObj<T>,
     pub gen: u64,
+}
+impl<'arena, T> ObjRef<'arena, T> {
+    pub fn type_erase(self) -> TypeErasedObjRef<'arena> {
+        TypeErasedObjRef {
+            // safety: repr(C) and we don't actually access the payload
+            ptr: unsafe { mem::transmute(self.ptr) },
+            gen: self.gen,
+        }
+    }
 }
 // fixme justify why auto deriving doesn't work
 impl<'arena, T> Clone for ObjRef<'arena, T> {
@@ -139,9 +150,12 @@ impl<'arena, T> Hash for ObjRef<'arena, T> {
     }
 }
 
+/// [ObjRef], except ignoring what's in the payload (because the lock itself doesn't care)
+pub type TypeErasedObjRef<'arena> = ObjRef<'arena, ()>;
+
 /// States that a lock instance can be in
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum LockState {
+pub enum LockState {
     Unlocked,
     Parked,
     LockedForUnorderedRead,
@@ -163,20 +177,20 @@ impl Default for LockState {
 ///
 /// This is *not* a RAII guard object, as the way we implement
 /// that this object is immobile (self-lifetimes) prevents implementing [Drop]
-pub struct RWLock<'arena, 'lock_inst, T, P> {
+pub struct RWLock<'arena, 'lock_inst, P> {
     /// State the lock is in
-    state: Cell<LockState>,
+    pub(crate) state: Cell<LockState>,
     /// Object that this lock is protecting / potentially accessing
-    pub p: ObjRef<'arena, T>,
+    pub(crate) p: TypeErasedObjRef<'arena>,
     /// Stroad module's state data
     // FIXME does this enforce too much invariance on lifetimes?
-    stroad_state: UnsafeCell<LockInstance<'lock_inst, ObjRef<'arena, T>, P>>,
+    stroad_state: UnsafeCell<LockInstance<'lock_inst, TypeErasedObjRef<'arena>, P>>,
     /// Prevent this type from being `Sync`, and
     /// ensure `'lock_inst` lifetime is invariant
     _pd1: PhantomData<UnsafeCell<&'lock_inst ()>>,
 }
 
-impl<'arena, 'lock_inst, T, P: Debug> Debug for RWLock<'arena, 'lock_inst, T, P> {
+impl<'arena, 'lock_inst, P: Debug> Debug for RWLock<'arena, 'lock_inst, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut dbg = f.debug_struct("RWLock");
         dbg.field("state", &(self.state.get()));
@@ -185,9 +199,9 @@ impl<'arena, 'lock_inst, T, P: Debug> Debug for RWLock<'arena, 'lock_inst, T, P>
         dbg.finish()
     }
 }
-impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P> {
+impl<'arena, 'lock_inst, P: LockInstPayload> RWLock<'arena, 'lock_inst, P> {
     /// Create a new lock state object
-    pub fn new(obj: ObjRef<'arena, T>, payload: P) -> Self {
+    pub fn new(obj: TypeErasedObjRef<'arena>, payload: P) -> Self {
         Self {
             state: Cell::new(LockState::Unlocked),
             p: obj,
@@ -197,10 +211,24 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
     }
 
     /// Initialize a lock object in place, *EXCEPT* the external payload
-    pub unsafe fn init(self_: *mut Self, obj: ObjRef<'arena, T>) {
+    pub unsafe fn init(self_: *mut Self, obj: TypeErasedObjRef<'arena>) {
         (*self_).state = Cell::new(LockState::Unlocked);
         (*self_).p = obj;
         LockInstance::init((*self_).stroad_state.get());
+    }
+
+    /// Ugly get access to the payload stored inside, so that it can be init-ed
+    pub(crate) unsafe fn unsafe_inner_payload_ptr(self_: *const Self) -> *mut P {
+        let stroad_state = (*self_).stroad_state.get();
+        addr_of_mut!((*stroad_state).payload)
+    }
+
+    /// Ugly get access to the payload stored inside, because we crammed a boolean there
+    pub(crate) fn inner_payload_ref(&'lock_inst self) -> &'lock_inst P {
+        unsafe {
+            let stroad_state = self.stroad_state.get();
+            &(*stroad_state).payload
+        }
     }
 
     /// Try to acquire an exclusive read/write lock, for an unordered algorithm
@@ -209,7 +237,7 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
     /// where the bool indicates whether or not the locking was successful.
     pub fn unordered_try_write<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, ObjRef<'arena, T>, P>,
+        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) -> Result<bool, ()> {
         assert!(self.state.get() == LockState::Unlocked);
         let mut lock_inst = unsafe {
@@ -321,7 +349,7 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
     /// where the bool indicates whether or not the locking was successful.
     pub fn unordered_try_read<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, ObjRef<'arena, T>, P>,
+        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) -> Result<bool, ()> {
         assert!(self.state.get() == LockState::Unlocked);
         let mut lock_inst = unsafe {
@@ -434,7 +462,7 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
     /// where the bool indicates whether or not the locking was successful.
     pub fn ordered_try_write<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, ObjRef<'arena, T>, P>,
+        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         prio: u64,
     ) -> Result<bool, ()> {
         assert!(self.state.get() == LockState::Unlocked);
@@ -488,7 +516,7 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
     /// where the bool indicates whether or not the locking was successful.
     pub fn ordered_try_read<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, ObjRef<'arena, T>, P>,
+        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         prio: u64,
     ) -> Result<bool, ()> {
         assert!(self.state.get() == LockState::Unlocked);
@@ -546,7 +574,7 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
     /// * you can only call this when no references to the protected data exist
     pub unsafe fn unlock<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, ObjRef<'arena, T>, P>,
+        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) {
         match self.state.get() {
             LockState::Unlocked => {
@@ -567,7 +595,7 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
     /// Always unparks everything
     fn unlock_unordered_write<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, ObjRef<'arena, T>, P>,
+        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) {
         // we have exclusive access
         // we need to push out all previous memory accesses
@@ -595,7 +623,7 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
     /// Unparks if we are the final reader
     fn unlock_unordered_read<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, ObjRef<'arena, T>, P>,
+        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) {
         let mut old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
         loop {
@@ -636,7 +664,7 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
     /// Always unparks everything
     fn unlock_ordered_write<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, ObjRef<'arena, T>, P>,
+        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) {
         let lock_inst = unsafe {
             // safety: this can only be called when we hold the lock
@@ -665,7 +693,7 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
     /// Unparks if we are the final reader *and* there isn't a writer
     fn unlock_ordered_read<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, ObjRef<'arena, T>, P>,
+        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) {
         let lock_inst = unsafe {
             // safety: this can only be called when we hold the lock
@@ -746,11 +774,11 @@ mod tests {
         let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
         dbg!(&obj_ref);
 
-        let stroad = Stroad::<ObjRefLockedU32, LockingTestingPayload>::new();
+        let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
 
         #[allow(unused_mut)]
-        let mut lock = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let mut lock = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         dbg!(&lock);
@@ -765,7 +793,7 @@ mod tests {
         dbg!(&lock);
 
         // can't work
-        // let mut _lock2 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
+        // let mut _lock2 = RWLock::<'_, '_, LockingTestingPayload>::new(
         //     obj_ref,
         //     LockingTestingPayload::default(),
         // );
@@ -788,14 +816,14 @@ mod tests {
             };
             let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
             drop(thread_shard);
-            let stroad = &*Box::leak(Stroad::<ObjRefLockedU32, LockingTestingPayload>::new());
+            let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
 
             let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
             let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
 
             let t1 = loom::thread::spawn(move || {
                 let lock = &*Box::leak(Box::new(RWLock::new(
-                    obj_ref,
+                    obj_ref.type_erase(),
                     LockingTestingPayload::default(),
                 )));
                 let ret = lock.unordered_try_write(stroad);
@@ -805,7 +833,7 @@ mod tests {
             });
             let t2 = loom::thread::spawn(move || {
                 let lock = &*Box::leak(Box::new(RWLock::new(
-                    obj_ref,
+                    obj_ref.type_erase(),
                     LockingTestingPayload::default(),
                 )));
                 let ret = lock.unordered_try_write(stroad);
@@ -841,14 +869,14 @@ mod tests {
             };
             let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
             drop(thread_shard);
-            let stroad = &*Box::leak(Stroad::<ObjRefLockedU32, LockingTestingPayload>::new());
+            let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
 
             let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
             let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
 
             let t1 = loom::thread::spawn(move || {
                 let lock = &*Box::leak(Box::new(RWLock::new(
-                    obj_ref,
+                    obj_ref.type_erase(),
                     LockingTestingPayload::default(),
                 )));
                 let ret = lock.unordered_try_read(stroad);
@@ -858,7 +886,7 @@ mod tests {
             });
             let t2 = loom::thread::spawn(move || {
                 let lock = &*Box::leak(Box::new(RWLock::new(
-                    obj_ref,
+                    obj_ref.type_erase(),
                     LockingTestingPayload::default(),
                 )));
                 let ret = lock.unordered_try_write(stroad);
@@ -894,14 +922,14 @@ mod tests {
             };
             let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
             drop(thread_shard);
-            let stroad = &*Box::leak(Stroad::<ObjRefLockedU32, LockingTestingPayload>::new());
+            let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
 
             let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
             let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
 
             let t1 = loom::thread::spawn(move || {
                 let lock = &*Box::leak(Box::new(RWLock::new(
-                    obj_ref,
+                    obj_ref.type_erase(),
                     LockingTestingPayload::default(),
                 )));
                 let ret = lock.unordered_try_read(stroad);
@@ -911,7 +939,7 @@ mod tests {
             });
             let t2 = loom::thread::spawn(move || {
                 let lock = &*Box::leak(Box::new(RWLock::new(
-                    obj_ref,
+                    obj_ref.type_erase(),
                     LockingTestingPayload::default(),
                 )));
                 let ret = lock.unordered_try_read(stroad);
@@ -947,17 +975,17 @@ mod tests {
             };
             let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
             drop(thread_shard);
-            let stroad = &*Box::leak(Stroad::<ObjRefLockedU32, LockingTestingPayload>::new());
+            let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
 
             let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
             let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
 
             let t1_lock = &*Box::leak(Box::new(RWLock::new(
-                obj_ref,
+                obj_ref.type_erase(),
                 LockingTestingPayload::default(),
             )));
             let t2_lock = &*Box::leak(Box::new(RWLock::new(
-                obj_ref,
+                obj_ref.type_erase(),
                 LockingTestingPayload::default(),
             )));
 
@@ -1042,10 +1070,10 @@ mod tests {
         let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
         drop(thread_shard);
 
-        let stroad = Stroad::<ObjRefLockedU32, LockingTestingPayload>::new();
+        let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
 
-        let lock_0 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_0 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_0.unordered_try_write(&stroad);
@@ -1055,8 +1083,8 @@ mod tests {
             0x800000000000007f | (gen << 8)
         );
 
-        let lock_1 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_1 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_1.unordered_try_write(&stroad);
@@ -1092,10 +1120,10 @@ mod tests {
         let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
         drop(thread_shard);
 
-        let stroad = Stroad::<ObjRefLockedU32, LockingTestingPayload>::new();
+        let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
 
-        let lock_0 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_0 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_0.unordered_try_read(&stroad);
@@ -1105,8 +1133,8 @@ mod tests {
             0x8000000000000001 | (gen << 8)
         );
 
-        let lock_1 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_1 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_1.unordered_try_read(&stroad);
@@ -1116,8 +1144,8 @@ mod tests {
             0x8000000000000002 | (gen << 8)
         );
 
-        let lock_2 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_2 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_2.unordered_try_write(&stroad);
@@ -1159,26 +1187,26 @@ mod tests {
         let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
         drop(thread_shard);
 
-        let stroad = Stroad::<ObjRefLockedU32, LockingTestingPayload>::new();
+        let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
 
-        let lock_0 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_0 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_0.ordered_try_read(&stroad, 0);
         assert_eq!(ret, Ok(true));
         assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 1);
 
-        let lock_1 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_1 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_1.ordered_try_write(&stroad, 1);
         assert_eq!(ret, Ok(true));
         assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
-        let lock_2 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_2 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_2.ordered_try_read(&stroad, 2);
@@ -1213,42 +1241,42 @@ mod tests {
         let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
         drop(thread_shard);
 
-        let stroad = Stroad::<ObjRefLockedU32, LockingTestingPayload>::new();
+        let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
 
-        let lock_0 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_0 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_0.ordered_try_read(&stroad, 0);
         assert_eq!(ret, Ok(true));
         assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 1);
 
-        let lock_1 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_1 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_1.ordered_try_write(&stroad, 1);
         assert_eq!(ret, Ok(true));
         assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
-        let lock_2 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_2 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_2.ordered_try_read(&stroad, 2);
         assert_eq!(ret, Ok(false));
         assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
-        let lock_3 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_3 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_3.ordered_try_read(&stroad, 3);
         assert_eq!(ret, Ok(false));
         assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
-        let lock_4 = RWLock::<'_, '_, u32, LockingTestingPayload>::new(
-            obj_ref,
+        let lock_4 = RWLock::<'_, '_, LockingTestingPayload>::new(
+            obj_ref.type_erase(),
             LockingTestingPayload::default(),
         );
         let ret = lock_4.ordered_try_write(&stroad, 3);
