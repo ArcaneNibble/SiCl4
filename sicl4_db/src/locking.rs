@@ -196,6 +196,13 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
         }
     }
 
+    /// Initialize a lock object in place, *EXCEPT* the external payload
+    pub unsafe fn init(self_: *mut Self, obj: ObjRef<'arena, T>) {
+        (*self_).state = Cell::new(LockState::Unlocked);
+        (*self_).p = obj;
+        LockInstance::init((*self_).stroad_state.get());
+    }
+
     /// Try to acquire an exclusive read/write lock, for an unordered algorithm
     ///
     /// Returns `Err(())` if the object has been deleted, or else `Ok(bool)`,
