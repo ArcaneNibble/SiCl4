@@ -6,7 +6,7 @@ use crate::locking::*;
 #[derive(Debug)]
 pub struct NetlistCell<'arena> {
     // todo
-    _wire: Option<NetlistWireRef<'arena>>,
+    pub _wire: Option<NetlistWireRef<'arena>>,
 }
 pub type NetlistCellRef<'arena> = ObjRef<'arena, NetlistCell<'arena>>;
 impl<'arena> NetlistCell<'arena> {
@@ -22,7 +22,7 @@ impl<'arena> NetlistCell<'arena> {
 #[derive(Debug)]
 pub struct NetlistWire<'arena> {
     // todo
-    _cell: Option<NetlistCellRef<'arena>>,
+    pub _cell: Option<NetlistCellRef<'arena>>,
 }
 pub type NetlistWireRef<'arena> = ObjRef<'arena, NetlistWire<'arena>>;
 impl<'arena> NetlistWire<'arena> {
