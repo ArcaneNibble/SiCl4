@@ -188,6 +188,42 @@ impl<'arena> SingleThreadedView<'arena> {
         }
     }
 
+    pub fn get_cell<'wrapper>(
+        &'wrapper mut self,
+        obj: NetlistCellRef<'arena>,
+    ) -> Option<SingleThreadedCellGuard<'arena>> {
+        let stored_lock_gen = obj.ptr.lock_and_generation.load(Ordering::Relaxed);
+        if !lock_gen_valid(stored_lock_gen) || lock_gen_gen(stored_lock_gen) != obj.gen {
+            return None;
+        }
+        if lock_gen_rwlock(stored_lock_gen) != 0 {
+            // prevent multiple locks on the same node
+            return None;
+        }
+        obj.ptr
+            .lock_and_generation
+            .fetch_or(0x7f, Ordering::Relaxed);
+        Some(SingleThreadedObjGuard { x: obj })
+    }
+
+    pub fn get_wire<'wrapper>(
+        &'wrapper mut self,
+        obj: NetlistWireRef<'arena>,
+    ) -> Option<SingleThreadedWireGuard<'arena>> {
+        let stored_lock_gen = obj.ptr.lock_and_generation.load(Ordering::Relaxed);
+        if !lock_gen_valid(stored_lock_gen) || lock_gen_gen(stored_lock_gen) != obj.gen {
+            return None;
+        }
+        if lock_gen_rwlock(stored_lock_gen) != 0 {
+            // prevent multiple locks on the same node
+            return None;
+        }
+        obj.ptr
+            .lock_and_generation
+            .fetch_or(0x7f, Ordering::Relaxed);
+        Some(SingleThreadedObjGuard { x: obj })
+    }
+
     pub fn delete_cell<'wrapper>(&'wrapper mut self, guard: SingleThreadedCellGuard<'arena>) {
         guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
         unsafe {
@@ -293,6 +329,13 @@ mod tests {
         let work_item = view.new_work_item(cell.x.into());
         dbg!(work_item);
         drop(view);
-        let _ = cell.x;
+        let cell_ref = cell.x;
+        drop(cell);
+
+        let mut view = manager.access_single_threaded();
+        let cell2 = view.get_cell(cell_ref);
+        dbg!(&cell2);
+        let cell3 = view.get_cell(cell_ref);
+        dbg!(&cell3);
     }
 }
