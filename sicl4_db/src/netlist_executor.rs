@@ -2,7 +2,8 @@
 
 use std::{
     alloc::Layout,
-    cell::Cell,
+    cell::{Cell, UnsafeCell},
+    marker::PhantomData,
     mem::{self, MaybeUninit},
     ops::{Deref, DerefMut},
     sync::atomic::Ordering,
@@ -45,12 +46,22 @@ impl<'arena> From<NetlistWireRef<'arena>> for NetlistRef<'arena> {
         Self::Wire(value)
     }
 }
+impl<'arena> NetlistRef<'arena> {
+    fn type_erase(self) -> TypeErasedObjRef<'arena> {
+        match self {
+            NetlistRef::Cell(x) => x.type_erase(),
+            NetlistRef::Wire(x) => x.type_erase(),
+        }
+    }
+}
 
 const NUM_THREADS_FOR_NOW: usize = 1;
 const MAX_ORDERED_LOCKS_PER_WORK_ITEM: usize = 4;
 
+#[derive(Debug)]
 struct WorkItemPayload<'arena, 'work_item> {
     w: &'work_item WorkItem<'arena, 'work_item>,
+    guard_handed_out: Cell<bool>,
 }
 impl<'arena, 'work_item> LockInstPayload for WorkItemPayload<'arena, 'work_item> {
     fn cancel<'lock_inst, K>(e: &'lock_inst mut LockInstance<'lock_inst, K, Self>)
@@ -71,17 +82,19 @@ impl<'arena, 'work_item> LockInstPayload for WorkItemPayload<'arena, 'work_item>
 #[derive(Debug)]
 pub struct WorkItem<'arena, 'work_item> {
     seed_node: NetlistRef<'arena>,
-    locks_used: usize,
+    locks_used: Cell<usize>,
     locks: [MaybeUninit<
-        RWLock<'arena, 'work_item, NetlistRef<'arena>, WorkItemPayload<'arena, 'work_item>>,
+        UnsafeCell<RWLock<'arena, 'work_item, WorkItemPayload<'arena, 'work_item>>>,
     >; MAX_ORDERED_LOCKS_PER_WORK_ITEM],
 }
 // xxx fixme wtf is this
+// xxx fixme the entire safety of this needs to be figured out, since it has unsafe inner mutability
+unsafe impl<'arena, 'work_item> Send for WorkItem<'arena, 'work_item> {}
 unsafe impl<'arena, 'work_item> Sync for WorkItem<'arena, 'work_item> {}
 impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     pub unsafe fn init(self_: *mut Self, node: NetlistRef<'arena>) -> &'work_item mut Self {
         (*self_).seed_node = node;
-        (*self_).locks_used = 0;
+        (*self_).locks_used = Cell::new(0);
         &mut *self_
     }
 
@@ -94,25 +107,26 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     }
 
     fn next_lock(
-        &'work_item mut self,
+        &'work_item self,
         obj: NetlistRef<'arena>,
     ) -> (
         usize,
-        &'work_item mut RWLock<
-            'arena,
-            'work_item,
-            NetlistRef<'arena>,
-            WorkItemPayload<'arena, 'work_item>,
-        >,
+        &'work_item mut RWLock<'arena, 'work_item, WorkItemPayload<'arena, 'work_item>>,
     ) {
-        if self.locks_used == MAX_ORDERED_LOCKS_PER_WORK_ITEM {
+        let lock_idx = self.locks_used.get();
+        if lock_idx == MAX_ORDERED_LOCKS_PER_WORK_ITEM {
             todo!("need to allocate a spill block?");
         }
-        let lock_ptr = self.locks[self.locks_used].as_mut_ptr();
+        self.locks_used.set(lock_idx + 1);
         unsafe {
-            RWLock::init(lock_ptr, obj);
+            let lock_ptr = (*self.locks[lock_idx].as_ptr()).get();
+            RWLock::init(lock_ptr, obj.type_erase());
+            let inner_payload = RWLock::unsafe_inner_payload_ptr(lock_ptr);
+            // lifetimes should've made it s.t. this is pinned in place
+            (*inner_payload).w = self;
+            (*inner_payload).guard_handed_out = Cell::new(false);
+            (lock_idx, &mut *lock_ptr)
         }
-        todo!()
     }
 }
 
@@ -122,7 +136,7 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
 #[derive(Debug)]
 pub struct NetlistManager<'arena> {
     heap: SlabRoot<'arena, NetlistTypeMapper>,
-    stroad: Box<Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>>,
+    stroad: Box<Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPayload<'arena, 'arena>>>,
     /// Ensure that this isn't Sync (only various sub-accessors are),
     /// and that only one algorithm can be running at once
     in_use: Cell<bool>,
@@ -192,31 +206,73 @@ impl<'arena> NetlistManager<'arena> {
 
 #[derive(Debug)]
 pub struct UnorderedAlgorithmROView<'arena> {
-    stroad: &'arena Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>,
+    stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPayload<'arena, 'arena>>,
     heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
 }
 impl<'arena> UnorderedAlgorithmROView<'arena> {
     pub fn try_lock_cell<'wrapper>(
         &'wrapper mut self,
-        work_item: &'arena mut WorkItem<'arena, 'arena>,
+        work_item: &'arena WorkItem<'arena, 'arena>,
         obj: NetlistCellRef<'arena>,
         want_write: bool,
     ) -> Result<UnorderedObjROGuard<'arena, NetlistCell<'arena>>, ()> {
-        todo!()
+        let (_lock_idx, lock) = work_item.next_lock(NetlistRef::Cell(obj));
+        let lock_gotten = if !want_write {
+            lock.unordered_try_read(self.stroad)?
+        } else {
+            lock.unordered_try_write(self.stroad)?
+        };
+        if !lock_gotten {
+            return Err(());
+        }
+        Ok(UnorderedObjROGuard {
+            lock,
+            _pd1: PhantomData,
+        })
     }
 }
 
 #[derive(Debug)]
 pub struct UnorderedAlgorithmRWView<'arena> {
-    stroad: &'arena Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>,
+    stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPayload<'arena, 'arena>>,
     heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
 }
-impl<'arena> UnorderedAlgorithmRWView<'arena> {}
+impl<'arena> UnorderedAlgorithmRWView<'arena> {
+    pub fn get_cell_read<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistCellRef<'arena>,
+    ) -> UnorderedObjROGuard<'arena, NetlistCell<'arena>> {
+        for lock_idx in 0..work_item.locks_used.get() {
+            let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
+            if lock_i.p == obj.type_erase() {
+                if lock_i.state.get() != LockState::LockedForUnorderedRead
+                    && lock_i.state.get() != LockState::LockedForUnorderedWrite
+                {
+                    panic!("Tried to access a node in the wrong state")
+                }
+                if lock_i.inner_payload_ref().guard_handed_out.get() {
+                    panic!("Tried to access a node multiple times")
+                    // xxx this is meh
+                }
+                lock_i.inner_payload_ref().guard_handed_out.set(true);
+                return UnorderedObjROGuard {
+                    lock: lock_i,
+                    _pd1: PhantomData,
+                };
+            }
+        }
+        panic!("Tried to access a node that wasn't tagged in RO phase")
+    }
+}
 
 #[derive(Debug)]
 pub struct UnorderedObjROGuard<'arena, T> {
+    lock: &'arena RWLock<'arena, 'arena, WorkItemPayload<'arena, 'arena>>,
+    // todo fixme variance?
+    _pd1: PhantomData<&'arena T>,
     // todo
-    pub x: ObjRef<'arena, T>,
+    // pub x: ObjRef<'arena, T>,
 }
 
 // the following code is for *single-threaded* operation
@@ -338,6 +394,11 @@ type SingleThreadedWireGuard<'arena> = SingleThreadedObjGuard<'arena, NetlistWir
 #[derive(Debug)]
 pub struct SingleThreadedObjGuard<'arena, T> {
     pub x: ObjRef<'arena, T>,
+}
+impl<'arena, T> SingleThreadedObjGuard<'arena, T> {
+    pub fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
+        self.x
+    }
 }
 impl<'arena, T> Drop for SingleThreadedObjGuard<'arena, T> {
     fn drop(&mut self) {
