@@ -1,0 +1,598 @@
+use std::alloc::Layout;
+
+use super::*;
+
+#[derive(Default, Debug)]
+struct LockingTestingPayload {
+    unparked: bool,
+    cancelled: bool,
+}
+impl StroadToWorkItemLink for LockingTestingPayload {
+    fn unpark<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
+    where
+        Self: Sized,
+    {
+        e.work_item_link.unparked = true;
+    }
+
+    fn cancel<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
+    where
+        Self: Sized,
+    {
+        e.work_item_link.cancelled = true;
+    }
+}
+
+struct JustU32Mapper {}
+impl TypeMapper for JustU32Mapper {
+    type BinsArrayTy<T> = [T; 1];
+    const LAYOUTS: &'static [&'static [Layout]] = &[&[Layout::new::<LockedObj<u32>>()]];
+}
+impl TypeMappable<JustU32Mapper> for LockedObj<u32> {
+    const I: usize = 0;
+}
+type ObjRefLockedU32<'arena> = ObjRef<'arena, u32>;
+
+#[test]
+#[ignore = "not automated, human eye verified"]
+fn locking_manual_tests() {
+    let alloc = SlabRoot::<JustU32Mapper>::new();
+    let thread_shard = alloc.new_thread();
+    let (obj, gen) = thread_shard.allocate::<LockedObj<u32>>();
+    let obj = unsafe {
+        let obj_p = obj.as_mut_ptr();
+        (*obj_p).lock_and_generation = AtomicU64::new(LOCK_GEN_VALID_BIT | (gen << 8));
+        (*obj_p).num_rw = UnsafeCell::new(0);
+        (*obj_p).payload = UnsafeCell::new(12345);
+        obj.assume_init_ref()
+    };
+    dbg!(&obj);
+    let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
+    dbg!(&obj_ref);
+
+    let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
+
+    #[allow(unused_mut)]
+    let mut lock = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    dbg!(&lock);
+    let ret = lock.unordered_try_write(&stroad);
+    dbg!(&ret);
+    let _ = ret.is_ok();
+    dbg!(&lock);
+
+    unsafe {
+        lock.unlock(&stroad);
+    }
+    dbg!(&lock);
+
+    // can't work
+    // let mut _lock2 = RWLock::<'_, '_, LockingTestingPayload>::new(
+    //     obj_ref,
+    //     LockingTestingPayload::default(),
+    // );
+    // std::mem::swap(&mut lock, &mut _lock2);
+}
+
+#[cfg(loom)]
+#[test]
+fn locking_loom_unordered_ww_nounlock() {
+    loom::model(|| {
+        let alloc = &*Box::leak(Box::new(SlabRoot::<'static, JustU32Mapper>::new()));
+        let thread_shard = alloc.new_thread();
+        let (obj, gen) = thread_shard.allocate::<LockedObj<u32>>();
+        let obj = unsafe {
+            let obj_p = obj.as_mut_ptr();
+            (*obj_p).lock_and_generation = AtomicU64::new(LOCK_GEN_VALID_BIT | (gen << 8));
+            (*obj_p).num_rw = UnsafeCell::new(0);
+            (*obj_p).payload = UnsafeCell::new(12345);
+            obj.assume_init_ref()
+        };
+        let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
+        drop(thread_shard);
+        let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
+
+        let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
+        let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
+
+        let t1 = loom::thread::spawn(move || {
+            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
+                obj_ref.type_erase(),
+                LockingTestingPayload::default(),
+            )));
+            let ret = lock.unordered_try_write(stroad);
+
+            assert!(ret.is_ok());
+            t1_got_lock.store(ret.unwrap(), Ordering::Relaxed);
+        });
+        let t2 = loom::thread::spawn(move || {
+            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
+                obj_ref.type_erase(),
+                LockingTestingPayload::default(),
+            )));
+            let ret = lock.unordered_try_write(stroad);
+
+            assert!(ret.is_ok());
+            t2_got_lock.store(ret.unwrap(), Ordering::Relaxed);
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let t1_got_lock = t1_got_lock.load(Ordering::Relaxed);
+        let t2_got_lock = t2_got_lock.load(Ordering::Relaxed);
+
+        // one of the two *must* succeed
+        assert!(t1_got_lock != t2_got_lock);
+    });
+}
+
+#[cfg(loom)]
+#[test]
+fn locking_loom_unordered_rw_nounlock() {
+    loom::model(|| {
+        let alloc = &*Box::leak(Box::new(SlabRoot::<'static, JustU32Mapper>::new()));
+        let thread_shard = alloc.new_thread();
+        let (obj, gen) = thread_shard.allocate::<LockedObj<u32>>();
+        let obj = unsafe {
+            let obj_p = obj.as_mut_ptr();
+            (*obj_p).lock_and_generation = AtomicU64::new(LOCK_GEN_VALID_BIT | (gen << 8));
+            (*obj_p).num_rw = UnsafeCell::new(0);
+            (*obj_p).payload = UnsafeCell::new(12345);
+            obj.assume_init_ref()
+        };
+        let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
+        drop(thread_shard);
+        let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
+
+        let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
+        let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
+
+        let t1 = loom::thread::spawn(move || {
+            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
+                obj_ref.type_erase(),
+                LockingTestingPayload::default(),
+            )));
+            let ret = lock.unordered_try_read(stroad);
+
+            assert!(ret.is_ok());
+            t1_got_lock.store(ret.unwrap(), Ordering::Relaxed);
+        });
+        let t2 = loom::thread::spawn(move || {
+            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
+                obj_ref.type_erase(),
+                LockingTestingPayload::default(),
+            )));
+            let ret = lock.unordered_try_write(stroad);
+
+            assert!(ret.is_ok());
+            t2_got_lock.store(ret.unwrap(), Ordering::Relaxed);
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let t1_got_lock = t1_got_lock.load(Ordering::Relaxed);
+        let t2_got_lock = t2_got_lock.load(Ordering::Relaxed);
+
+        // one of the two *must* succeed
+        assert!(t1_got_lock != t2_got_lock);
+    });
+}
+
+#[cfg(loom)]
+#[test]
+fn locking_loom_unordered_rr_nounlock() {
+    loom::model(|| {
+        let alloc = &*Box::leak(Box::new(SlabRoot::<'static, JustU32Mapper>::new()));
+        let thread_shard = alloc.new_thread();
+        let (obj, gen) = thread_shard.allocate::<LockedObj<u32>>();
+        let obj = unsafe {
+            let obj_p = obj.as_mut_ptr();
+            (*obj_p).lock_and_generation = AtomicU64::new(LOCK_GEN_VALID_BIT | (gen << 8));
+            (*obj_p).num_rw = UnsafeCell::new(0);
+            (*obj_p).payload = UnsafeCell::new(12345);
+            obj.assume_init_ref()
+        };
+        let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
+        drop(thread_shard);
+        let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
+
+        let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
+        let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
+
+        let t1 = loom::thread::spawn(move || {
+            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
+                obj_ref.type_erase(),
+                LockingTestingPayload::default(),
+            )));
+            let ret = lock.unordered_try_read(stroad);
+
+            assert!(ret.is_ok());
+            t1_got_lock.store(ret.unwrap(), Ordering::Relaxed);
+        });
+        let t2 = loom::thread::spawn(move || {
+            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
+                obj_ref.type_erase(),
+                LockingTestingPayload::default(),
+            )));
+            let ret = lock.unordered_try_read(stroad);
+
+            assert!(ret.is_ok());
+            t2_got_lock.store(ret.unwrap(), Ordering::Relaxed);
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let t1_got_lock = t1_got_lock.load(Ordering::Relaxed);
+        let t2_got_lock = t2_got_lock.load(Ordering::Relaxed);
+
+        // *both* must succeed
+        assert!(t1_got_lock && t2_got_lock);
+    });
+}
+
+#[cfg(loom)]
+#[test]
+fn locking_loom_unordered_ww_unlock() {
+    loom::model(|| {
+        let alloc = &*Box::leak(Box::new(SlabRoot::<'static, JustU32Mapper>::new()));
+        let thread_shard = alloc.new_thread();
+        let (obj, gen) = thread_shard.allocate::<LockedObj<u32>>();
+        let obj = unsafe {
+            let obj_p = obj.as_mut_ptr();
+            (*obj_p).lock_and_generation = AtomicU64::new(LOCK_GEN_VALID_BIT | (gen << 8));
+            (*obj_p).num_rw = UnsafeCell::new(0);
+            (*obj_p).payload = UnsafeCell::new(12345);
+            obj.assume_init_ref()
+        };
+        let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
+        drop(thread_shard);
+        let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
+
+        let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
+        let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
+
+        let t1_lock = &*Box::leak(Box::new(LockAndStroadData::new(
+            obj_ref.type_erase(),
+            LockingTestingPayload::default(),
+        )));
+        let t2_lock = &*Box::leak(Box::new(LockAndStroadData::new(
+            obj_ref.type_erase(),
+            LockingTestingPayload::default(),
+        )));
+
+        // println!("~~~~~ MODEL ITER ~~~~~");
+
+        let t1 = loom::thread::spawn(move || {
+            let ret = t1_lock.unordered_try_write(stroad);
+
+            assert!(ret.is_ok());
+            if ret.unwrap() {
+                t1_got_lock.store(true, Ordering::Relaxed);
+                // needed in order to simulate processing taking some time
+                loom::thread::yield_now();
+                unsafe {
+                    t1_lock.unlock(stroad);
+                }
+            }
+        });
+        let t2 = loom::thread::spawn(move || {
+            let ret = t2_lock.unordered_try_write(stroad);
+
+            assert!(ret.is_ok());
+            if ret.unwrap() {
+                t2_got_lock.store(true, Ordering::Relaxed);
+                // needed in order to simulate processing taking some time
+                loom::thread::yield_now();
+                // drop guard
+                unsafe {
+                    t2_lock.unlock(stroad);
+                }
+            }
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let t1_got_lock = t1_got_lock.load(Ordering::Relaxed);
+        let t2_got_lock = t2_got_lock.load(Ordering::Relaxed);
+        // xxx
+        unsafe {
+            match (t1_got_lock, t2_got_lock) {
+                (true, true) => {
+                    assert!(!(*t1_lock.stroad_state.get()).payload.unparked);
+                    assert!(!(*t1_lock.stroad_state.get()).payload.cancelled);
+                    assert!(!(*t2_lock.stroad_state.get()).payload.unparked);
+                    assert!(!(*t2_lock.stroad_state.get()).payload.cancelled);
+                }
+                (true, false) => {
+                    assert!(!(*t1_lock.stroad_state.get()).payload.unparked);
+                    assert!(!(*t1_lock.stroad_state.get()).payload.cancelled);
+                    assert!((*t2_lock.stroad_state.get()).payload.unparked);
+                    assert!(!(*t2_lock.stroad_state.get()).payload.cancelled);
+                }
+                (false, true) => {
+                    assert!((*t1_lock.stroad_state.get()).payload.unparked);
+                    assert!(!(*t1_lock.stroad_state.get()).payload.cancelled);
+                    assert!(!(*t2_lock.stroad_state.get()).payload.unparked);
+                    assert!(!(*t2_lock.stroad_state.get()).payload.cancelled);
+                }
+                (false, false) => {
+                    panic!("both locks failed to grab")
+                }
+            }
+        }
+    });
+}
+// fixme: the cas loop makes thw _rw_unlock and _rr_unlock tests too slow
+
+#[cfg(not(loom))]
+#[test]
+fn locking_single_threaded_write_unpark_sim() {
+    let alloc = SlabRoot::<JustU32Mapper>::new();
+    let thread_shard = alloc.new_thread();
+    let (obj, gen) = thread_shard.allocate::<LockedObj<u32>>();
+    let obj = unsafe {
+        let obj_p = obj.as_mut_ptr();
+        (*obj_p).lock_and_generation = AtomicU64::new(LOCK_GEN_VALID_BIT | (gen << 8));
+        (*obj_p).num_rw = UnsafeCell::new(0);
+        (*obj_p).payload = UnsafeCell::new(12345);
+        obj.assume_init_ref()
+    };
+    let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
+    drop(thread_shard);
+
+    let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
+
+    let lock_0 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_0.unordered_try_write(&stroad);
+    assert_eq!(ret, Ok(true));
+    assert_eq!(
+        obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
+        0x800000000000007f | (gen << 8)
+    );
+
+    let lock_1 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_1.unordered_try_write(&stroad);
+    assert_eq!(ret, Ok(false));
+    assert_eq!(
+        obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
+        0x80000000000000ff | (gen << 8)
+    );
+
+    unsafe {
+        lock_0.unlock(&stroad);
+        assert_eq!(
+            obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
+            0x8000000000000000 | (gen << 8)
+        );
+        assert!((*lock_1.stroad_state.get()).work_item_link.unparked);
+    }
+}
+
+#[cfg(not(loom))]
+#[test]
+fn locking_single_threaded_read_unpark_sim() {
+    let alloc = SlabRoot::<JustU32Mapper>::new();
+    let thread_shard = alloc.new_thread();
+    let (obj, gen) = thread_shard.allocate::<LockedObj<u32>>();
+    let obj = unsafe {
+        let obj_p = obj.as_mut_ptr();
+        (*obj_p).lock_and_generation = AtomicU64::new(LOCK_GEN_VALID_BIT | (gen << 8));
+        (*obj_p).num_rw = UnsafeCell::new(0);
+        (*obj_p).payload = UnsafeCell::new(12345);
+        obj.assume_init_ref()
+    };
+    let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
+    drop(thread_shard);
+
+    let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
+
+    let lock_0 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_0.unordered_try_read(&stroad);
+    assert_eq!(ret, Ok(true));
+    assert_eq!(
+        obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
+        0x8000000000000001 | (gen << 8)
+    );
+
+    let lock_1 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_1.unordered_try_read(&stroad);
+    assert_eq!(ret, Ok(true));
+    assert_eq!(
+        obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
+        0x8000000000000002 | (gen << 8)
+    );
+
+    let lock_2 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_2.unordered_try_write(&stroad);
+    assert_eq!(ret, Ok(false));
+    assert_eq!(
+        obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
+        0x8000000000000082 | (gen << 8)
+    );
+
+    unsafe {
+        lock_0.unlock(&stroad);
+        assert!(!(*lock_2.stroad_state.get()).work_item_link.unparked);
+        assert_eq!(
+            obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
+            0x8000000000000081 | (gen << 8)
+        );
+        lock_1.unlock(&stroad);
+        assert!((*lock_2.stroad_state.get()).work_item_link.unparked);
+        assert_eq!(
+            obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
+            0x8000000000000000 | (gen << 8)
+        );
+    }
+}
+
+#[cfg(not(loom))]
+#[test]
+fn locking_single_threaded_ordered_write_causes_unpark_sim() {
+    let alloc = SlabRoot::<JustU32Mapper>::new();
+    let thread_shard = alloc.new_thread();
+    let (obj, gen) = thread_shard.allocate::<LockedObj<u32>>();
+    let obj = unsafe {
+        let obj_p = obj.as_mut_ptr();
+        (*obj_p).lock_and_generation = AtomicU64::new(LOCK_GEN_VALID_BIT | (gen << 8));
+        (*obj_p).num_rw = UnsafeCell::new(0);
+        (*obj_p).payload = UnsafeCell::new(12345);
+        obj.assume_init_ref()
+    };
+    let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
+    drop(thread_shard);
+
+    let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
+
+    let lock_0 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_0.ordered_try_read(&stroad, 0);
+    assert_eq!(ret, Ok(true));
+    assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 1);
+
+    let lock_1 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_1.ordered_try_write(&stroad, 1);
+    assert_eq!(ret, Ok(true));
+    assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
+
+    let lock_2 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_2.ordered_try_read(&stroad, 2);
+    assert_eq!(ret, Ok(false));
+    assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
+
+    unsafe {
+        // the read shouldn't trigger an unpark
+        lock_0.unlock(&stroad);
+        assert!(!(*lock_2.stroad_state.get()).work_item_link.unparked);
+        assert_eq!(*obj_ref.ptr.num_rw.get(), 0x8000000000000000);
+        // but the write should
+        lock_1.unlock(&stroad);
+        assert!((*lock_2.stroad_state.get()).work_item_link.unparked);
+        assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
+    }
+}
+
+#[cfg(not(loom))]
+#[test]
+fn locking_single_threaded_ordered_read_causes_unpark_sim() {
+    let alloc = SlabRoot::<JustU32Mapper>::new();
+    let thread_shard = alloc.new_thread();
+    let (obj, gen) = thread_shard.allocate::<LockedObj<u32>>();
+    let obj = unsafe {
+        let obj_p = obj.as_mut_ptr();
+        (*obj_p).lock_and_generation = AtomicU64::new(LOCK_GEN_VALID_BIT | (gen << 8));
+        (*obj_p).num_rw = UnsafeCell::new(0);
+        (*obj_p).payload = UnsafeCell::new(12345);
+        obj.assume_init_ref()
+    };
+    let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
+    drop(thread_shard);
+
+    let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
+
+    let lock_0 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_0.ordered_try_read(&stroad, 0);
+    assert_eq!(ret, Ok(true));
+    assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 1);
+
+    let lock_1 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_1.ordered_try_write(&stroad, 1);
+    assert_eq!(ret, Ok(true));
+    assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
+
+    let lock_2 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_2.ordered_try_read(&stroad, 2);
+    assert_eq!(ret, Ok(false));
+    assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
+
+    let lock_3 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_3.ordered_try_read(&stroad, 3);
+    assert_eq!(ret, Ok(false));
+    assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
+
+    let lock_4 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
+        obj_ref.type_erase(),
+        LockingTestingPayload::default(),
+    );
+    let ret = lock_4.ordered_try_write(&stroad, 3);
+    assert_eq!(ret, Ok(false));
+    assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
+
+    unsafe {
+        lock_0.unlock(&stroad);
+        // shouldn't unpark anything yet
+        assert_eq!(*obj_ref.ptr.num_rw.get(), 0x8000000000000000);
+        assert!(!(*lock_2.stroad_state.get()).work_item_link.unparked);
+        assert!(!(*lock_3.stroad_state.get()).work_item_link.unparked);
+        assert!(!(*lock_4.stroad_state.get()).work_item_link.unparked);
+
+        lock_1.unlock(&stroad);
+        assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
+        // both of these should now be unparked
+        assert!((*lock_2.stroad_state.get()).work_item_link.unparked);
+        assert!((*lock_3.stroad_state.get()).work_item_link.unparked);
+        // but not this
+        assert!(!(*lock_4.stroad_state.get()).work_item_link.unparked);
+
+        // xxx simulate 2 and 3 getting re-acquired
+        lock_2.state.set(LockState::Unlocked);
+        lock_3.state.set(LockState::Unlocked);
+        let ret = lock_2.ordered_try_read(&stroad, 2);
+        assert_eq!(ret, Ok(true));
+        assert_eq!(*obj_ref.ptr.num_rw.get(), 1);
+        let ret = lock_3.ordered_try_read(&stroad, 2);
+        assert_eq!(ret, Ok(true));
+        assert_eq!(*obj_ref.ptr.num_rw.get(), 2);
+
+        lock_2.unlock(&stroad);
+        // shouldn't unpark yet
+        assert_eq!(*obj_ref.ptr.num_rw.get(), 1);
+        assert!(!(*lock_4.stroad_state.get()).work_item_link.unparked);
+
+        lock_3.unlock(&stroad);
+        // now it should
+        assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
+        assert!((*lock_4.stroad_state.get()).work_item_link.unparked);
+    }
+}
