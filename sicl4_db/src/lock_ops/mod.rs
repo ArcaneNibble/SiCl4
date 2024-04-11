@@ -201,34 +201,26 @@ impl<'arena, 'lock_inst, P: Debug> Debug for LockAndStroadData<'arena, 'lock_ins
 }
 impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'lock_inst, P> {
     /// Create a new lock state object
-    pub fn new(obj: TypeErasedObjRef<'arena>, payload: P) -> Self {
+    pub fn new(obj: TypeErasedObjRef<'arena>, work_item_link: P) -> Self {
         Self {
             state: Cell::new(LockState::Unlocked),
             p: obj,
-            stroad_state: UnsafeCell::new(StroadNode::new(payload)),
+            stroad_state: UnsafeCell::new(StroadNode::new(work_item_link)),
             _pd1: PhantomData,
         }
     }
 
-    /// Initialize a lock object in place, *EXCEPT* the external payload
+    /// Initialize a lock object in place, *EXCEPT* the external work item link
     pub unsafe fn init(self_: *mut Self, obj: TypeErasedObjRef<'arena>) {
         (*self_).state = Cell::new(LockState::Unlocked);
         (*self_).p = obj;
         StroadNode::init((*self_).stroad_state.get());
     }
 
-    /// Ugly get access to the payload stored inside, so that it can be init-ed
-    pub(crate) unsafe fn unsafe_inner_payload_ptr(self_: *const Self) -> *mut P {
+    /// Ugly get access to the work item link stored inside, so that it can be init-ed
+    pub(crate) unsafe fn unsafe_stroad_work_item_link_ptr(self_: *const Self) -> *mut P {
         let stroad_state = (*self_).stroad_state.get();
         addr_of_mut!((*stroad_state).work_item_link)
-    }
-
-    /// Ugly get access to the payload stored inside, because we crammed a boolean there
-    pub(crate) fn inner_payload_ref(&'lock_inst self) -> &'lock_inst P {
-        unsafe {
-            let stroad_state = self.stroad_state.get();
-            &(*stroad_state).work_item_link
-        }
     }
 
     /// Try to acquire an exclusive read/write lock, for an unordered algorithm
