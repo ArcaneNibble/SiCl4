@@ -61,7 +61,7 @@ const MAX_ORDERED_LOCKS_PER_WORK_ITEM: usize = 4;
 #[derive(Debug)]
 struct WorkItemPayload<'arena, 'work_item> {
     w: &'work_item WorkItem<'arena, 'work_item>,
-    guard_handed_out: Cell<bool>,
+    // guard_handed_out: Cell<bool>,
 }
 impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPayload<'arena, 'work_item> {
     fn cancel<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
@@ -124,7 +124,7 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
             let inner_payload = RWLock::unsafe_inner_payload_ptr(lock_ptr);
             // lifetimes should've made it s.t. this is pinned in place
             (*inner_payload).w = self;
-            (*inner_payload).guard_handed_out = Cell::new(false);
+            // (*inner_payload).guard_handed_out = Cell::new(false);
             (lock_idx, &mut *lock_ptr)
         }
     }
@@ -251,15 +251,16 @@ impl<'arena> UnorderedAlgorithmRWView<'arena> {
                 {
                     panic!("Tried to access a node in the wrong state")
                 }
-                if lock_i.inner_payload_ref().guard_handed_out.get() {
-                    panic!("Tried to access a node multiple times")
-                    // xxx this is meh
-                }
-                lock_i.inner_payload_ref().guard_handed_out.set(true);
-                return UnorderedObjROGuard {
-                    lock: lock_i,
-                    _pd1: PhantomData,
-                };
+                todo!();
+                // if lock_i.inner_payload_ref().guard_handed_out.get() {
+                //     panic!("Tried to access a node multiple times")
+                //     // xxx this is meh
+                // }
+                // lock_i.inner_payload_ref().guard_handed_out.set(true);
+                // return UnorderedObjROGuard {
+                //     lock: lock_i,
+                //     _pd1: PhantomData,
+                // };
             }
         }
         panic!("Tried to access a node that wasn't tagged in RO phase")
