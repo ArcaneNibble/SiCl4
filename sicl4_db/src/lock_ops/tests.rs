@@ -4,22 +4,16 @@ use super::*;
 
 #[derive(Default, Debug)]
 struct LockingTestingPayload {
-    unparked: bool,
-    cancelled: bool,
+    unparked: AtomicBool,
+    cancelled: AtomicBool,
 }
 impl StroadToWorkItemLink for LockingTestingPayload {
-    fn unpark<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
-    where
-        Self: Sized,
-    {
-        e.work_item_link.unparked = true;
+    fn unpark(&self) {
+        self.unparked.store(true, Ordering::Relaxed);
     }
 
-    fn cancel<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
-    where
-        Self: Sized,
-    {
-        e.work_item_link.cancelled = true;
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
@@ -304,22 +298,58 @@ fn locking_loom_unordered_ww_unlock() {
         unsafe {
             match (t1_got_lock, t2_got_lock) {
                 (true, true) => {
-                    assert!(!(*t1_lock.stroad_state.get()).payload.unparked);
-                    assert!(!(*t1_lock.stroad_state.get()).payload.cancelled);
-                    assert!(!(*t2_lock.stroad_state.get()).payload.unparked);
-                    assert!(!(*t2_lock.stroad_state.get()).payload.cancelled);
+                    assert!(!(*t1_lock.stroad_state.get())
+                        .work_item_link
+                        .unparked
+                        .load(Ordering::Relaxed));
+                    assert!(!(*t1_lock.stroad_state.get())
+                        .work_item_link
+                        .cancelled
+                        .load(Ordering::Relaxed));
+                    assert!(!(*t2_lock.stroad_state.get())
+                        .work_item_link
+                        .unparked
+                        .load(Ordering::Relaxed));
+                    assert!(!(*t2_lock.stroad_state.get())
+                        .work_item_link
+                        .cancelled
+                        .load(Ordering::Relaxed));
                 }
                 (true, false) => {
-                    assert!(!(*t1_lock.stroad_state.get()).payload.unparked);
-                    assert!(!(*t1_lock.stroad_state.get()).payload.cancelled);
-                    assert!((*t2_lock.stroad_state.get()).payload.unparked);
-                    assert!(!(*t2_lock.stroad_state.get()).payload.cancelled);
+                    assert!(!(*t1_lock.stroad_state.get())
+                        .work_item_link
+                        .unparked
+                        .load(Ordering::Relaxed));
+                    assert!(!(*t1_lock.stroad_state.get())
+                        .work_item_link
+                        .cancelled
+                        .load(Ordering::Relaxed));
+                    assert!((*t2_lock.stroad_state.get())
+                        .work_item_link
+                        .unparked
+                        .load(Ordering::Relaxed));
+                    assert!(!(*t2_lock.stroad_state.get())
+                        .work_item_link
+                        .cancelled
+                        .load(Ordering::Relaxed));
                 }
                 (false, true) => {
-                    assert!((*t1_lock.stroad_state.get()).payload.unparked);
-                    assert!(!(*t1_lock.stroad_state.get()).payload.cancelled);
-                    assert!(!(*t2_lock.stroad_state.get()).payload.unparked);
-                    assert!(!(*t2_lock.stroad_state.get()).payload.cancelled);
+                    assert!((*t1_lock.stroad_state.get())
+                        .work_item_link
+                        .unparked
+                        .load(Ordering::Relaxed));
+                    assert!(!(*t1_lock.stroad_state.get())
+                        .work_item_link
+                        .cancelled
+                        .load(Ordering::Relaxed));
+                    assert!(!(*t2_lock.stroad_state.get())
+                        .work_item_link
+                        .unparked
+                        .load(Ordering::Relaxed));
+                    assert!(!(*t2_lock.stroad_state.get())
+                        .work_item_link
+                        .cancelled
+                        .load(Ordering::Relaxed));
                 }
                 (false, false) => {
                     panic!("both locks failed to grab")
@@ -376,7 +406,10 @@ fn locking_single_threaded_write_unpark_sim() {
             obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
             0x8000000000000000 | (gen << 8)
         );
-        assert!((*lock_1.stroad_state.get()).work_item_link.unparked);
+        assert!((*lock_1.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
     }
 }
 
@@ -433,13 +466,19 @@ fn locking_single_threaded_read_unpark_sim() {
 
     unsafe {
         lock_0.unlock(&stroad);
-        assert!(!(*lock_2.stroad_state.get()).work_item_link.unparked);
+        assert!(!(*lock_2.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
         assert_eq!(
             obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
             0x8000000000000081 | (gen << 8)
         );
         lock_1.unlock(&stroad);
-        assert!((*lock_2.stroad_state.get()).work_item_link.unparked);
+        assert!((*lock_2.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
         assert_eq!(
             obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
             0x8000000000000000 | (gen << 8)
@@ -492,11 +531,17 @@ fn locking_single_threaded_ordered_write_causes_unpark_sim() {
     unsafe {
         // the read shouldn't trigger an unpark
         lock_0.unlock(&stroad);
-        assert!(!(*lock_2.stroad_state.get()).work_item_link.unparked);
+        assert!(!(*lock_2.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
         assert_eq!(*obj_ref.ptr.num_rw.get(), 0x8000000000000000);
         // but the write should
         lock_1.unlock(&stroad);
-        assert!((*lock_2.stroad_state.get()).work_item_link.unparked);
+        assert!((*lock_2.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
         assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
     }
 }
@@ -563,17 +608,35 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
         lock_0.unlock(&stroad);
         // shouldn't unpark anything yet
         assert_eq!(*obj_ref.ptr.num_rw.get(), 0x8000000000000000);
-        assert!(!(*lock_2.stroad_state.get()).work_item_link.unparked);
-        assert!(!(*lock_3.stroad_state.get()).work_item_link.unparked);
-        assert!(!(*lock_4.stroad_state.get()).work_item_link.unparked);
+        assert!(!(*lock_2.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
+        assert!(!(*lock_3.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
+        assert!(!(*lock_4.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
 
         lock_1.unlock(&stroad);
         assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
         // both of these should now be unparked
-        assert!((*lock_2.stroad_state.get()).work_item_link.unparked);
-        assert!((*lock_3.stroad_state.get()).work_item_link.unparked);
+        assert!((*lock_2.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
+        assert!((*lock_3.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
         // but not this
-        assert!(!(*lock_4.stroad_state.get()).work_item_link.unparked);
+        assert!(!(*lock_4.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
 
         // xxx simulate 2 and 3 getting re-acquired
         lock_2.state.set(LockState::Unlocked);
@@ -588,11 +651,17 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
         lock_2.unlock(&stroad);
         // shouldn't unpark yet
         assert_eq!(*obj_ref.ptr.num_rw.get(), 1);
-        assert!(!(*lock_4.stroad_state.get()).work_item_link.unparked);
+        assert!(!(*lock_4.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
 
         lock_3.unlock(&stroad);
         // now it should
         assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
-        assert!((*lock_4.stroad_state.get()).work_item_link.unparked);
+        assert!((*lock_4.stroad_state.get())
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
     }
 }

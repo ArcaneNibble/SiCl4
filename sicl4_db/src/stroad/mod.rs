@@ -91,16 +91,11 @@ use crate::util::to_unsafecell;
 /// Methods _must_ be safe to call from multiple threads, must be idempotent,
 /// and "cancel" must win over "unpark".
 // TODO: add "get priority" here maybe??? (difference is one pointer indirection)
-// TODO: can this just take... &self?
-pub trait StroadToWorkItemLink {
+pub trait StroadToWorkItemLink: Send + Sync {
     /// The given work item has been invalidated by some other access
-    fn cancel<'stroad_node, K>(e: &'stroad_node mut StroadNode<'stroad_node, K, Self>)
-    where
-        Self: Sized;
+    fn cancel(&self);
     /// The given work item is now possible to attempt to run again
-    fn unpark<'stroad_node, K>(e: &'stroad_node mut StroadNode<'stroad_node, K, Self>)
-    where
-        Self: Sized;
+    fn unpark(&self);
 }
 
 /// log2 of the number of toplevel shards
@@ -144,16 +139,8 @@ struct DoubleLL<'stroad_node, K, P> {
     next: ListEntryPtr<'stroad_node, K, P>,
     prev: ListEntryPtr<'stroad_node, K, P>,
 }
-// safety: the linked list entry moving to another thread
-// means that that other thread has references to K and P
-// (i.e. we `Send`ed a &K and &P to another thread)
-// --> require Sync
-// the way our code works can also end up sending the ownership
-// of K and P (i.e. unpark/abort/commit on another thread)
-// --> require Send
-// also used s.t. StroadNode will have Send/Sync as appropriate
-unsafe impl<'stroad_node, K: Send + Sync, P: Send + Sync> Send for DoubleLL<'stroad_node, K, P> {}
-unsafe impl<'stroad_node, K: Send + Sync, P: Send + Sync> Sync for DoubleLL<'stroad_node, K, P> {}
+// safety: note that this isn't Send/Sync and doesn't need to be
+// -- there are no useful methods on this type, and all of the useful methods are on Stroad
 impl<'stroad_node, K, P> Debug for DoubleLL<'stroad_node, K, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DoubleLL")
@@ -374,9 +361,7 @@ impl<'stroad_node, K, P> Debug for StroadShard<'stroad_node, K, P> {
             .finish()
     }
 }
-impl<'stroad_node, K: Hash + Eq + 'stroad_node, P: StroadToWorkItemLink + 'stroad_node>
-    StroadShard<'stroad_node, K, P>
-{
+impl<'stroad_node, K: Hash + Eq, P: StroadToWorkItemLink> StroadShard<'stroad_node, K, P> {
     /// Insert the lock instance onto either the [wants_lock](StroadBucket::wants_lock)
     /// or [holds_lock](StroadBucket::holds_lock) list
     ///
@@ -515,7 +500,7 @@ impl<'stroad_node, K: Hash + Eq + 'stroad_node, P: StroadToWorkItemLink + 'stroa
                 // only at this point, after unlink, do we know that nothing else
                 // is referencing the node
                 let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                StroadToWorkItemLink::unpark(list_ent_mut);
+                list_ent_mut.work_item_link.unpark();
                 self.nents -= 1;
             } else {
                 list_ent = list_ent_ref.link.next;
@@ -567,13 +552,18 @@ pub struct Stroad<'stroad_node, K, P> {
     /// Array of shards
     shards: [UnsafeCell<StroadShard<'stroad_node, K, P>>; HASH_NUM_SHARDS],
 }
-// safety: we are using interior mutability with locking
-// the locks guarantee that only one thread is accessing a given shard at once
-// a &Stroad requires &K and &P on any thread
-// --> require Sync
-// a &Stroad can also send the ownership of K and P as explained for the linked list item
-// --> require Send
-unsafe impl<'stroad_node, K: Send + Sync, P: Send + Sync> Sync for Stroad<'stroad_node, K, P> {}
+// safety: we are using interior mutability with locking,
+// so the locks guarantee that only one thread is accessing a given shard at once
+//
+// we can shift around ownership of stuff between threads in many operations, so
+// --> require Send on K (and P)
+//
+// we can compute hashes and unpark/cancel simultaneously from different threads
+// (see notes on the trait) --> require Sync on K (and P)
+unsafe impl<'stroad_node, K: Send + Sync, P: StroadToWorkItemLink> Sync
+    for Stroad<'stroad_node, K, P>
+{
+}
 impl<'stroad_node, K, P> Debug for Stroad<'stroad_node, K, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut dbg = f.debug_struct("Stroad");
@@ -587,9 +577,7 @@ impl<'stroad_node, K, P> Debug for Stroad<'stroad_node, K, P> {
         dbg.finish()
     }
 }
-impl<'stroad_node, K: Hash + Eq + 'stroad_node, P: StroadToWorkItemLink + 'stroad_node>
-    Stroad<'stroad_node, K, P>
-{
+impl<'stroad_node, K: Hash + Eq, P: StroadToWorkItemLink> Stroad<'stroad_node, K, P> {
     /// Allocate a new hash map
     ///
     /// Always returns a box because it overflows the stack otherwise
@@ -768,7 +756,7 @@ impl<'stroad_node, K: Hash + Eq + 'stroad_node, P: StroadToWorkItemLink + 'stroa
                             // only at this point, after unlink, do we know that nothing else
                             // is referencing the node
                             let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                            StroadToWorkItemLink::cancel(list_ent_mut);
+                            list_ent_mut.work_item_link.cancel();
                             shard.nents -= 1;
                         } else {
                             let other_prio = list_ent_ref.prio;
@@ -778,7 +766,7 @@ impl<'stroad_node, K: Hash + Eq + 'stroad_node, P: StroadToWorkItemLink + 'stroa
                                 // only at this point, after unlink, do we know that nothing else
                                 // is referencing the node
                                 let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                                StroadToWorkItemLink::cancel(list_ent_mut);
+                                list_ent_mut.work_item_link.cancel();
                                 shard.nents -= 1;
                             } else if prio == other_prio {
                                 panic!("reader with same priority, even though we checked?");
@@ -931,7 +919,7 @@ impl<'stroad_node, K: Hash + Eq + 'stroad_node, P: StroadToWorkItemLink + 'stroa
                         // only at this point, after unlink, do we know that nothing else
                         // is referencing the node
                         let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                        StroadToWorkItemLink::unpark(list_ent_mut);
+                        list_ent_mut.work_item_link.unpark();
                         shard.nents -= 1;
                     } else {
                         list_ent = list_ent_ref.link.next;
@@ -945,7 +933,8 @@ impl<'stroad_node, K: Hash + Eq + 'stroad_node, P: StroadToWorkItemLink + 'stroa
         if !found_readers_of_same_priority {
             if let Some(highest_found_writer) = highest_found_writer {
                 bucket.unlink_item(highest_found_writer, false);
-                StroadToWorkItemLink::unpark(unsafe { &mut *highest_found_writer.get() });
+                let highest_found_writer_node = unsafe { &mut *highest_found_writer.get() };
+                highest_found_writer_node.work_item_link.unpark();
                 shard.nents -= 1;
             }
         }

@@ -4,22 +4,16 @@ use super::*;
 
 #[derive(Default, Debug)]
 struct StroadTestingPayload {
-    unparked: bool,
-    cancelled: bool,
+    unparked: AtomicBool,
+    cancelled: AtomicBool,
 }
 impl StroadToWorkItemLink for StroadTestingPayload {
-    fn unpark<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
-    where
-        Self: Sized,
-    {
-        e.work_item_link.unparked = true;
+    fn unpark(&self) {
+        self.unparked.store(true, Ordering::Relaxed);
     }
 
-    fn cancel<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
-    where
-        Self: Sized,
-    {
-        e.work_item_link.cancelled = true;
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
@@ -136,8 +130,14 @@ fn stroad_unpark_all() {
     stroad.unordered_unpark_all(&12345);
 
     unsafe {
-        assert!((*list_ent_0_ptr).work_item_link.unparked);
-        assert!((*list_ent_1_ptr).work_item_link.unparked);
+        assert!((*list_ent_0_ptr)
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
+        assert!((*list_ent_1_ptr)
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
     }
 
     let hash = hash(&12345);
@@ -390,7 +390,10 @@ fn stroad_priority_locking() {
     let (ret, _) = stroad.ordered_do_locking(&mut list_ent_6, 12345, -9, || {});
     assert!(ret);
     unsafe {
-        assert!((*list_ent_4_ptr).work_item_link.cancelled);
+        assert!((*list_ent_4_ptr)
+            .work_item_link
+            .cancelled
+            .load(Ordering::Relaxed));
     }
 
     // fail reader
@@ -540,8 +543,14 @@ fn stroad_writer_canceling_readers() {
     let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, 12345, -5, || {});
     assert!(ret);
     unsafe {
-        assert!((*list_ent_3_ptr).work_item_link.cancelled);
-        assert!((*list_ent_2_ptr).work_item_link.cancelled);
+        assert!((*list_ent_3_ptr)
+            .work_item_link
+            .cancelled
+            .load(Ordering::Relaxed));
+        assert!((*list_ent_2_ptr)
+            .work_item_link
+            .cancelled
+            .load(Ordering::Relaxed));
     }
 
     // test the lists
@@ -650,8 +659,14 @@ fn stroad_priority_unlocking() {
     println!("** unlock ent 2");
     stroad.ordered_do_unlocking(unsafe { &*(list_ent_2_ptr) }, || true, || {});
     unsafe {
-        assert!((*list_ent_4_ptr).work_item_link.unparked);
-        assert!((*list_ent_3_ptr).work_item_link.unparked);
+        assert!((*list_ent_4_ptr)
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
+        assert!((*list_ent_3_ptr)
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
     }
 
     // *one* of the readers will cause an unlock
@@ -659,14 +674,20 @@ fn stroad_priority_unlocking() {
     println!("** unlock ent 3");
     stroad.ordered_do_unlocking(unsafe { &*(list_ent_3_ptr) }, || true, || {});
     unsafe {
-        assert!((*list_ent_6_ptr).work_item_link.unparked);
+        assert!((*list_ent_6_ptr)
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
     }
 
     // this should unlock the other writer
     println!("** unlock ent 6");
     stroad.ordered_do_unlocking(unsafe { &*(list_ent_6_ptr) }, || true, || {});
     unsafe {
-        assert!((*list_ent_5_ptr).work_item_link.unparked);
+        assert!((*list_ent_5_ptr)
+            .work_item_link
+            .unparked
+            .load(Ordering::Relaxed));
     }
 
     // this should unlock nothing
@@ -699,8 +720,14 @@ fn stroad_writers_dont_cancel_if_conflict() {
     assert!(!ret); // won't work, conflicts with the reader
 
     unsafe {
-        assert!(!(*list_ent_0_ptr).work_item_link.cancelled);
-        assert!(!(*list_ent_1_ptr).work_item_link.cancelled);
+        assert!(!(*list_ent_0_ptr)
+            .work_item_link
+            .cancelled
+            .load(Ordering::Relaxed));
+        assert!(!(*list_ent_1_ptr)
+            .work_item_link
+            .cancelled
+            .load(Ordering::Relaxed));
     }
 }
 
@@ -812,8 +839,18 @@ fn stroad_loom_park_unpark() {
         t2.join().unwrap();
 
         {
-            let ent_0_unparked = unsafe { (*list_ent_0_ptr).payload.unparked };
-            let ent_1_unparked = unsafe { (*list_ent_1_ptr).payload.unparked };
+            let ent_0_unparked = unsafe {
+                (*list_ent_0_ptr)
+                    .work_item_link
+                    .unparked
+                    .load(Ordering::Relaxed)
+            };
+            let ent_1_unparked = unsafe {
+                (*list_ent_1_ptr)
+                    .work_item_link
+                    .unparked
+                    .load(Ordering::Relaxed)
+            };
             assert!(ent_0_unparked || ent_1_unparked);
             if !ent_1_unparked {
                 let hash = hash(&12345);
