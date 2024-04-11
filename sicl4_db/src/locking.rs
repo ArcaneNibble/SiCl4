@@ -184,7 +184,7 @@ pub struct RWLock<'arena, 'lock_inst, P> {
     pub(crate) p: TypeErasedObjRef<'arena>,
     /// Stroad module's state data
     // FIXME does this enforce too much invariance on lifetimes?
-    stroad_state: UnsafeCell<LockInstance<'lock_inst, TypeErasedObjRef<'arena>, P>>,
+    stroad_state: UnsafeCell<StroadNode<'lock_inst, TypeErasedObjRef<'arena>, P>>,
     /// Prevent this type from being `Sync`, and
     /// ensure `'lock_inst` lifetime is invariant
     _pd1: PhantomData<UnsafeCell<&'lock_inst ()>>,
@@ -199,13 +199,13 @@ impl<'arena, 'lock_inst, P: Debug> Debug for RWLock<'arena, 'lock_inst, P> {
         dbg.finish()
     }
 }
-impl<'arena, 'lock_inst, P: LockInstPayload> RWLock<'arena, 'lock_inst, P> {
+impl<'arena, 'lock_inst, P: StroadToWorkItemLink> RWLock<'arena, 'lock_inst, P> {
     /// Create a new lock state object
     pub fn new(obj: TypeErasedObjRef<'arena>, payload: P) -> Self {
         Self {
             state: Cell::new(LockState::Unlocked),
             p: obj,
-            stroad_state: UnsafeCell::new(LockInstance::new(payload)),
+            stroad_state: UnsafeCell::new(StroadNode::new(payload)),
             _pd1: PhantomData,
         }
     }
@@ -214,20 +214,20 @@ impl<'arena, 'lock_inst, P: LockInstPayload> RWLock<'arena, 'lock_inst, P> {
     pub unsafe fn init(self_: *mut Self, obj: TypeErasedObjRef<'arena>) {
         (*self_).state = Cell::new(LockState::Unlocked);
         (*self_).p = obj;
-        LockInstance::init((*self_).stroad_state.get());
+        StroadNode::init((*self_).stroad_state.get());
     }
 
     /// Ugly get access to the payload stored inside, so that it can be init-ed
     pub(crate) unsafe fn unsafe_inner_payload_ptr(self_: *const Self) -> *mut P {
         let stroad_state = (*self_).stroad_state.get();
-        addr_of_mut!((*stroad_state).payload)
+        addr_of_mut!((*stroad_state).work_item_link)
     }
 
     /// Ugly get access to the payload stored inside, because we crammed a boolean there
     pub(crate) fn inner_payload_ref(&'lock_inst self) -> &'lock_inst P {
         unsafe {
             let stroad_state = self.stroad_state.get();
-            &(*stroad_state).payload
+            &(*stroad_state).work_item_link
         }
     }
 
@@ -731,19 +731,19 @@ mod tests {
         unparked: bool,
         cancelled: bool,
     }
-    impl LockInstPayload for LockingTestingPayload {
-        fn unpark<'lock_inst, K>(e: &'lock_inst mut LockInstance<'lock_inst, K, Self>)
+    impl StroadToWorkItemLink for LockingTestingPayload {
+        fn unpark<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
         where
             Self: Sized,
         {
-            e.payload.unparked = true;
+            e.work_item_link.unparked = true;
         }
 
-        fn cancel<'lock_inst, K>(e: &'lock_inst mut LockInstance<'lock_inst, K, Self>)
+        fn cancel<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
         where
             Self: Sized,
         {
-            e.payload.cancelled = true;
+            e.work_item_link.cancelled = true;
         }
     }
 
@@ -1100,7 +1100,7 @@ mod tests {
                 obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
                 0x8000000000000000 | (gen << 8)
             );
-            assert!((*lock_1.stroad_state.get()).payload.unparked);
+            assert!((*lock_1.stroad_state.get()).work_item_link.unparked);
         }
     }
 
@@ -1157,13 +1157,13 @@ mod tests {
 
         unsafe {
             lock_0.unlock(&stroad);
-            assert!(!(*lock_2.stroad_state.get()).payload.unparked);
+            assert!(!(*lock_2.stroad_state.get()).work_item_link.unparked);
             assert_eq!(
                 obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
                 0x8000000000000081 | (gen << 8)
             );
             lock_1.unlock(&stroad);
-            assert!((*lock_2.stroad_state.get()).payload.unparked);
+            assert!((*lock_2.stroad_state.get()).work_item_link.unparked);
             assert_eq!(
                 obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
                 0x8000000000000000 | (gen << 8)
@@ -1216,11 +1216,11 @@ mod tests {
         unsafe {
             // the read shouldn't trigger an unpark
             lock_0.unlock(&stroad);
-            assert!(!(*lock_2.stroad_state.get()).payload.unparked);
+            assert!(!(*lock_2.stroad_state.get()).work_item_link.unparked);
             assert_eq!(*obj_ref.ptr.num_rw.get(), 0x8000000000000000);
             // but the write should
             lock_1.unlock(&stroad);
-            assert!((*lock_2.stroad_state.get()).payload.unparked);
+            assert!((*lock_2.stroad_state.get()).work_item_link.unparked);
             assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
         }
     }
@@ -1287,17 +1287,17 @@ mod tests {
             lock_0.unlock(&stroad);
             // shouldn't unpark anything yet
             assert_eq!(*obj_ref.ptr.num_rw.get(), 0x8000000000000000);
-            assert!(!(*lock_2.stroad_state.get()).payload.unparked);
-            assert!(!(*lock_3.stroad_state.get()).payload.unparked);
-            assert!(!(*lock_4.stroad_state.get()).payload.unparked);
+            assert!(!(*lock_2.stroad_state.get()).work_item_link.unparked);
+            assert!(!(*lock_3.stroad_state.get()).work_item_link.unparked);
+            assert!(!(*lock_4.stroad_state.get()).work_item_link.unparked);
 
             lock_1.unlock(&stroad);
             assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
             // both of these should now be unparked
-            assert!((*lock_2.stroad_state.get()).payload.unparked);
-            assert!((*lock_3.stroad_state.get()).payload.unparked);
+            assert!((*lock_2.stroad_state.get()).work_item_link.unparked);
+            assert!((*lock_3.stroad_state.get()).work_item_link.unparked);
             // but not this
-            assert!(!(*lock_4.stroad_state.get()).payload.unparked);
+            assert!(!(*lock_4.stroad_state.get()).work_item_link.unparked);
 
             // xxx simulate 2 and 3 getting re-acquired
             lock_2.state.set(LockState::Unlocked);
@@ -1312,12 +1312,12 @@ mod tests {
             lock_2.unlock(&stroad);
             // shouldn't unpark yet
             assert_eq!(*obj_ref.ptr.num_rw.get(), 1);
-            assert!(!(*lock_4.stroad_state.get()).payload.unparked);
+            assert!(!(*lock_4.stroad_state.get()).work_item_link.unparked);
 
             lock_3.unlock(&stroad);
             // now it should
             assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
-            assert!((*lock_4.stroad_state.get()).payload.unparked);
+            assert!((*lock_4.stroad_state.get()).work_item_link.unparked);
         }
     }
 }

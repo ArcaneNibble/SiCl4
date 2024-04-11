@@ -7,26 +7,26 @@ struct StroadTestingPayload {
     unparked: bool,
     cancelled: bool,
 }
-impl LockInstPayload for StroadTestingPayload {
-    fn unpark<'lock_inst, K>(e: &'lock_inst mut LockInstance<'lock_inst, K, Self>)
+impl StroadToWorkItemLink for StroadTestingPayload {
+    fn unpark<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
     where
         Self: Sized,
     {
-        e.payload.unparked = true;
+        e.work_item_link.unparked = true;
     }
 
-    fn cancel<'lock_inst, K>(e: &'lock_inst mut LockInstance<'lock_inst, K, Self>)
+    fn cancel<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
     where
         Self: Sized,
     {
-        e.payload.cancelled = true;
+        e.work_item_link.cancelled = true;
     }
 }
 
 #[cfg(not(loom))]
 #[test]
 fn stroad_lock_held_during_validation() {
-    let mut list_ent = LockInstance::<u32, StroadTestingPayload>::default();
+    let mut list_ent = StroadNode::<u32, StroadTestingPayload>::default();
     let stroad = Stroad::<u32, StroadTestingPayload>::new();
     let hash = hash(&12345);
     let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
@@ -56,9 +56,9 @@ fn stroad_manual_tests() {
         "size {}",
         mem::size_of::<Stroad<u32, StroadTestingPayload>>()
     );
-    let list_ent_0 = LockInstance::<u32, StroadTestingPayload>::default();
+    let list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
     dbg!(&list_ent_0);
-    dbg!(size_of::<LockInstance<u32, StroadTestingPayload>>());
+    dbg!(size_of::<StroadNode<u32, StroadTestingPayload>>());
     dbg!(size_of::<StroadShard<u32, StroadTestingPayload>>());
     let x = UnsafeCell::new(list_ent_0);
     let x = StroadBucket::<u32, StroadTestingPayload> {
@@ -73,9 +73,9 @@ fn stroad_manual_tests() {
     };
     dbg!(&x);
     let x = Stroad::<u32, StroadTestingPayload>::new();
-    let mut list_ent_0 = LockInstance::<u32, StroadTestingPayload>::default();
-    let mut list_ent_1 = LockInstance::<u32, StroadTestingPayload>::default();
-    let mut list_ent_2 = LockInstance::<u32, StroadTestingPayload>::default();
+    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
+    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
+    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
     let _ = x.unordered_park_conditionally(&mut list_ent_0, 12345, || true);
     let _ = x.unordered_park_conditionally(&mut list_ent_1, 12345, || true);
     let _ = x.unordered_park_conditionally(&mut list_ent_2, 67890, || true);
@@ -87,8 +87,8 @@ fn stroad_manual_tests() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_park_one() {
-    let mut list_ent_0 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const LockInstance<u32, StroadTestingPayload>;
+    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
     let stroad = Stroad::<u32, StroadTestingPayload>::new();
 
     let hash = hash(&12345);
@@ -123,10 +123,10 @@ fn stroad_park_one() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_unpark_all() {
-    let mut list_ent_0 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_1 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const LockInstance<u32, StroadTestingPayload>;
+    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     let stroad = Stroad::<u32, StroadTestingPayload>::new();
@@ -136,8 +136,8 @@ fn stroad_unpark_all() {
     stroad.unordered_unpark_all(&12345);
 
     unsafe {
-        assert!((*list_ent_0_ptr).payload.unparked);
-        assert!((*list_ent_1_ptr).payload.unparked);
+        assert!((*list_ent_0_ptr).work_item_link.unparked);
+        assert!((*list_ent_1_ptr).work_item_link.unparked);
     }
 
     let hash = hash(&12345);
@@ -159,10 +159,10 @@ fn stroad_unpark_all() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_park_two_separate_buckets() {
-    let mut list_ent_0 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_1 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const LockInstance<u32, StroadTestingPayload>;
+    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     let stroad = Stroad::<u32, StroadTestingPayload>::new();
@@ -228,12 +228,12 @@ fn stroad_park_two_separate_buckets() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_park_many_same() {
-    let mut list_ent_0 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_1 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_2 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_2_ptr = &list_ent_2 as *const LockInstance<u32, StroadTestingPayload>;
+    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<u32, StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     dbg!(list_ent_2_ptr);
@@ -331,24 +331,24 @@ fn stroad_park_many_same() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_priority_locking() {
-    let mut list_ent_0 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_1 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_2 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_2_ptr = &list_ent_2 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_3 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_3_ptr = &list_ent_3 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_4 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_4_ptr = &list_ent_4 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_5 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_5_ptr = &list_ent_5 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_6 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_6_ptr = &list_ent_6 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_7 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_7_ptr = &list_ent_7 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_8 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_8_ptr = &list_ent_8 as *const LockInstance<u32, StroadTestingPayload>;
+    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_3 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_3_ptr = &list_ent_3 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_4 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_4_ptr = &list_ent_4 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_5 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_5_ptr = &list_ent_5 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_6 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_6_ptr = &list_ent_6 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_7 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_7_ptr = &list_ent_7 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_8 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_8_ptr = &list_ent_8 as *const StroadNode<u32, StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     dbg!(list_ent_2_ptr);
@@ -390,7 +390,7 @@ fn stroad_priority_locking() {
     let (ret, _) = stroad.ordered_do_locking(&mut list_ent_6, 12345, -9, || {});
     assert!(ret);
     unsafe {
-        assert!((*list_ent_4_ptr).payload.cancelled);
+        assert!((*list_ent_4_ptr).work_item_link.cancelled);
     }
 
     // fail reader
@@ -504,16 +504,16 @@ fn stroad_priority_locking() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_writer_canceling_readers() {
-    let mut list_ent_0 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_1 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_2 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_2_ptr = &list_ent_2 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_3 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_3_ptr = &list_ent_3 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_4 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_4_ptr = &list_ent_4 as *const LockInstance<u32, StroadTestingPayload>;
+    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_3 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_3_ptr = &list_ent_3 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_4 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_4_ptr = &list_ent_4 as *const StroadNode<u32, StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     dbg!(list_ent_2_ptr);
@@ -540,8 +540,8 @@ fn stroad_writer_canceling_readers() {
     let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, 12345, -5, || {});
     assert!(ret);
     unsafe {
-        assert!((*list_ent_3_ptr).payload.cancelled);
-        assert!((*list_ent_2_ptr).payload.cancelled);
+        assert!((*list_ent_3_ptr).work_item_link.cancelled);
+        assert!((*list_ent_2_ptr).work_item_link.cancelled);
     }
 
     // test the lists
@@ -601,20 +601,20 @@ fn stroad_writer_canceling_readers() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_priority_unlocking() {
-    let mut list_ent_0 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_1 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_2 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_2_ptr = &list_ent_2 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_3 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_3_ptr = &list_ent_3 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_4 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_4_ptr = &list_ent_4 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_5 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_5_ptr = &list_ent_5 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_6 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_6_ptr = &list_ent_6 as *const LockInstance<u32, StroadTestingPayload>;
+    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_3 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_3_ptr = &list_ent_3 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_4 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_4_ptr = &list_ent_4 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_5 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_5_ptr = &list_ent_5 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_6 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_6_ptr = &list_ent_6 as *const StroadNode<u32, StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     dbg!(list_ent_2_ptr);
@@ -650,8 +650,8 @@ fn stroad_priority_unlocking() {
     println!("** unlock ent 2");
     stroad.ordered_do_unlocking(unsafe { &*(list_ent_2_ptr) }, || true, || {});
     unsafe {
-        assert!((*list_ent_4_ptr).payload.unparked);
-        assert!((*list_ent_3_ptr).payload.unparked);
+        assert!((*list_ent_4_ptr).work_item_link.unparked);
+        assert!((*list_ent_3_ptr).work_item_link.unparked);
     }
 
     // *one* of the readers will cause an unlock
@@ -659,14 +659,14 @@ fn stroad_priority_unlocking() {
     println!("** unlock ent 3");
     stroad.ordered_do_unlocking(unsafe { &*(list_ent_3_ptr) }, || true, || {});
     unsafe {
-        assert!((*list_ent_6_ptr).payload.unparked);
+        assert!((*list_ent_6_ptr).work_item_link.unparked);
     }
 
     // this should unlock the other writer
     println!("** unlock ent 6");
     stroad.ordered_do_unlocking(unsafe { &*(list_ent_6_ptr) }, || true, || {});
     unsafe {
-        assert!((*list_ent_5_ptr).payload.unparked);
+        assert!((*list_ent_5_ptr).work_item_link.unparked);
     }
 
     // this should unlock nothing
@@ -677,12 +677,12 @@ fn stroad_priority_unlocking() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_writers_dont_cancel_if_conflict() {
-    let mut list_ent_0 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_1 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const LockInstance<u32, StroadTestingPayload>;
-    let mut list_ent_2 = LockInstance::<u32, StroadTestingPayload>::default();
-    let list_ent_2_ptr = &list_ent_2 as *const LockInstance<u32, StroadTestingPayload>;
+    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
+    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<u32, StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     dbg!(list_ent_2_ptr);
@@ -699,8 +699,8 @@ fn stroad_writers_dont_cancel_if_conflict() {
     assert!(!ret); // won't work, conflicts with the reader
 
     unsafe {
-        assert!(!(*list_ent_0_ptr).payload.cancelled);
-        assert!(!(*list_ent_1_ptr).payload.cancelled);
+        assert!(!(*list_ent_0_ptr).work_item_link.cancelled);
+        assert!(!(*list_ent_1_ptr).work_item_link.cancelled);
     }
 }
 
@@ -708,14 +708,10 @@ fn stroad_writers_dont_cancel_if_conflict() {
 #[cfg(loom)]
 fn stroad_loom_concurrent_park() {
     loom::model(|| {
-        let list_ent_0 = Box::leak(Box::new(
-            LockInstance::<u32, StroadTestingPayload>::default(),
-        ));
-        let list_ent_0_ptr = list_ent_0 as *const LockInstance<u32, StroadTestingPayload>;
-        let list_ent_1 = Box::leak(Box::new(
-            LockInstance::<u32, StroadTestingPayload>::default(),
-        ));
-        let list_ent_1_ptr = list_ent_1 as *const LockInstance<u32, StroadTestingPayload>;
+        let list_ent_0 = Box::leak(Box::new(StroadNode::<u32, StroadTestingPayload>::default()));
+        let list_ent_0_ptr = list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
+        let list_ent_1 = Box::leak(Box::new(StroadNode::<u32, StroadTestingPayload>::default()));
+        let list_ent_1_ptr = list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
         let stroad = &*Box::leak(Stroad::<u32, StroadTestingPayload>::new());
 
         let t1 = loom::thread::spawn(move || {
@@ -799,14 +795,10 @@ fn stroad_loom_concurrent_park() {
 #[cfg(loom)]
 fn stroad_loom_park_unpark() {
     loom::model(|| {
-        let list_ent_0 = Box::leak(Box::new(
-            LockInstance::<u32, StroadTestingPayload>::default(),
-        ));
-        let list_ent_0_ptr = list_ent_0 as *const LockInstance<u32, StroadTestingPayload>;
-        let list_ent_1 = Box::leak(Box::new(
-            LockInstance::<u32, StroadTestingPayload>::default(),
-        ));
-        let list_ent_1_ptr = list_ent_1 as *const LockInstance<u32, StroadTestingPayload>;
+        let list_ent_0 = Box::leak(Box::new(StroadNode::<u32, StroadTestingPayload>::default()));
+        let list_ent_0_ptr = list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
+        let list_ent_1 = Box::leak(Box::new(StroadNode::<u32, StroadTestingPayload>::default()));
+        let list_ent_1_ptr = list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
         let stroad = &*Box::leak(Stroad::<u32, StroadTestingPayload>::new());
         let _ = stroad.unordered_park_conditionally(list_ent_0, 12345, || true);
 

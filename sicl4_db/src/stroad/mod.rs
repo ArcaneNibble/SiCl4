@@ -2,7 +2,7 @@
 //!
 //! This is used to set aside work items that cannot run because they are
 //! not able to acquire needed locks. The items will only be re-queued when
-//! locks get released. Maps (node address + generation) -> (list of work item)
+//! locks get released. Maps (address (of a _graph_ node) + generation) -> (list of work item)
 //!
 //! Unlike in WebKit, this is specifically designed for our specific set of
 //! reader-writer locks (which either have or don't have priority).
@@ -79,18 +79,26 @@ use std::{
 use crate::loom_testing::*;
 use crate::util::to_unsafecell;
 
-/// Lock instance payloads need a function that can unpark or cancel
-/// the work items that they are a part of.
+/// When a lock is being acquired and released, said operations need
+/// the ability to reach back "up" to unpark or cancel other work items.
+/// Due to the way we've built the abstractions, it has to be possible to
+/// _reach_ said work items from linked list nodes. This trait provides that link.
 ///
 /// This will be called, with the bucket lock held,
 /// on the thread that released the lock triggering the unpark/cancel.
-pub trait LockInstPayload {
+///
+/// This can be called from multiple threads at the same time!
+/// Methods _must_ be safe to call from multiple threads, must be idempotent,
+/// and "cancel" must win over "unpark".
+// TODO: add "get priority" here maybe??? (difference is one pointer indirection)
+// TODO: can this just take... &self?
+pub trait StroadToWorkItemLink {
     /// The given work item has been invalidated by some other access
-    fn cancel<'lock_inst, K>(e: &'lock_inst mut LockInstance<'lock_inst, K, Self>)
+    fn cancel<'stroad_node, K>(e: &'stroad_node mut StroadNode<'stroad_node, K, Self>)
     where
         Self: Sized;
     /// The given work item is now possible to attempt to run again
-    fn unpark<'lock_inst, K>(e: &'lock_inst mut LockInstance<'lock_inst, K, Self>)
+    fn unpark<'stroad_node, K>(e: &'stroad_node mut StroadNode<'stroad_node, K, Self>)
     where
         Self: Sized;
 }
@@ -129,12 +137,12 @@ fn hash<K: Hash>(key: &K) -> u64 {
 }
 
 /// Type alias for linked list pointers
-type ListEntryPtr<'lock_inst, K, P> =
-    Option<&'lock_inst UnsafeCell<LockInstance<'lock_inst, K, P>>>;
+type ListEntryPtr<'stroad_node, K, P> =
+    Option<&'stroad_node UnsafeCell<StroadNode<'stroad_node, K, P>>>;
 /// Doubly-linked list links
-struct DoubleLL<'lock_inst, K, P> {
-    next: ListEntryPtr<'lock_inst, K, P>,
-    prev: ListEntryPtr<'lock_inst, K, P>,
+struct DoubleLL<'stroad_node, K, P> {
+    next: ListEntryPtr<'stroad_node, K, P>,
+    prev: ListEntryPtr<'stroad_node, K, P>,
 }
 // safety: the linked list entry moving to another thread
 // means that that other thread has references to K and P
@@ -143,10 +151,10 @@ struct DoubleLL<'lock_inst, K, P> {
 // the way our code works can also end up sending the ownership
 // of K and P (i.e. unpark/abort/commit on another thread)
 // --> require Send
-// also used s.t. LockInstance will have Send/Sync as appropriate
-unsafe impl<'lock_inst, K: Send + Sync, P: Send + Sync> Send for DoubleLL<'lock_inst, K, P> {}
-unsafe impl<'lock_inst, K: Send + Sync, P: Send + Sync> Sync for DoubleLL<'lock_inst, K, P> {}
-impl<'lock_inst, K, P> Debug for DoubleLL<'lock_inst, K, P> {
+// also used s.t. StroadNode will have Send/Sync as appropriate
+unsafe impl<'stroad_node, K: Send + Sync, P: Send + Sync> Send for DoubleLL<'stroad_node, K, P> {}
+unsafe impl<'stroad_node, K: Send + Sync, P: Send + Sync> Sync for DoubleLL<'stroad_node, K, P> {}
+impl<'stroad_node, K, P> Debug for DoubleLL<'stroad_node, K, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DoubleLL")
             .field("next", &self.next.map(|x| x.get()))
@@ -154,32 +162,32 @@ impl<'lock_inst, K, P> Debug for DoubleLL<'lock_inst, K, P> {
             .finish()
     }
 }
-/// Lock instances (doubly-linked list)
+/// Hashtable entry nodes, which happen to correspond to locks in the upper layers
 ///
 /// Some notes on lifetimes, references, and pinning:
-/// If a lock is on any of the stroad linked lists, then it is not allowed
-/// to move them. If a lock isn't on our linked lists, then we don't care in this module.
+/// If a node is on any of the stroad linked lists, then it is not allowed
+/// to move them. If a node isn't on our linked lists, then we don't care in this module.
 /// This is enforced by this module taking in `&mut` and handing back `&` or `&mut`.
 /// A `&mut` reference implies that it is the *only* reference to that object,
-/// so we only hand a `&mut` back when the lock instance isn't on a linked list.
-/// Because a [Stroad] is annotated that it borrows items with lifetime `'lock_inst`,
-/// accepting a `&'lock_inst mut` tells the borrow checker that the passed-in items
+/// so we only hand a `&mut` back when the node instance isn't on a linked list.
+/// Because a [Stroad] is annotated that it borrows items with lifetime `'stroad_node`,
+/// accepting a `&'stroad_node mut` tells the borrow checker that the passed-in items
 /// can no longer be used by the calling code. The self-referential lifetimes
 /// enforce the appropriate pinning in memory.
-pub struct LockInstance<'lock_inst, K, P> {
+pub struct StroadNode<'stroad_node, K, P> {
     /// linked list next
-    link: DoubleLL<'lock_inst, K, P>,
+    link: DoubleLL<'stroad_node, K, P>,
     /// hash key
     key: Option<K>,
     /// task priority
     ///
     /// negative is a writer, smaller absolute value is higher priority
     prio: i64,
-    /// Payload for storing extra state (e.g. to get the work item from the lock instance)
-    pub payload: P,
+    /// A link to get the work item from this node
+    pub work_item_link: P,
 }
-impl<'lock_inst, K, P: LockInstPayload> LockInstance<'lock_inst, K, P> {
-    /// Construct, with the given payload
+impl<'stroad_node, K, P: StroadToWorkItemLink> StroadNode<'stroad_node, K, P> {
+    /// Construct, with the given work item link
     pub fn new(p: P) -> Self {
         Self {
             link: DoubleLL {
@@ -188,11 +196,11 @@ impl<'lock_inst, K, P: LockInstPayload> LockInstance<'lock_inst, K, P> {
             },
             key: None,
             prio: 0,
-            payload: p,
+            work_item_link: p,
         }
     }
 
-    /// Initialize in place, *EXCEPT* the external payload
+    /// Initialize in place, *EXCEPT* the external work item link
     pub unsafe fn init(self_: *mut Self) {
         (*self_).link = DoubleLL {
             next: None,
@@ -211,18 +219,18 @@ impl<'lock_inst, K, P: LockInstPayload> LockInstance<'lock_inst, K, P> {
         self.prio
     }
 }
-impl<'lock_inst, K: Debug, P: Debug> Debug for LockInstance<'lock_inst, K, P> {
+impl<'stroad_node, K: Debug, P: Debug> Debug for StroadNode<'stroad_node, K, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LockInstance")
+        f.debug_struct("StroadNode")
             .field("@addr", &(self as *const _))
             .field("link", &self.link)
             .field("key", &self.key)
             .field("prio", &self.prio)
-            .field("payload", &self.payload)
+            .field("work_item_link", &self.work_item_link)
             .finish()
     }
 }
-impl<'lock_inst, K, P: Default> Default for LockInstance<'lock_inst, K, P> {
+impl<'stroad_node, K, P: Default> Default for StroadNode<'stroad_node, K, P> {
     fn default() -> Self {
         Self {
             link: DoubleLL {
@@ -231,26 +239,26 @@ impl<'lock_inst, K, P: Default> Default for LockInstance<'lock_inst, K, P> {
             },
             key: None,
             prio: 0,
-            payload: P::default(),
+            work_item_link: P::default(),
         }
     }
 }
 
 /// One single hash bucket entry
-struct StroadBucket<'lock_inst, K, P> {
+struct StroadBucket<'stroad_node, K, P> {
     /// Lock instances wanting a lock
-    wants_lock: DoubleLL<'lock_inst, K, P>,
+    wants_lock: DoubleLL<'stroad_node, K, P>,
     /// Lock instances holding a lock
-    holds_lock: DoubleLL<'lock_inst, K, P>,
+    holds_lock: DoubleLL<'stroad_node, K, P>,
 }
 // safety for all blocks in this struct:
 // it is only possible for a &mut StroadBucket to be created
 // through a &mut StroadShard, where we have guaranteed
 // that we are the only thread accessing any of the list items
-impl<'lock_inst, K, P> StroadBucket<'lock_inst, K, P> {
+impl<'stroad_node, K, P> StroadBucket<'stroad_node, K, P> {
     pub fn link_at_head(
         &mut self,
-        lock_inst: &'lock_inst UnsafeCell<LockInstance<'lock_inst, K, P>>,
+        stroad_node: &'stroad_node UnsafeCell<StroadNode<'stroad_node, K, P>>,
         holding_lock: bool,
     ) {
         let list_head = if holding_lock {
@@ -260,24 +268,24 @@ impl<'lock_inst, K, P> StroadBucket<'lock_inst, K, P> {
         };
 
         unsafe {
-            (*(lock_inst.get())).link.next = list_head.next;
-            (*(lock_inst.get())).link.prev = None;
+            (*(stroad_node.get())).link.next = list_head.next;
+            (*(stroad_node.get())).link.prev = None;
         }
         if let Some(next) = list_head.next {
             unsafe {
-                (*(next.get())).link.prev = Some(lock_inst);
+                (*(next.get())).link.prev = Some(stroad_node);
             }
         }
 
-        list_head.next = Some(lock_inst);
+        list_head.next = Some(stroad_node);
         if list_head.prev.is_none() {
-            list_head.prev = Some(lock_inst);
+            list_head.prev = Some(stroad_node);
         }
     }
 
     pub fn link_at_tail(
         &mut self,
-        lock_inst: &'lock_inst UnsafeCell<LockInstance<'lock_inst, K, P>>,
+        stroad_node: &'stroad_node UnsafeCell<StroadNode<'stroad_node, K, P>>,
         holding_lock: bool,
     ) {
         let list_head = if holding_lock {
@@ -287,24 +295,24 @@ impl<'lock_inst, K, P> StroadBucket<'lock_inst, K, P> {
         };
 
         unsafe {
-            (*(lock_inst.get())).link.prev = list_head.prev;
-            (*(lock_inst.get())).link.next = None;
+            (*(stroad_node.get())).link.prev = list_head.prev;
+            (*(stroad_node.get())).link.next = None;
         }
         if let Some(prev) = list_head.prev {
             unsafe {
-                (*(prev.get())).link.next = Some(lock_inst);
+                (*(prev.get())).link.next = Some(stroad_node);
             }
         }
 
-        list_head.prev = Some(lock_inst);
+        list_head.prev = Some(stroad_node);
         if list_head.next.is_none() {
-            list_head.next = Some(lock_inst);
+            list_head.next = Some(stroad_node);
         }
     }
 
     pub fn unlink_item(
         &mut self,
-        lock_inst: &'lock_inst UnsafeCell<LockInstance<'lock_inst, K, P>>,
+        stroad_node: &'stroad_node UnsafeCell<StroadNode<'stroad_node, K, P>>,
         holding_lock: bool,
     ) {
         let list_head = if holding_lock {
@@ -314,22 +322,22 @@ impl<'lock_inst, K, P> StroadBucket<'lock_inst, K, P> {
         };
 
         unsafe {
-            if let Some(prev) = (*(lock_inst.get())).link.prev {
-                (*(prev.get())).link.next = (*(lock_inst.get())).link.next;
+            if let Some(prev) = (*(stroad_node.get())).link.prev {
+                (*(prev.get())).link.next = (*(stroad_node.get())).link.next;
             } else {
                 // entry 0
-                list_head.next = (*(lock_inst.get())).link.next;
+                list_head.next = (*(stroad_node.get())).link.next;
             }
-            if let Some(next) = (*(lock_inst.get())).link.next {
-                (*(next.get())).link.prev = (*(lock_inst.get())).link.prev;
+            if let Some(next) = (*(stroad_node.get())).link.next {
+                (*(next.get())).link.prev = (*(stroad_node.get())).link.prev;
             } else {
                 // entry n
-                list_head.prev = (*(lock_inst.get())).link.prev;
+                list_head.prev = (*(stroad_node.get())).link.prev;
             }
         }
     }
 }
-impl<'lock_inst, K, P> Debug for StroadBucket<'lock_inst, K, P> {
+impl<'stroad_node, K, P> Debug for StroadBucket<'stroad_node, K, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StroadBucket")
             .field("@addr", &(self as *const _))
@@ -343,16 +351,16 @@ impl<'lock_inst, K, P> Debug for StroadBucket<'lock_inst, K, P> {
 ///
 /// All methods *require* the bucket lock to already be held
 /// (i.e. access through [StroadShardGuard])
-struct StroadShard<'lock_inst, K, P> {
+struct StroadShard<'stroad_node, K, P> {
     /// Owning pointer to an array of [StroadBucket]
     buckets_and_lock: AtomicUsize,
     /// Number of entries in this shard
     nents: usize,
     /// log2 of the size of the bucket array
     capacity_shift: usize,
-    _p: PhantomData<StroadBucket<'lock_inst, K, P>>,
+    _p: PhantomData<StroadBucket<'stroad_node, K, P>>,
 }
-impl<'lock_inst, K, P> Debug for StroadShard<'lock_inst, K, P> {
+impl<'stroad_node, K, P> Debug for StroadShard<'stroad_node, K, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StroadShard")
             .field("@addr", &(self as *const _))
@@ -366,8 +374,8 @@ impl<'lock_inst, K, P> Debug for StroadShard<'lock_inst, K, P> {
             .finish()
     }
 }
-impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
-    StroadShard<'lock_inst, K, P>
+impl<'stroad_node, K: Hash + Eq + 'stroad_node, P: StroadToWorkItemLink + 'stroad_node>
+    StroadShard<'stroad_node, K, P>
 {
     /// Insert the lock instance onto either the [wants_lock](StroadBucket::wants_lock)
     /// or [holds_lock](StroadBucket::holds_lock) list
@@ -375,17 +383,17 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
     /// Returns a downgraded shared reference to the item
     pub fn insert<'stroad>(
         &'stroad mut self,
-        lock_inst: &'lock_inst mut LockInstance<'lock_inst, K, P>,
+        stroad_node: &'stroad_node mut StroadNode<'stroad_node, K, P>,
         key: K,
         hash: u64,
         holding_lock: bool,
-    ) -> &'lock_inst LockInstance<'lock_inst, K, P> {
+    ) -> &'stroad_node StroadNode<'stroad_node, K, P> {
         let buckets_ptr_usz = self.buckets_and_lock.load(Ordering::Relaxed) & !1;
-        let mut buckets_ptr = buckets_ptr_usz as *mut StroadBucket<'lock_inst, K, P>;
+        let mut buckets_ptr = buckets_ptr_usz as *mut StroadBucket<'stroad_node, K, P>;
 
         if buckets_ptr.is_null() {
             let layout =
-                Layout::array::<StroadBucket<'lock_inst, K, P>>(BUCKETS_INITIAL_ENT).unwrap();
+                Layout::array::<StroadBucket<'stroad_node, K, P>>(BUCKETS_INITIAL_ENT).unwrap();
             unsafe {
                 // safety: we "know" that all zeros is a valid init
                 let new_buckets = alloc::alloc_zeroed(layout);
@@ -407,26 +415,26 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
             let buckets = &mut *slice_from_raw_parts_mut(buckets_ptr, 1 << self.capacity_shift);
             &mut buckets[bucket_i as usize]
         };
-        lock_inst.key = Some(key);
-        bucket.link_at_head(to_unsafecell(lock_inst), holding_lock);
+        stroad_node.key = Some(key);
+        bucket.link_at_head(to_unsafecell(stroad_node), holding_lock);
 
         self.nents += 1;
-        lock_inst
+        stroad_node
     }
 
     /// Double the size of the hash bucket array (and rehash everything)
     fn resize_buckets<'stroad>(
         &'stroad mut self,
-        old_buckets_ptr: *mut StroadBucket<'lock_inst, K, P>,
-    ) -> *mut StroadBucket<'lock_inst, K, P> {
+        old_buckets_ptr: *mut StroadBucket<'stroad_node, K, P>,
+    ) -> *mut StroadBucket<'stroad_node, K, P> {
         let old_layout =
-            Layout::array::<StroadBucket<'lock_inst, K, P>>(1 << self.capacity_shift).unwrap();
+            Layout::array::<StroadBucket<'stroad_node, K, P>>(1 << self.capacity_shift).unwrap();
         self.capacity_shift += 1;
         let new_layout =
-            Layout::array::<StroadBucket<'lock_inst, K, P>>(1 << self.capacity_shift).unwrap();
+            Layout::array::<StroadBucket<'stroad_node, K, P>>(1 << self.capacity_shift).unwrap();
         let new_buckets_ptr = unsafe {
             let new_buckets = alloc::alloc_zeroed(new_layout);
-            new_buckets as *mut StroadBucket<'lock_inst, K, P>
+            new_buckets as *mut StroadBucket<'stroad_node, K, P>
         };
         let (old_buckets, new_buckets) = unsafe {
             // safety: this is the size of the buckets array
@@ -439,8 +447,8 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
         for old_bucket_i in 0..old_buckets.len() {
             let mut list_ent = old_buckets[old_bucket_i].holds_lock.next;
             while let Some(list_ent_) = list_ent {
-                // safety: when a lock instance is parked/owned, we take in a &'lock_inst mut
-                // but only release a &'lock_inst (non-mut) back to external code
+                // safety: when a lock instance is parked/owned, we take in a &'stroad_node mut
+                // but only release a &'stroad_node (non-mut) back to external code
                 // (so external code can't modify anything anymore).
                 // the only time when a &mut is created again is when unparking
                 // or cancelling, in which case only a single thread can be performing
@@ -484,7 +492,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
     /// This is used for the unordered case
     pub fn unpark_all(&mut self, key: &K, hash: u64) {
         let buckets = self.buckets_and_lock.load(Ordering::Relaxed) & !1;
-        let buckets = buckets as *mut StroadBucket<'lock_inst, K, P>;
+        let buckets = buckets as *mut StroadBucket<'stroad_node, K, P>;
         let bucket_i = (hash >> HASH_NUM_SHARDS_SHIFT) & ((1 << self.capacity_shift) - 1);
 
         if buckets.is_null() {
@@ -507,7 +515,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
                 // only at this point, after unlink, do we know that nothing else
                 // is referencing the node
                 let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                LockInstPayload::unpark(list_ent_mut);
+                StroadToWorkItemLink::unpark(list_ent_mut);
                 self.nents -= 1;
             } else {
                 list_ent = list_ent_ref.link.next;
@@ -517,14 +525,14 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
 }
 
 /// RAII guard locking one single shard of the hash map
-struct StroadShardGuard<'stroad, 'lock_inst, K, P>(&'stroad mut StroadShard<'lock_inst, K, P>);
-impl<'stroad, 'lock_inst, K, P> Debug for StroadShardGuard<'stroad, 'lock_inst, K, P> {
+struct StroadShardGuard<'stroad, 'stroad_node, K, P>(&'stroad mut StroadShard<'stroad_node, K, P>);
+impl<'stroad, 'stroad_node, K, P> Debug for StroadShardGuard<'stroad, 'stroad_node, K, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // because we know we have the lock held, we can print all the things
         let mut dbg = f.debug_struct("StroadShardGuard");
         dbg.field("@p", &(self.0 as *const _));
         let buckets = self.buckets_and_lock.load(Ordering::Relaxed) & !1;
-        let buckets = buckets as *const StroadBucket<'lock_inst, K, P>;
+        let buckets = buckets as *const StroadBucket<'stroad_node, K, P>;
         unsafe {
             // safety: this is the size of the buckets array
             // (which this shard exclusively owns)
@@ -536,28 +544,28 @@ impl<'stroad, 'lock_inst, K, P> Debug for StroadShardGuard<'stroad, 'lock_inst, 
         dbg.finish()
     }
 }
-impl<'stroad, 'lock_inst, K, P> Drop for StroadShardGuard<'stroad, 'lock_inst, K, P> {
+impl<'stroad, 'stroad_node, K, P> Drop for StroadShardGuard<'stroad, 'stroad_node, K, P> {
     fn drop(&mut self) {
         self.0.buckets_and_lock.fetch_and(!1, Ordering::Release);
     }
 }
-impl<'stroad, 'lock_inst, K, P> Deref for StroadShardGuard<'stroad, 'lock_inst, K, P> {
-    type Target = StroadShard<'lock_inst, K, P>;
+impl<'stroad, 'stroad_node, K, P> Deref for StroadShardGuard<'stroad, 'stroad_node, K, P> {
+    type Target = StroadShard<'stroad_node, K, P>;
 
     fn deref(&self) -> &Self::Target {
         self.0
     }
 }
-impl<'stroad, 'lock_inst, K, P> DerefMut for StroadShardGuard<'stroad, 'lock_inst, K, P> {
+impl<'stroad, 'stroad_node, K, P> DerefMut for StroadShardGuard<'stroad, 'stroad_node, K, P> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0
     }
 }
 
 /// Stroad hash map
-pub struct Stroad<'lock_inst, K, P> {
+pub struct Stroad<'stroad_node, K, P> {
     /// Array of shards
-    shards: [UnsafeCell<StroadShard<'lock_inst, K, P>>; HASH_NUM_SHARDS],
+    shards: [UnsafeCell<StroadShard<'stroad_node, K, P>>; HASH_NUM_SHARDS],
 }
 // safety: we are using interior mutability with locking
 // the locks guarantee that only one thread is accessing a given shard at once
@@ -565,8 +573,8 @@ pub struct Stroad<'lock_inst, K, P> {
 // --> require Sync
 // a &Stroad can also send the ownership of K and P as explained for the linked list item
 // --> require Send
-unsafe impl<'lock_inst, K: Send + Sync, P: Send + Sync> Sync for Stroad<'lock_inst, K, P> {}
-impl<'lock_inst, K, P> Debug for Stroad<'lock_inst, K, P> {
+unsafe impl<'stroad_node, K: Send + Sync, P: Send + Sync> Sync for Stroad<'stroad_node, K, P> {}
+impl<'stroad_node, K, P> Debug for Stroad<'stroad_node, K, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut dbg = f.debug_struct("Stroad");
         for i in 0..HASH_NUM_SHARDS {
@@ -579,8 +587,8 @@ impl<'lock_inst, K, P> Debug for Stroad<'lock_inst, K, P> {
         dbg.finish()
     }
 }
-impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
-    Stroad<'lock_inst, K, P>
+impl<'stroad_node, K: Hash + Eq + 'stroad_node, P: StroadToWorkItemLink + 'stroad_node>
+    Stroad<'stroad_node, K, P>
 {
     /// Allocate a new hash map
     ///
@@ -604,12 +612,12 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
     /// (blocking the work item) onto the [wants_lock](StroadBucket::wants_lock) list
     pub fn unordered_park_conditionally<VAL>(
         &self,
-        lock_inst: &'lock_inst mut LockInstance<'lock_inst, K, P>,
+        stroad_node: &'stroad_node mut StroadNode<'stroad_node, K, P>,
         key: K,
         validation: VAL,
     ) -> Result<
-        &'lock_inst LockInstance<'lock_inst, K, P>,
-        &'lock_inst mut LockInstance<'lock_inst, K, P>,
+        &'stroad_node StroadNode<'stroad_node, K, P>,
+        &'stroad_node mut StroadNode<'stroad_node, K, P>,
     >
     where
         VAL: FnOnce() -> bool,
@@ -621,10 +629,10 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
         // lock held, call validation
         let should_park = validation();
         if !should_park {
-            return Err(lock_inst);
+            return Err(stroad_node);
         }
 
-        let ret = shard.insert(lock_inst, key, hash, false);
+        let ret = shard.insert(stroad_node, key, hash, false);
         Ok(ret)
     }
 
@@ -640,7 +648,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
     fn lock_shard<'stroad>(
         &'stroad self,
         shard_i: usize,
-    ) -> StroadShardGuard<'stroad, 'lock_inst, K, P> {
+    ) -> StroadShardGuard<'stroad, 'stroad_node, K, P> {
         let mut _spins = 0;
         let shard = self.shards[shard_i].get();
         'outer_spin: loop {
@@ -678,16 +686,16 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
     /// Calls the `mark_item` callback with the bucket lock held upon success
     pub fn ordered_do_locking<MARK>(
         &self,
-        lock_inst: &'lock_inst mut LockInstance<'lock_inst, K, P>,
+        stroad_node: &'stroad_node mut StroadNode<'stroad_node, K, P>,
         key: K,
         prio: i64,
         mark_item: MARK,
-    ) -> (bool, &'lock_inst LockInstance<'lock_inst, K, P>)
+    ) -> (bool, &'stroad_node StroadNode<'stroad_node, K, P>)
     where
         MARK: FnOnce(),
     {
         let mut lock_okay = true;
-        lock_inst.prio = prio;
+        stroad_node.prio = prio;
 
         let hash = hash(&key);
         let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
@@ -699,9 +707,9 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
         if buckets_ptr_usz == 0 {
             // there isn't even a bucket, so nobody has a lock, so fast path claim
             mark_item();
-            return (true, shard.insert(lock_inst, key, hash, true));
+            return (true, shard.insert(stroad_node, key, hash, true));
         }
-        let buckets_ptr = buckets_ptr_usz as *mut StroadBucket<'lock_inst, K, P>;
+        let buckets_ptr = buckets_ptr_usz as *mut StroadBucket<'stroad_node, K, P>;
         let bucket = unsafe {
             // safety: this is the size of the buckets array
             // (which this shard exclusively owns)
@@ -720,7 +728,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
             // also for readers of the same priority.
             // don't actually commit to cancelling anything yet, until
             // we *know* we're going to steal the lock
-            let mut list_ent: Option<&UnsafeCell<LockInstance<'_, K, P>>> = bucket.holds_lock.next;
+            let mut list_ent: Option<&UnsafeCell<StroadNode<'_, K, P>>> = bucket.holds_lock.next;
             while let Some(list_ent_) = list_ent {
                 // safety: see above in resize_buckets
                 let list_ent_ref = unsafe { &*list_ent_.get() };
@@ -746,7 +754,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
             // we have to loop twice, because we don't want to start canceling
             // readers unless we *know* we're going to take the write lock
             if lock_okay {
-                let mut list_ent: Option<&UnsafeCell<LockInstance<'_, K, P>>> =
+                let mut list_ent: Option<&UnsafeCell<StroadNode<'_, K, P>>> =
                     bucket.holds_lock.next;
                 while let Some(list_ent_) = list_ent {
                     // safety: see above
@@ -760,7 +768,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
                             // only at this point, after unlink, do we know that nothing else
                             // is referencing the node
                             let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                            LockInstPayload::cancel(list_ent_mut);
+                            StroadToWorkItemLink::cancel(list_ent_mut);
                             shard.nents -= 1;
                         } else {
                             let other_prio = list_ent_ref.prio;
@@ -770,7 +778,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
                                 // only at this point, after unlink, do we know that nothing else
                                 // is referencing the node
                                 let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                                LockInstPayload::cancel(list_ent_mut);
+                                StroadToWorkItemLink::cancel(list_ent_mut);
                                 shard.nents -= 1;
                             } else if prio == other_prio {
                                 panic!("reader with same priority, even though we checked?");
@@ -787,7 +795,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
             // a reader is okay as long as there isn't a writer
             // with a higher or *equal* priority
 
-            let mut list_ent: Option<&UnsafeCell<LockInstance<'_, K, P>>> = bucket.holds_lock.next;
+            let mut list_ent: Option<&UnsafeCell<StroadNode<'_, K, P>>> = bucket.holds_lock.next;
             while let Some(list_ent_) = list_ent {
                 // safety: see above
                 let list_ent_ref = unsafe { &*list_ent_.get() };
@@ -811,27 +819,27 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
         if lock_okay {
             mark_item();
         }
-        let ret = shard.insert(lock_inst, key, hash, lock_okay);
+        let ret = shard.insert(stroad_node, key, hash, lock_okay);
         (lock_okay, ret)
     }
 
     /// For an ordered algorithm, wake everything that would be able to run
     ///
-    /// Should only be called if lock_inst is holding a write lock,
-    /// or if the lock_inst is holding the *last* read lock, with no write lock
+    /// Should only be called if stroad_node is holding a write lock,
+    /// or if the stroad_node is holding the *last* read lock, with no write lock
     /// of lower priority pending.
     pub fn ordered_do_unlocking<VAL, UNMARK>(
         &self,
-        lock_inst: &'lock_inst LockInstance<'lock_inst, K, P>,
+        stroad_node: &'stroad_node StroadNode<'stroad_node, K, P>,
         unpark_validation: VAL,
         unmark_item: UNMARK,
-    ) -> &'lock_inst mut LockInstance<'lock_inst, K, P>
+    ) -> &'stroad_node mut StroadNode<'stroad_node, K, P>
     where
         VAL: FnOnce() -> bool,
         UNMARK: FnOnce(),
     {
-        let key = lock_inst.key.as_ref().unwrap();
-        let mut prio = lock_inst.prio;
+        let key = stroad_node.key.as_ref().unwrap();
+        let mut prio = stroad_node.prio;
 
         let hash = hash(key);
         let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
@@ -840,7 +848,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
         // fixme layering?
         let bucket_i = (hash >> HASH_NUM_SHARDS_SHIFT) & ((1 << shard.capacity_shift) - 1);
         let buckets_ptr_usz = shard.buckets_and_lock.load(Ordering::Relaxed) & !1;
-        let buckets_ptr = buckets_ptr_usz as *mut StroadBucket<'lock_inst, K, P>;
+        let buckets_ptr = buckets_ptr_usz as *mut StroadBucket<'stroad_node, K, P>;
         let bucket = unsafe {
             // safety: this is the size of the buckets array
             // (which this shard exclusively owns)
@@ -851,10 +859,10 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
         // validation for unlocking reader, with lock held
         if !unpark_validation() {
             // don't unpark anything, just unlink ourselves
-            let lock_inst = to_unsafecell(lock_inst);
-            bucket.unlink_item(lock_inst, true);
+            let stroad_node = to_unsafecell(stroad_node);
+            bucket.unlink_item(stroad_node, true);
             unmark_item();
-            return unsafe { &mut *lock_inst.get() };
+            return unsafe { &mut *stroad_node.get() };
         }
 
         // go through awaking everything that needs to be awaked
@@ -868,7 +876,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
         let mut highest_found_writer_prio: Option<i64> = None;
         let mut highest_found_writer = None;
 
-        let mut list_ent: Option<&UnsafeCell<LockInstance<'_, K, P>>> = bucket.wants_lock.next;
+        let mut list_ent: Option<&UnsafeCell<StroadNode<'_, K, P>>> = bucket.wants_lock.next;
         while let Some(list_ent_) = list_ent {
             // safety: see above
             let list_ent_ref = unsafe { &*list_ent_.get() };
@@ -905,7 +913,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
 
         // loop again, unparking readers as necessary
         let reader_unpark_prio = highest_found_writer_prio.unwrap_or(i64::MAX);
-        let mut list_ent: Option<&UnsafeCell<LockInstance<'_, K, P>>> = bucket.wants_lock.next;
+        let mut list_ent: Option<&UnsafeCell<StroadNode<'_, K, P>>> = bucket.wants_lock.next;
         while let Some(list_ent_) = list_ent {
             // safety: see above
             let list_ent_ref = unsafe { &*list_ent_.get() };
@@ -923,7 +931,7 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
                         // only at this point, after unlink, do we know that nothing else
                         // is referencing the node
                         let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                        LockInstPayload::unpark(list_ent_mut);
+                        StroadToWorkItemLink::unpark(list_ent_mut);
                         shard.nents -= 1;
                     } else {
                         list_ent = list_ent_ref.link.next;
@@ -937,15 +945,15 @@ impl<'lock_inst, K: Hash + Eq + 'lock_inst, P: LockInstPayload + 'lock_inst>
         if !found_readers_of_same_priority {
             if let Some(highest_found_writer) = highest_found_writer {
                 bucket.unlink_item(highest_found_writer, false);
-                LockInstPayload::unpark(unsafe { &mut *highest_found_writer.get() });
+                StroadToWorkItemLink::unpark(unsafe { &mut *highest_found_writer.get() });
                 shard.nents -= 1;
             }
         }
 
-        let lock_inst = to_unsafecell(lock_inst);
-        bucket.unlink_item(lock_inst, true);
+        let stroad_node = to_unsafecell(stroad_node);
+        bucket.unlink_item(stroad_node, true);
         unmark_item();
-        unsafe { &mut *lock_inst.get() }
+        unsafe { &mut *stroad_node.get() }
     }
 }
 
