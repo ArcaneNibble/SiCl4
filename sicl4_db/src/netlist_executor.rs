@@ -59,11 +59,11 @@ const NUM_THREADS_FOR_NOW: usize = 1;
 const MAX_ORDERED_LOCKS_PER_WORK_ITEM: usize = 4;
 
 #[derive(Debug)]
-struct WorkItemPayload<'arena, 'work_item> {
+struct WorkItemPerLockData<'arena, 'work_item> {
     w: &'work_item WorkItem<'arena, 'work_item>,
     // guard_handed_out: Cell<bool>,
 }
-impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPayload<'arena, 'work_item> {
+impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPerLockData<'arena, 'work_item> {
     fn cancel<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
     where
         Self: Sized,
@@ -84,7 +84,7 @@ pub struct WorkItem<'arena, 'work_item> {
     seed_node: NetlistRef<'arena>,
     locks_used: Cell<usize>,
     locks: [MaybeUninit<
-        UnsafeCell<LockAndStroadData<'arena, 'work_item, WorkItemPayload<'arena, 'work_item>>>,
+        UnsafeCell<LockAndStroadData<'arena, 'work_item, WorkItemPerLockData<'arena, 'work_item>>>,
     >; MAX_ORDERED_LOCKS_PER_WORK_ITEM],
 }
 // xxx fixme wtf is this
@@ -111,7 +111,11 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         obj: NetlistRef<'arena>,
     ) -> (
         usize,
-        &'work_item mut LockAndStroadData<'arena, 'work_item, WorkItemPayload<'arena, 'work_item>>,
+        &'work_item mut LockAndStroadData<
+            'arena,
+            'work_item,
+            WorkItemPerLockData<'arena, 'work_item>,
+        >,
     ) {
         let lock_idx = self.locks_used.get();
         if lock_idx == MAX_ORDERED_LOCKS_PER_WORK_ITEM {
@@ -136,7 +140,7 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
 #[derive(Debug)]
 pub struct NetlistManager<'arena> {
     heap: SlabRoot<'arena, NetlistTypeMapper>,
-    stroad: Box<Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPayload<'arena, 'arena>>>,
+    stroad: Box<Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>>,
     /// Ensure that this isn't Sync (only various sub-accessors are),
     /// and that only one algorithm can be running at once
     in_use: Cell<bool>,
@@ -206,7 +210,7 @@ impl<'arena> NetlistManager<'arena> {
 
 #[derive(Debug)]
 pub struct UnorderedAlgorithmROView<'arena> {
-    stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPayload<'arena, 'arena>>,
+    stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
     heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
 }
 impl<'arena> UnorderedAlgorithmROView<'arena> {
@@ -234,7 +238,7 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
 
 #[derive(Debug)]
 pub struct UnorderedAlgorithmRWView<'arena> {
-    stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPayload<'arena, 'arena>>,
+    stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
     heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
 }
 impl<'arena> UnorderedAlgorithmRWView<'arena> {
@@ -269,7 +273,7 @@ impl<'arena> UnorderedAlgorithmRWView<'arena> {
 
 #[derive(Debug)]
 pub struct UnorderedObjROGuard<'arena, T> {
-    lock: &'arena LockAndStroadData<'arena, 'arena, WorkItemPayload<'arena, 'arena>>,
+    lock: &'arena LockAndStroadData<'arena, 'arena, WorkItemPerLockData<'arena, 'arena>>,
     // todo fixme variance?
     _pd1: PhantomData<&'arena T>,
     // todo
