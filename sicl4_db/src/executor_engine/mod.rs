@@ -32,6 +32,19 @@ impl<'arena> From<NetlistWireRef<'arena>> for NetlistRef<'arena> {
     }
 }
 impl<'arena> NetlistRef<'arena> {
+    pub fn cell(self) -> NetlistCellRef<'arena> {
+        match self {
+            NetlistRef::Cell(x) => x,
+            _ => panic!("Not a Cell"),
+        }
+    }
+    pub fn wire(self) -> NetlistWireRef<'arena> {
+        match self {
+            NetlistRef::Wire(x) => x,
+            _ => panic!("Not a Wire"),
+        }
+    }
+
     fn type_erase(self) -> TypeErasedObjRef<'arena> {
         match self {
             NetlistRef::Cell(x) => x.type_erase(),
@@ -61,7 +74,7 @@ impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPerLockData<'arena, 'w
 
 #[derive(Debug)]
 pub struct WorkItem<'arena, 'work_item> {
-    seed_node: NetlistRef<'arena>,
+    pub seed_node: NetlistRef<'arena>,
     _todo_wip_cancelled: AtomicBool,
     locks_used: Cell<usize>,
     locks: [MaybeUninit<
@@ -179,8 +192,7 @@ impl<'arena> NetlistManager<'arena> {
                         heap_thread_shard,
                     };
                     while let Some(work_item) = local_queue_rc.borrow_mut().pop() {
-                        let seed_node = work_item.seed_node;
-                        let ro_ret = algo.try_process_readonly(&mut ro_view, seed_node, work_item);
+                        let ro_ret = algo.try_process_readonly(&mut ro_view, work_item);
                         if ro_ret.is_err() {
                             println!("parked!");
                             unsafe {
@@ -209,7 +221,7 @@ impl<'arena> NetlistManager<'arena> {
                             heap_thread_shard: ro_view.heap_thread_shard,
                             local_queue: local_queue_rc.clone(),
                         };
-                        algo.process_finish_readwrite(&mut rw_view, seed_node, work_item, ro_ret);
+                        algo.process_finish_readwrite(&mut rw_view, work_item, ro_ret);
                         ro_view = UnorderedAlgorithmROView {
                             stroad,
                             heap_thread_shard: rw_view.heap_thread_shard,

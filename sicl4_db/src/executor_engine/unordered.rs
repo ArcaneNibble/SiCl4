@@ -12,14 +12,12 @@ pub trait UnorderedAlgorithm: Send + Sync {
     fn try_process_readonly<'algo_global_state, 'view, 'arena, 'work_item>(
         &'algo_global_state self,
         view: &'view mut UnorderedAlgorithmROView,
-        node: NetlistRef<'arena>,
         work_item: &'work_item WorkItem<'arena, 'work_item>,
     ) -> Result<Self::ROtoRWTy, ()>;
 
     fn process_finish_readwrite<'algo_state, 'view, 'arena, 'work_item>(
         &'algo_state self,
         view: &'view mut UnorderedAlgorithmRWView,
-        node: NetlistRef<'arena>,
         work_item: &'work_item WorkItem<'arena, 'work_item>,
         ro_output: Self::ROtoRWTy,
     );

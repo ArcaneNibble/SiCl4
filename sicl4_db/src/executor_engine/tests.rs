@@ -90,3 +90,46 @@ fn executor_asdf() {
     let cell3 = view.get_cell(cell_ref);
     dbg!(&cell3);
 }
+
+#[cfg(not(loom))]
+#[test]
+fn executor_asdf2() {
+    struct TestAlgo {}
+    impl UnorderedAlgorithm for TestAlgo {
+        type ROtoRWTy = ();
+
+        fn try_process_readonly<'algo_global_state, 'view, 'arena, 'work_item>(
+            &'algo_global_state self,
+            view: &'view mut UnorderedAlgorithmROView,
+            work_item: &'work_item WorkItem<'arena, 'work_item>,
+        ) -> Result<Self::ROtoRWTy, ()> {
+            dbg!(work_item.seed_node);
+            let x = view.try_lock_cell(work_item, work_item.seed_node.cell(), false);
+            Ok(())
+        }
+
+        fn process_finish_readwrite<'algo_state, 'view, 'arena, 'work_item>(
+            &'algo_state self,
+            _view: &'view mut UnorderedAlgorithmRWView,
+            work_item: &'work_item WorkItem<'arena, 'work_item>,
+            _ro_output: Self::ROtoRWTy,
+        ) {
+            dbg!(work_item.seed_node);
+        }
+    }
+
+    let manager = NetlistManager::new();
+    let mut view = manager.access_single_threaded();
+    let mut cell = view.new_cell();
+    let mut wire = view.new_wire();
+    cell._wire = Some(wire.x);
+    wire._cell = Some(cell.x);
+    let work_item = view.new_work_item(cell.x.into());
+    drop(view);
+
+    let workqueue = work_queue::Queue::new(1, 128);
+    workqueue.push(&*work_item);
+
+    let algo = TestAlgo {};
+    manager.run_unordered_algorithm(&algo, &workqueue);
+}
