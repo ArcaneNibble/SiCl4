@@ -11,14 +11,14 @@ pub trait UnorderedAlgorithm: Send + Sync {
         &'algo_global_state self,
         view: &'view mut UnorderedAlgorithmROView,
         node: NetlistRef<'arena>,
-        work_item: &'work_item mut WorkItem<'arena, 'work_item>,
-    ) -> Result<(Self::ROtoRWTy, &'work_item mut WorkItem<'arena, 'work_item>), ()>;
+        work_item: &'work_item WorkItem<'arena, 'work_item>,
+    ) -> Result<Self::ROtoRWTy, ()>;
 
     fn process_finish_readwrite<'algo_state, 'view, 'arena, 'work_item>(
         &'algo_state self,
         view: &'view mut UnorderedAlgorithmRWView,
         node: NetlistRef<'arena>,
-        work_item: &'work_item mut WorkItem<'arena, 'work_item>,
+        work_item: &'work_item WorkItem<'arena, 'work_item>,
         ro_output: Self::ROtoRWTy,
     );
 }
@@ -35,7 +35,7 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
         work_item: &'arena WorkItem<'arena, 'arena>,
         obj: NetlistCellRef<'arena>,
         want_write: bool,
-    ) -> Result<UnorderedObjROGuard<'arena, NetlistCell<'arena>>, ()> {
+    ) -> Result<UnorderedObjPhase1Guard<'arena, NetlistCell<'arena>>, ()> {
         let (_lock_idx, lock) = work_item.next_lock(NetlistRef::Cell(obj));
         let lock_gotten = if !want_write {
             lock.unordered_try_read(self.stroad)?
@@ -45,10 +45,7 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
         if !lock_gotten {
             return Err(());
         }
-        Ok(UnorderedObjROGuard {
-            lock,
-            _pd1: PhantomData,
-        })
+        Ok(UnorderedObjPhase1Guard { x: obj })
     }
 }
 
@@ -63,7 +60,8 @@ impl<'arena> UnorderedAlgorithmRWView<'arena> {
         &'wrapper mut self,
         work_item: &'arena WorkItem<'arena, 'arena>,
         obj: NetlistCellRef<'arena>,
-    ) -> UnorderedObjROGuard<'arena, NetlistCell<'arena>> {
+    ) -> UnorderedObjPhase2ROGuard<'arena, NetlistCell<'arena>> {
+        // xxx can this be done more efficiently?
         for lock_idx in 0..work_item.locks_used.get() {
             let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
             if lock_i.p == obj.type_erase() {
@@ -84,21 +82,127 @@ impl<'arena> UnorderedAlgorithmRWView<'arena> {
                     .stroad_work_item_link()
                     .guard_handed_out
                     .store(true, Ordering::Relaxed);
-                return UnorderedObjROGuard {
+                return UnorderedObjPhase2ROGuard {
                     lock: lock_i,
-                    _pd1: PhantomData,
+                    stroad: self.stroad,
+                    x: obj,
                 };
             }
         }
-        panic!("Tried to access a node that wasn't tagged in RO phase")
+        panic!("Tried to access a node that wasn't tagged in phase 1")
+    }
+
+    pub fn get_cell_write<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistCellRef<'arena>,
+    ) -> UnorderedObjPhase2RWGuard<'arena, NetlistCell<'arena>> {
+        // xxx can this be done more efficiently?
+        for lock_idx in 0..work_item.locks_used.get() {
+            let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
+            if lock_i.p == obj.type_erase() {
+                if lock_i.state.get() != LockState::LockedForUnorderedWrite {
+                    panic!("Tried to access a node in the wrong state")
+                }
+                if lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .load(Ordering::Relaxed)
+                {
+                    panic!("Tried to access a node multiple times")
+                    // xxx this is meh
+                }
+                lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .store(true, Ordering::Relaxed);
+                return UnorderedObjPhase2RWGuard {
+                    lock: lock_i,
+                    stroad: self.stroad,
+                    x: obj,
+                };
+            }
+        }
+        panic!("Tried to access a node that wasn't tagged in phase 1")
     }
 }
 
 #[derive(Debug)]
-pub struct UnorderedObjROGuard<'arena, T> {
+pub struct UnorderedObjPhase1Guard<'arena, T> {
+    pub x: ObjRef<'arena, T>,
+}
+impl<'arena, T> UnorderedObjPhase1Guard<'arena, T> {
+    pub fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
+        self.x
+    }
+}
+impl<'arena, T> Deref for UnorderedObjPhase1Guard<'arena, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // safety: atomic ops (in lock_ops) ensures that there is no conflict
+        unsafe { &*self.x.ptr.payload.get() }
+    }
+}
+
+#[derive(Debug)]
+pub struct UnorderedObjPhase2ROGuard<'arena, T> {
     lock: &'arena LockAndStroadData<'arena, 'arena, WorkItemPerLockData<'arena, 'arena>>,
-    // todo fixme variance?
-    _pd1: PhantomData<&'arena T>,
-    // todo
-    // pub x: ObjRef<'arena, T>,
+    stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
+    pub x: ObjRef<'arena, T>,
+}
+impl<'arena, T> UnorderedObjPhase2ROGuard<'arena, T> {
+    pub fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
+        self.x
+    }
+}
+impl<'arena, T> Drop for UnorderedObjPhase2ROGuard<'arena, T> {
+    fn drop(&mut self) {
+        // safety: we hold the lock
+        unsafe {
+            self.lock.unlock(self.stroad);
+        }
+    }
+}
+impl<'arena, T> Deref for UnorderedObjPhase2ROGuard<'arena, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // safety: atomic ops (in lock_ops) ensures that there is no conflict
+        unsafe { &*self.x.ptr.payload.get() }
+    }
+}
+
+#[derive(Debug)]
+pub struct UnorderedObjPhase2RWGuard<'arena, T> {
+    lock: &'arena LockAndStroadData<'arena, 'arena, WorkItemPerLockData<'arena, 'arena>>,
+    stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
+    pub x: ObjRef<'arena, T>,
+}
+impl<'arena, T> UnorderedObjPhase2RWGuard<'arena, T> {
+    pub fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
+        self.x
+    }
+}
+impl<'arena, T> Drop for UnorderedObjPhase2RWGuard<'arena, T> {
+    fn drop(&mut self) {
+        // safety: we hold the lock
+        unsafe {
+            self.lock.unlock(self.stroad);
+        }
+    }
+}
+impl<'arena, T> Deref for UnorderedObjPhase2RWGuard<'arena, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // safety: atomic ops (in lock_ops) ensures that there is no conflict
+        unsafe { &*self.x.ptr.payload.get() }
+    }
+}
+impl<'arena, T> DerefMut for UnorderedObjPhase2RWGuard<'arena, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // safety: atomic ops (in lock_ops) ensures that there is no conflict
+        unsafe { &mut *self.x.ptr.payload.get() }
+    }
 }

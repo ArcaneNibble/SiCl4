@@ -3,7 +3,6 @@
 use std::{
     alloc::Layout,
     cell::{Cell, UnsafeCell},
-    marker::PhantomData,
     mem::{self, MaybeUninit},
     ops::{Deref, DerefMut},
     sync::atomic::Ordering,
@@ -40,7 +39,7 @@ impl<'arena> NetlistRef<'arena> {
     }
 }
 
-const MAX_ORDERED_LOCKS_PER_WORK_ITEM: usize = 4;
+const MAX_LOCKS_PER_WORK_ITEM: usize = 4;
 
 #[derive(Debug)]
 struct WorkItemPerLockData<'arena, 'work_item> {
@@ -63,7 +62,7 @@ pub struct WorkItem<'arena, 'work_item> {
     locks_used: Cell<usize>,
     locks: [MaybeUninit<
         UnsafeCell<LockAndStroadData<'arena, 'work_item, WorkItemPerLockData<'arena, 'work_item>>>,
-    >; MAX_ORDERED_LOCKS_PER_WORK_ITEM],
+    >; MAX_LOCKS_PER_WORK_ITEM],
 }
 // xxx fixme wtf is this
 // xxx fixme the entire safety of this needs to be figured out, since it has unsafe inner mutability
@@ -96,7 +95,7 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         >,
     ) {
         let lock_idx = self.locks_used.get();
-        if lock_idx == MAX_ORDERED_LOCKS_PER_WORK_ITEM {
+        if lock_idx == MAX_LOCKS_PER_WORK_ITEM {
             todo!("need to allocate a spill block?");
         }
         self.locks_used.set(lock_idx + 1);
@@ -159,13 +158,34 @@ impl<'arena> NetlistManager<'arena> {
                         heap_thread_shard,
                     };
                     while let Some(work_item) = local_queue.pop() {
+                        // we are passed in exclusive pointers, but, as soon as any locks are created,
+                        // the reference is no longer &mut exclusive. downgrade immediately.
+                        // fixme should we just never expose &mut WorkItem?
+                        let work_item = &*work_item;
                         let seed_node = work_item.seed_node;
                         let ro_ret = algo.try_process_readonly(&mut ro_view, seed_node, work_item);
                         if ro_ret.is_err() {
                             println!("parked!");
+                            unsafe {
+                                let locks_used = work_item.locks_used.get();
+                                let lock_that_failed =
+                                    &*work_item.locks[locks_used - 1].assume_init_ref().get();
+                                debug_assert!(lock_that_failed.state.get() == LockState::Parked);
+
+                                // release all the other locks, as we failed to speculative grab what we needed
+                                for lock_idx in 0..(locks_used - 1) {
+                                    let lock = &*work_item.locks[lock_idx].assume_init_ref().get();
+                                    debug_assert!(
+                                        (lock.state.get() == LockState::LockedForUnorderedRead)
+                                            || lock.state.get()
+                                                == LockState::LockedForUnorderedWrite
+                                    );
+                                    lock.unlock(stroad);
+                                }
+                            }
                             continue;
                         }
-                        let (ro_ret, work_item) = ro_ret.unwrap();
+                        let ro_ret = ro_ret.unwrap();
 
                         let mut rw_view = UnorderedAlgorithmRWView {
                             stroad,
