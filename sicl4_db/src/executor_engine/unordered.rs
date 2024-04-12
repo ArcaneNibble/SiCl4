@@ -9,16 +9,16 @@ use super::*;
 pub trait UnorderedAlgorithm: Send + Sync {
     type ROtoRWTy;
 
-    fn try_process_readonly<'algo_global_state, 'view, 'arena, 'work_item>(
+    fn try_process_readonly<'algo_global_state, 'view, 'arena>(
         &'algo_global_state self,
-        view: &'view mut UnorderedAlgorithmROView,
-        work_item: &'work_item WorkItem<'arena, 'work_item>,
+        view: &'view mut UnorderedAlgorithmROView<'arena>,
+        work_item: &'arena WorkItem<'arena, 'arena>,
     ) -> Result<Self::ROtoRWTy, ()>;
 
-    fn process_finish_readwrite<'algo_state, 'view, 'arena, 'work_item>(
+    fn process_finish_readwrite<'algo_state, 'view, 'arena>(
         &'algo_state self,
-        view: &'view mut UnorderedAlgorithmRWView,
-        work_item: &'work_item WorkItem<'arena, 'work_item>,
+        view: &'view mut UnorderedAlgorithmRWView<'arena>,
+        work_item: &'arena WorkItem<'arena, 'arena>,
         ro_output: Self::ROtoRWTy,
     );
 }

@@ -98,23 +98,26 @@ fn executor_asdf2() {
     impl UnorderedAlgorithm for TestAlgo {
         type ROtoRWTy = ();
 
-        fn try_process_readonly<'algo_global_state, 'view, 'arena, 'work_item>(
+        fn try_process_readonly<'algo_global_state, 'view, 'arena>(
             &'algo_global_state self,
-            view: &'view mut UnorderedAlgorithmROView,
-            work_item: &'work_item WorkItem<'arena, 'work_item>,
+            view: &'view mut UnorderedAlgorithmROView<'arena>,
+            work_item: &'arena WorkItem<'arena, 'arena>,
         ) -> Result<Self::ROtoRWTy, ()> {
             dbg!(work_item.seed_node);
-            let x = view.try_lock_cell(work_item, work_item.seed_node.cell(), false);
+            let x = view.try_lock_cell(work_item, work_item.seed_node.cell(), true)?;
+            dbg!(&*x);
             Ok(())
         }
 
-        fn process_finish_readwrite<'algo_state, 'view, 'arena, 'work_item>(
+        fn process_finish_readwrite<'algo_state, 'view, 'arena>(
             &'algo_state self,
-            _view: &'view mut UnorderedAlgorithmRWView,
-            work_item: &'work_item WorkItem<'arena, 'work_item>,
+            view: &'view mut UnorderedAlgorithmRWView<'arena>,
+            work_item: &'arena WorkItem<'arena, 'arena>,
             _ro_output: Self::ROtoRWTy,
         ) {
             dbg!(work_item.seed_node);
+            let x = view.get_cell_write(work_item, work_item.seed_node.cell());
+            dbg!(&*x);
         }
     }
 
@@ -126,6 +129,8 @@ fn executor_asdf2() {
     wire._cell = Some(cell.x);
     let work_item = view.new_work_item(cell.x.into());
     drop(view);
+    drop(cell);
+    drop(wire);
 
     let workqueue = work_queue::Queue::new(1, 128);
     workqueue.push(&*work_item);

@@ -191,7 +191,12 @@ impl<'arena> NetlistManager<'arena> {
                         stroad,
                         heap_thread_shard,
                     };
-                    while let Some(work_item) = local_queue_rc.borrow_mut().pop() {
+                    while let Some(work_item) = {
+                        let mut q = local_queue_rc.borrow_mut();
+                        let work_item = q.pop();
+                        drop(q);
+                        work_item
+                    } {
                         let ro_ret = algo.try_process_readonly(&mut ro_view, work_item);
                         if ro_ret.is_err() {
                             println!("parked!");
