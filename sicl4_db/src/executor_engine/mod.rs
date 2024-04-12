@@ -76,10 +76,22 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     }
 
     fn unpark(&'work_item self) {
+        // unpark happens *only* on lock release
+        // and *only* happens once
+        // it happens for both ordered and unordered algorithms
+        // it cannot happen multiple times simultaneously from different threads, because
+        // a work item can only be blocked on *one* lock at a time (at least in a correct impl).
+        // additionally, unparking happens with the stroad bucket lock held -- can only happen from one thread
         todo!()
     }
 
     fn cancel(&'work_item self) {
+        // cancel happens *only* on lock acquisition
+        // it happens *only* for ordered algorithms
+        // it can happen multiple times in a multithreaded race-prone way, because
+        // even though cancelling happens with the stroad bucket lock held,
+        // a speculative work item waiting to commit can hold multiple *different* locks.
+        // a cancellation can be triggered because of two *different* ones in a racy way
         todo!()
     }
 
@@ -144,7 +156,7 @@ impl<'arena> NetlistManager<'arena> {
     pub fn run_unordered_algorithm<A: UnorderedAlgorithm>(
         &'arena self,
         algo: &A,
-        queue: &work_queue::Queue<&'arena mut WorkItem<'arena, 'arena>>,
+        queue: &work_queue::Queue<&'arena WorkItem<'arena, 'arena>>,
     ) {
         assert!(!self.in_use.get());
         self.in_use.set(true);
@@ -158,10 +170,6 @@ impl<'arena> NetlistManager<'arena> {
                         heap_thread_shard,
                     };
                     while let Some(work_item) = local_queue.pop() {
-                        // we are passed in exclusive pointers, but, as soon as any locks are created,
-                        // the reference is no longer &mut exclusive. downgrade immediately.
-                        // fixme should we just never expose &mut WorkItem?
-                        let work_item = &*work_item;
                         let seed_node = work_item.seed_node;
                         let ro_ret = algo.try_process_readonly(&mut ro_view, seed_node, work_item);
                         if ro_ret.is_err() {

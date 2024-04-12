@@ -100,6 +100,8 @@ impl<'arena> SingleThreadedView<'arena> {
         mem::forget(guard);
     }
 
+    // fixme is there any reason for these to expose &mut?
+
     pub fn new_work_item<'wrapper>(
         &'wrapper mut self,
         node: NetlistRef<'arena>,
