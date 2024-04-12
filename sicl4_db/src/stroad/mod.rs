@@ -92,10 +92,12 @@ use crate::util::to_unsafecell;
 /// and "cancel" must win over "unpark".
 // TODO: add "get priority" here maybe??? (difference is one pointer indirection)
 pub trait StroadToWorkItemLink: Send + Sync {
+    type UnparkXtraTy;
+
     /// The given work item has been invalidated by some other access
     fn cancel(&self);
     /// The given work item is now possible to attempt to run again
-    fn unpark(&self);
+    fn unpark(&self, xtra: &mut Self::UnparkXtraTy);
 }
 
 /// log2 of the number of toplevel shards
@@ -475,7 +477,7 @@ impl<'stroad_node, K: Hash + Eq, P: StroadToWorkItemLink> StroadShard<'stroad_no
     /// Unpark all items on the [wants_lock](StroadBucket::wants_lock) list
     ///
     /// This is used for the unordered case
-    pub fn unpark_all(&mut self, key: &K, hash: u64) {
+    pub fn unpark_all(&mut self, key: &K, hash: u64, unpark_xtra: &mut P::UnparkXtraTy) {
         let buckets = self.buckets_and_lock.load(Ordering::Relaxed) & !1;
         let buckets = buckets as *mut StroadBucket<'stroad_node, K, P>;
         let bucket_i = (hash >> HASH_NUM_SHARDS_SHIFT) & ((1 << self.capacity_shift) - 1);
@@ -500,7 +502,7 @@ impl<'stroad_node, K: Hash + Eq, P: StroadToWorkItemLink> StroadShard<'stroad_no
                 // only at this point, after unlink, do we know that nothing else
                 // is referencing the node
                 let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                list_ent_mut.work_item_link.unpark();
+                list_ent_mut.work_item_link.unpark(unpark_xtra);
                 self.nents -= 1;
             } else {
                 list_ent = list_ent_ref.link.next;
@@ -625,11 +627,11 @@ impl<'stroad_node, K: Hash + Eq, P: StroadToWorkItemLink> Stroad<'stroad_node, K
     }
 
     /// For an ordered algorithm, unblock all the work items
-    pub fn unordered_unpark_all(&self, key: &K) {
+    pub fn unordered_unpark_all(&self, key: &K, unpark_xtra: &mut P::UnparkXtraTy) {
         let hash = hash(key);
         let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
         let mut shard = self.lock_shard(shard as usize);
-        shard.unpark_all(key, hash);
+        shard.unpark_all(key, hash, unpark_xtra);
     }
 
     /// Lock a given shard, returning a guard that allows access to it from the current (OS) thread only
@@ -821,6 +823,7 @@ impl<'stroad_node, K: Hash + Eq, P: StroadToWorkItemLink> Stroad<'stroad_node, K
         stroad_node: &'stroad_node StroadNode<'stroad_node, K, P>,
         unpark_validation: VAL,
         unmark_item: UNMARK,
+        unpark_xtra: &mut P::UnparkXtraTy,
     ) -> &'stroad_node mut StroadNode<'stroad_node, K, P>
     where
         VAL: FnOnce() -> bool,
@@ -919,7 +922,7 @@ impl<'stroad_node, K: Hash + Eq, P: StroadToWorkItemLink> Stroad<'stroad_node, K
                         // only at this point, after unlink, do we know that nothing else
                         // is referencing the node
                         let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                        list_ent_mut.work_item_link.unpark();
+                        list_ent_mut.work_item_link.unpark(unpark_xtra);
                         shard.nents -= 1;
                     } else {
                         list_ent = list_ent_ref.link.next;
@@ -934,7 +937,7 @@ impl<'stroad_node, K: Hash + Eq, P: StroadToWorkItemLink> Stroad<'stroad_node, K
             if let Some(highest_found_writer) = highest_found_writer {
                 bucket.unlink_item(highest_found_writer, false);
                 let highest_found_writer_node = unsafe { &mut *highest_found_writer.get() };
-                highest_found_writer_node.work_item_link.unpark();
+                highest_found_writer_node.work_item_link.unpark(unpark_xtra);
                 shard.nents -= 1;
             }
         }

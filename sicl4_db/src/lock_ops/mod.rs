@@ -567,6 +567,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     pub unsafe fn unlock<'stroad>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        unpark_xtra: &mut P::UnparkXtraTy,
     ) {
         match self.state.get() {
             LockState::Unlocked => {
@@ -575,10 +576,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
             LockState::Parked => {
                 // fixme: what are we supposed to do here?
             }
-            LockState::LockedForUnorderedRead => self.unlock_unordered_read(stroad),
-            LockState::LockedForUnorderedWrite => self.unlock_unordered_write(stroad),
-            LockState::LockedForOrderedRead => self.unlock_ordered_read(stroad),
-            LockState::LockedForOrderedWrite => self.unlock_ordered_write(stroad),
+            LockState::LockedForUnorderedRead => self.unlock_unordered_read(stroad, unpark_xtra),
+            LockState::LockedForUnorderedWrite => self.unlock_unordered_write(stroad, unpark_xtra),
+            LockState::LockedForOrderedRead => self.unlock_ordered_read(stroad, unpark_xtra),
+            LockState::LockedForOrderedWrite => self.unlock_ordered_write(stroad, unpark_xtra),
         }
     }
 
@@ -588,6 +589,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     fn unlock_unordered_write<'stroad>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        unpark_xtra: &mut P::UnparkXtraTy,
     ) {
         // we have exclusive access
         // we need to push out all previous memory accesses
@@ -604,7 +606,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         debug_assert_eq!(lock_gen_rwlock(old_atomic_val), 0x7f);
 
         if lock_gen_maybe_parked(old_atomic_val) {
-            stroad.unordered_unpark_all(&self.p);
+            stroad.unordered_unpark_all(&self.p, unpark_xtra);
         }
 
         self.state.set(LockState::Unlocked);
@@ -616,6 +618,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     fn unlock_unordered_read<'stroad>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        unpark_xtra: &mut P::UnparkXtraTy,
     ) {
         let mut old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
         loop {
@@ -640,7 +643,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     if lock_gen_rwlock(old_atomic_val) == 1 && lock_gen_maybe_parked(old_atomic_val)
                     {
                         // fixme can we optimize this?
-                        stroad.unordered_unpark_all(&self.p);
+                        stroad.unordered_unpark_all(&self.p, unpark_xtra);
                     }
                     break;
                 }
@@ -657,6 +660,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     fn unlock_ordered_write<'stroad>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        unpark_xtra: &mut P::UnparkXtraTy,
     ) {
         let lock_inst = unsafe {
             // safety: this can only be called when we hold the lock
@@ -675,6 +679,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     *num_rw &= !0x8000000000000000;
                 }
             },
+            unpark_xtra,
         );
 
         self.state.set(LockState::Unlocked);
@@ -686,6 +691,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     fn unlock_ordered_read<'stroad>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        unpark_xtra: &mut P::UnparkXtraTy,
     ) {
         let lock_inst = unsafe {
             // safety: this can only be called when we hold the lock
@@ -708,6 +714,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                         ((old_num_rw & 0x7fffffffffffffff) - 1) | (old_num_rw & 0x8000000000000000);
                 }
             },
+            unpark_xtra,
         );
     }
 }

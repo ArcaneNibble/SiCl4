@@ -8,13 +8,15 @@ struct StroadTestingPayload {
     cancelled: AtomicBool,
 }
 impl StroadToWorkItemLink for StroadTestingPayload {
-    fn unpark(&self) {
+    fn unpark(&self, _: &mut ()) {
         self.unparked.store(true, Ordering::Relaxed);
     }
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
     }
+
+    type UnparkXtraTy = ();
 }
 
 #[cfg(not(loom))]
@@ -127,7 +129,7 @@ fn stroad_unpark_all() {
 
     let _ = stroad.unordered_park_conditionally(&mut list_ent_0, 12345, || true);
     let _ = stroad.unordered_park_conditionally(&mut list_ent_1, 12345, || true);
-    stroad.unordered_unpark_all(&12345);
+    stroad.unordered_unpark_all(&12345, &mut ());
 
     unsafe {
         assert!((*list_ent_0_ptr)
@@ -657,7 +659,7 @@ fn stroad_priority_unlocking() {
 
     // ent 2 will cause an unlock (as a writer)
     println!("** unlock ent 2");
-    stroad.ordered_do_unlocking(unsafe { &*(list_ent_2_ptr) }, || true, || {});
+    stroad.ordered_do_unlocking(unsafe { &*(list_ent_2_ptr) }, || true, || {}, &mut ());
     unsafe {
         assert!((*list_ent_4_ptr)
             .work_item_link
@@ -672,7 +674,7 @@ fn stroad_priority_unlocking() {
     // *one* of the readers will cause an unlock
     // it *shouldn't* matter which, as long as it's the last
     println!("** unlock ent 3");
-    stroad.ordered_do_unlocking(unsafe { &*(list_ent_3_ptr) }, || true, || {});
+    stroad.ordered_do_unlocking(unsafe { &*(list_ent_3_ptr) }, || true, || {}, &mut ());
     unsafe {
         assert!((*list_ent_6_ptr)
             .work_item_link
@@ -682,7 +684,7 @@ fn stroad_priority_unlocking() {
 
     // this should unlock the other writer
     println!("** unlock ent 6");
-    stroad.ordered_do_unlocking(unsafe { &*(list_ent_6_ptr) }, || true, || {});
+    stroad.ordered_do_unlocking(unsafe { &*(list_ent_6_ptr) }, || true, || {}, &mut ());
     unsafe {
         assert!((*list_ent_5_ptr)
             .work_item_link
@@ -692,7 +694,7 @@ fn stroad_priority_unlocking() {
 
     // this should unlock nothing
     println!("** unlock ent 5");
-    stroad.ordered_do_unlocking(unsafe { &*(list_ent_5_ptr) }, || true, || {});
+    stroad.ordered_do_unlocking(unsafe { &*(list_ent_5_ptr) }, || true, || {}, &mut ());
 }
 
 #[cfg(not(loom))]
@@ -833,7 +835,7 @@ fn stroad_loom_park_unpark() {
             let _ = stroad.unordered_park_conditionally(list_ent_1, 12345, || true);
         });
         let t2 = loom::thread::spawn(move || {
-            stroad.unordered_unpark_all(&12345);
+            stroad.unordered_unpark_all(&12345, &mut ());
         });
         t1.join().unwrap();
         t2.join().unwrap();
