@@ -7,6 +7,7 @@ use super::*;
 pub struct SingleThreadedView<'arena> {
     pub(super) x: &'arena NetlistManager<'arena>,
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
+    pub(super) debug_id: Cell<usize>,
 }
 // safety: only one of these objects can exist at once
 unsafe impl<'arena> Send for SingleThreadedView<'arena> {}

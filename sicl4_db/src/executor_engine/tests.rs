@@ -1,4 +1,7 @@
 use super::*;
+use uuid::uuid;
+
+const TEST_LUT_UUID: Uuid = uuid!("00000000-0000-0000-0000-000000000000");
 
 #[test]
 fn executor_ensure_obj_safety() {
@@ -22,7 +25,7 @@ fn executor_single_threaded_smoke_test() {
     let cell_ref;
     let wire_ref;
     {
-        let mut cell = view.new_cell();
+        let mut cell = view.new_cell(TEST_LUT_UUID, 1);
         dbg!(&cell);
         dbg!(&*cell);
         cell_ref = cell.x;
@@ -33,14 +36,13 @@ fn executor_single_threaded_smoke_test() {
         let work_item = view.new_work_item(cell_ref.into());
         dbg!(work_item);
 
-        cell._wire = Some(wire_ref);
-        wire._cell = Some(cell_ref);
+        connect_driver(&mut cell, 0, &mut wire);
     }
     {
         let cell_again = view.get_cell_read((), cell_ref).unwrap();
         let wire_again = view.get_wire_read((), wire_ref).unwrap();
-        assert_eq!(cell_again._wire, Some(wire_ref));
-        assert_eq!(wire_again._cell, Some(cell_ref));
+        assert_eq!(cell_again.connections[0], Some(wire_ref));
+        assert_eq!(wire_again.drivers[0], cell_ref);
         view.delete_cell(cell_again);
         view.delete_wire(wire_again);
     }
@@ -57,7 +59,7 @@ fn executor_single_threaded_smoke_test() {
 fn executor_single_threaded_only_one_get() {
     let manager = NetlistManager::new();
     let mut view = manager.access_single_threaded();
-    let cell = view.new_cell();
+    let cell = view.new_cell(TEST_LUT_UUID, 0);
     let cell_ref = cell.x;
     drop(cell);
 
@@ -72,7 +74,7 @@ fn executor_single_threaded_only_one_get() {
 fn executor_asdf() {
     let manager = NetlistManager::new();
     let mut view = manager.access_single_threaded();
-    let cell = view.new_cell();
+    let cell = view.new_cell(TEST_LUT_UUID, 0);
     dbg!(&cell);
     dbg!(&*cell);
     let wire = view.new_wire();
@@ -106,7 +108,7 @@ fn executor_asdf2() {
             dbg!(work_item.seed_node);
             let x = view.try_lock_cell(work_item, work_item.seed_node.cell(), true)?;
             dbg!(&*x);
-            let y = view.try_lock_wire(work_item, x._wire.unwrap(), false)?;
+            let y = view.try_lock_wire(work_item, x.connections[0].unwrap(), false)?;
             dbg!(&*y);
             Ok(())
         }
@@ -122,17 +124,18 @@ fn executor_asdf2() {
                 .get_cell_write(work_item, work_item.seed_node.cell())
                 .unwrap();
             dbg!(&*x);
-            let y = view.get_wire_read(work_item, x._wire.unwrap()).unwrap();
+            let y = view
+                .get_wire_read(work_item, x.connections[0].unwrap())
+                .unwrap();
             dbg!(&*y);
         }
     }
 
     let manager = NetlistManager::new();
     let mut view = manager.access_single_threaded();
-    let mut cell = view.new_cell();
+    let mut cell = view.new_cell(TEST_LUT_UUID, 1);
     let mut wire = view.new_wire();
-    cell._wire = Some(wire.x);
-    wire._cell = Some(cell.x);
+    connect_driver(&mut cell, 0, &mut wire);
     let work_item = view.new_work_item(cell.x.into());
     drop(view);
     drop(cell);

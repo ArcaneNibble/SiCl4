@@ -68,6 +68,7 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
 #[derive(Debug)]
 pub struct UnorderedAlgorithmRWView<'arena> {
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
+    pub(super) debug_id: Cell<usize>,
 }
 impl<'arena> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena> {
     type CellROGuardTy = UnorderedObjPhase2ROGuard<'arena, NetlistCell<'arena>>;

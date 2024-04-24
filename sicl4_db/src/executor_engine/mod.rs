@@ -70,7 +70,11 @@ pub trait NetlistView<'arena> {
         + DerefMut<Target = NetlistWire<'arena>>;
     type MaybeWorkItem;
 
-    fn new_cell<'wrapper>(&'wrapper mut self) -> Self::CellOwningGuardTy;
+    fn new_cell<'wrapper>(
+        &'wrapper mut self,
+        cell_type: Uuid,
+        num_connections: usize,
+    ) -> Self::CellOwningGuardTy;
     fn new_wire<'wrapper>(&'wrapper mut self) -> Self::WireOwningGuardTy;
     fn delete_cell<'wrapper>(&'wrapper mut self, guard: Self::CellOwningGuardTy);
     fn delete_wire<'wrapper>(&'wrapper mut self, guard: Self::WireOwningGuardTy);
@@ -100,13 +104,23 @@ pub trait NetlistView<'arena> {
 }
 macro_rules! impl_view_shared_code {
     () => {
-        fn new_cell<'wrapper>(&'wrapper mut self) -> Self::CellOwningGuardTy {
+        fn new_cell<'wrapper>(
+            &'wrapper mut self,
+            cell_type: Uuid,
+            num_connections: usize,
+        ) -> Self::CellOwningGuardTy {
             let (new, gen) = self
                 .heap_thread_shard
                 .allocate::<LockedObj<NetlistCell<'arena>>>();
             unsafe {
                 LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
-                let _ = NetlistCell::init((*new.as_mut_ptr()).payload.get());
+                let _ = NetlistCell::init(
+                    (*new.as_mut_ptr()).payload.get(),
+                    cell_type,
+                    self.debug_id.get(),
+                    num_connections,
+                );
+                self.debug_id.set(self.debug_id.get() + 1);
                 let new_ref = ObjRef {
                     ptr: new.assume_init_ref(),
                     gen,
@@ -120,7 +134,8 @@ macro_rules! impl_view_shared_code {
                 .allocate::<LockedObj<NetlistWire<'arena>>>();
             unsafe {
                 LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
-                let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get());
+                let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get(), self.debug_id.get());
+                self.debug_id.set(self.debug_id.get() + 1);
                 let new_ref = ObjRef {
                     ptr: new.assume_init_ref(),
                     gen,
@@ -279,6 +294,7 @@ impl<'arena> NetlistManager<'arena> {
         SingleThreadedView {
             x: self,
             heap_thread_shard: self.heap.new_thread(),
+            debug_id: Cell::new(0),
         }
     }
 
@@ -332,6 +348,7 @@ impl<'arena> NetlistManager<'arena> {
 
                         let mut rw_view = UnorderedAlgorithmRWView {
                             heap_thread_shard: ro_view.heap_thread_shard,
+                            debug_id: Cell::new(0), // XXX totally fuckered
                         };
                         algo.process_finish_readwrite(&mut rw_view, work_item, ro_ret);
                         unsafe {
@@ -383,6 +400,7 @@ pub use single_threaded::*;
 
 mod unordered;
 pub use unordered::*;
+use uuid::Uuid;
 use work_queue::LocalQueue;
 
 #[cfg(test)]
