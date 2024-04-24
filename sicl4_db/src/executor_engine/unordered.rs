@@ -222,6 +222,11 @@ impl<'arena, T> Deref for UnorderedObjPhase1Guard<'arena, T> {
 pub struct UnorderedObjPhase2ROGuard<'arena, T> {
     pub x: ObjRef<'arena, T>,
 }
+impl<'arena, T> NetlistGuard<'arena, T> for UnorderedObjPhase2ROGuard<'arena, T> {
+    fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
+        self.x
+    }
+}
 impl<'arena, T> Deref for UnorderedObjPhase2ROGuard<'arena, T> {
     type Target = T;
 
@@ -234,6 +239,11 @@ impl<'arena, T> Deref for UnorderedObjPhase2ROGuard<'arena, T> {
 #[derive(Debug)]
 pub struct UnorderedObjPhase2RWGuard<'arena, T> {
     pub x: ObjRef<'arena, T>,
+}
+impl<'arena, T> NetlistGuard<'arena, T> for UnorderedObjPhase2RWGuard<'arena, T> {
+    fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
+        self.x
+    }
 }
 impl<'arena, T> Deref for UnorderedObjPhase2RWGuard<'arena, T> {
     type Target = T;

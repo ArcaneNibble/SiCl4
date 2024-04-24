@@ -53,12 +53,21 @@ impl<'arena> NetlistRef<'arena> {
     }
 }
 
+/// guards must allow for extracting the target ptr
+pub trait NetlistGuard<'arena, T> {
+    fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T>;
+}
+
 /// common API for doing stuff to a netlist
 pub trait NetlistView<'arena> {
-    type CellROGuardTy: Deref<Target = NetlistCell<'arena>>;
-    type WireROGuardTy: Deref<Target = NetlistWire<'arena>>;
-    type CellOwningGuardTy: DerefMut<Target = NetlistCell<'arena>>;
-    type WireOwningGuardTy: DerefMut<Target = NetlistWire<'arena>>;
+    type CellROGuardTy: NetlistGuard<'arena, NetlistCell<'arena>>
+        + Deref<Target = NetlistCell<'arena>>;
+    type WireROGuardTy: NetlistGuard<'arena, NetlistWire<'arena>>
+        + Deref<Target = NetlistWire<'arena>>;
+    type CellOwningGuardTy: NetlistGuard<'arena, NetlistCell<'arena>>
+        + DerefMut<Target = NetlistCell<'arena>>;
+    type WireOwningGuardTy: NetlistGuard<'arena, NetlistWire<'arena>>
+        + DerefMut<Target = NetlistWire<'arena>>;
     type MaybeWorkItem;
 
     fn new_cell<'wrapper>(&'wrapper mut self) -> Self::CellOwningGuardTy;

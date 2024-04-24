@@ -105,6 +105,11 @@ impl<'arena, T> SingleThreadedObjGuard<'arena, T> {
         self.x
     }
 }
+impl<'arena, T> NetlistGuard<'arena, T> for SingleThreadedObjGuard<'arena, T> {
+    fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
+        self.x
+    }
+}
 impl<'arena, T> Drop for SingleThreadedObjGuard<'arena, T> {
     fn drop(&mut self) {
         self.x
