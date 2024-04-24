@@ -2,8 +2,6 @@
 //!
 //! In other words, the "fringe" of the graph algorithm is an unordered set.
 
-use std::cell::RefCell;
-
 use super::*;
 
 pub trait UnorderedAlgorithm: Send + Sync {
@@ -51,10 +49,7 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
 
 #[derive(Debug)]
 pub struct UnorderedAlgorithmRWView<'arena> {
-    pub(super) stroad:
-        &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
-    pub(super) local_queue: Rc<RefCell<LocalQueue<&'arena WorkItem<'arena, 'arena>>>>,
 }
 impl<'arena> UnorderedAlgorithmRWView<'arena> {
     pub fn get_cell_read<'wrapper>(
@@ -83,12 +78,7 @@ impl<'arena> UnorderedAlgorithmRWView<'arena> {
                     .stroad_work_item_link()
                     .guard_handed_out
                     .store(true, Ordering::Relaxed);
-                return UnorderedObjPhase2ROGuard {
-                    lock: lock_i,
-                    stroad: self.stroad,
-                    local_queue: self.local_queue.clone(),
-                    x: obj,
-                };
+                return UnorderedObjPhase2ROGuard { x: obj };
             }
         }
         panic!("Tried to access a node that wasn't tagged in phase 1")
@@ -118,12 +108,7 @@ impl<'arena> UnorderedAlgorithmRWView<'arena> {
                     .stroad_work_item_link()
                     .guard_handed_out
                     .store(true, Ordering::Relaxed);
-                return UnorderedObjPhase2RWGuard {
-                    lock: lock_i,
-                    stroad: self.stroad,
-                    local_queue: self.local_queue.clone(),
-                    x: obj,
-                };
+                return UnorderedObjPhase2RWGuard { x: obj };
             }
         }
         panic!("Tried to access a node that wasn't tagged in phase 1")
@@ -145,19 +130,7 @@ impl<'arena, T> Deref for UnorderedObjPhase1Guard<'arena, T> {
 
 #[derive(Debug)]
 pub struct UnorderedObjPhase2ROGuard<'arena, T> {
-    lock: &'arena LockAndStroadData<'arena, 'arena, WorkItemPerLockData<'arena, 'arena>>,
-    stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
-    local_queue: Rc<RefCell<LocalQueue<&'arena WorkItem<'arena, 'arena>>>>,
     pub x: ObjRef<'arena, T>,
-}
-impl<'arena, T> Drop for UnorderedObjPhase2ROGuard<'arena, T> {
-    fn drop(&mut self) {
-        // safety: we hold the lock
-        unsafe {
-            self.lock
-                .unlock(self.stroad, &mut self.local_queue.borrow_mut());
-        }
-    }
 }
 impl<'arena, T> Deref for UnorderedObjPhase2ROGuard<'arena, T> {
     type Target = T;
@@ -170,19 +143,7 @@ impl<'arena, T> Deref for UnorderedObjPhase2ROGuard<'arena, T> {
 
 #[derive(Debug)]
 pub struct UnorderedObjPhase2RWGuard<'arena, T> {
-    lock: &'arena LockAndStroadData<'arena, 'arena, WorkItemPerLockData<'arena, 'arena>>,
-    stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
-    local_queue: Rc<RefCell<LocalQueue<&'arena WorkItem<'arena, 'arena>>>>,
     pub x: ObjRef<'arena, T>,
-}
-impl<'arena, T> Drop for UnorderedObjPhase2RWGuard<'arena, T> {
-    fn drop(&mut self) {
-        // safety: we hold the lock
-        unsafe {
-            self.lock
-                .unlock(self.stroad, &mut self.local_queue.borrow_mut());
-        }
-    }
 }
 impl<'arena, T> Deref for UnorderedObjPhase2RWGuard<'arena, T> {
     type Target = T;

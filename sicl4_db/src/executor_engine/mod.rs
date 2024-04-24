@@ -222,11 +222,21 @@ impl<'arena> NetlistManager<'arena> {
                         let ro_ret = ro_ret.unwrap();
 
                         let mut rw_view = UnorderedAlgorithmRWView {
-                            stroad,
                             heap_thread_shard: ro_view.heap_thread_shard,
-                            local_queue: local_queue_rc.clone(),
                         };
                         algo.process_finish_readwrite(&mut rw_view, work_item, ro_ret);
+                        unsafe {
+                            // release *all* locks, even if the RW phase didn't use one
+                            let locks_used = work_item.locks_used.get();
+                            for lock_idx in 0..locks_used {
+                                let lock = &*work_item.locks[lock_idx].assume_init_ref().get();
+                                debug_assert!(
+                                    (lock.state.get() == LockState::LockedForUnorderedRead)
+                                        || lock.state.get() == LockState::LockedForUnorderedWrite
+                                );
+                                lock.unlock(stroad, &mut local_queue_rc.borrow_mut());
+                            }
+                        }
                         ro_view = UnorderedAlgorithmROView {
                             stroad,
                             heap_thread_shard: rw_view.heap_thread_shard,
