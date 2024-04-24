@@ -75,6 +75,7 @@ impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPerLockData<'arena, 'w
 #[derive(Debug)]
 pub struct WorkItem<'arena, 'work_item> {
     pub seed_node: NetlistRef<'arena>,
+    _todo_wip_did_unpark: AtomicBool,
     _todo_wip_cancelled: AtomicBool,
     locks_used: Cell<usize>,
     locks: [MaybeUninit<
@@ -88,6 +89,7 @@ unsafe impl<'arena, 'work_item> Sync for WorkItem<'arena, 'work_item> {}
 impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     pub unsafe fn init(self_: *mut Self, node: NetlistRef<'arena>) -> &'work_item mut Self {
         (*self_).seed_node = node;
+        (*self_)._todo_wip_did_unpark = AtomicBool::new(false);
         (*self_)._todo_wip_cancelled = AtomicBool::new(false);
         (*self_).locks_used = Cell::new(0);
         &mut *self_
@@ -103,7 +105,11 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         // it cannot happen multiple times simultaneously from different threads, because
         // a work item can only be blocked on *one* lock at a time (at least in a correct impl).
         // additionally, unparking happens with the stroad bucket lock held -- can only happen from one thread
-        local_queue.push(self);
+
+        // we *do* need to actually check the "only unpark once" requirement though
+        if !self._todo_wip_did_unpark.swap(true, Ordering::Relaxed) {
+            local_queue.push(self);
+        }
     }
 
     fn cancel(&'work_item self) {
@@ -141,6 +147,13 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
             (*inner_payload).guard_handed_out = AtomicBool::new(false);
             (lock_idx, &mut *lock_ptr)
         }
+    }
+
+    /// after this work item pops back out after unparking, reset everything so that it's ready to try again
+    fn reset_state(&self) {
+        self._todo_wip_did_unpark.store(false, Ordering::Relaxed);
+        self._todo_wip_cancelled.store(false, Ordering::Relaxed);
+        self.locks_used.set(0);
     }
 }
 
@@ -197,6 +210,7 @@ impl<'arena> NetlistManager<'arena> {
                         drop(q);
                         work_item
                     } {
+                        work_item.reset_state();
                         let ro_ret = algo.try_process_readonly(&mut ro_view, work_item);
                         if ro_ret.is_err() {
                             println!("parked!");
