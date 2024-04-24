@@ -13,9 +13,9 @@ pub trait UnorderedAlgorithm: Send + Sync {
         work_item: &'arena WorkItem<'arena, 'arena>,
     ) -> Result<Self::ROtoRWTy, ()>;
 
-    fn process_finish_readwrite<'algo_state, 'view, 'arena>(
+    fn process_finish_readwrite<'algo_state, 'view, 'arena, 'q>(
         &'algo_state self,
-        view: &'view mut UnorderedAlgorithmRWView<'arena>,
+        view: &'view mut UnorderedAlgorithmRWView<'arena, 'q>,
         work_item: &'arena WorkItem<'arena, 'arena>,
         ro_output: Self::ROtoRWTy,
     );
@@ -66,11 +66,12 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
 }
 
 #[derive(Debug)]
-pub struct UnorderedAlgorithmRWView<'arena> {
+pub struct UnorderedAlgorithmRWView<'arena, 'q> {
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
+    pub(super) queue: &'q mut work_queue::LocalQueue<&'arena WorkItem<'arena, 'arena>>,
     pub(super) debug_id: Cell<usize>,
 }
-impl<'arena> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena> {
+impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
     type CellROGuardTy = UnorderedObjPhase2ROGuard<'arena, NetlistCell<'arena>>;
     type WireROGuardTy = UnorderedObjPhase2ROGuard<'arena, NetlistWire<'arena>>;
     type CellOwningGuardTy = UnorderedObjPhase2RWGuard<'arena, NetlistCell<'arena>>;
@@ -201,8 +202,14 @@ impl<'arena> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena> {
         }
         panic!("Tried to access a node that wasn't tagged in phase 1")
     }
+
+    fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>) {
+        let (new, _gen) = self.heap_thread_shard.allocate::<WorkItem>();
+        let work_item = unsafe { WorkItem::init(new.as_mut_ptr(), node) };
+        self.queue.push(&*work_item);
+    }
 }
-impl<'arena> UnorderedAlgorithmRWView<'arena> {
+impl<'arena, 'q> UnorderedAlgorithmRWView<'arena, 'q> {
     // xxx?
 }
 

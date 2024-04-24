@@ -4,19 +4,20 @@
 use super::*;
 
 #[derive(Debug)]
-pub struct SingleThreadedView<'arena> {
+pub struct SingleThreadedView<'arena, 'q> {
     pub(super) x: &'arena NetlistManager<'arena>,
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
+    pub(super) workqueue: &'q work_queue::Queue<&'arena WorkItem<'arena, 'arena>>,
     pub(super) debug_id: Cell<usize>,
 }
 // safety: only one of these objects can exist at once
-unsafe impl<'arena> Send for SingleThreadedView<'arena> {}
-impl<'arena> Drop for SingleThreadedView<'arena> {
+unsafe impl<'arena, 'q> Send for SingleThreadedView<'arena, 'q> {}
+impl<'arena, 'q> Drop for SingleThreadedView<'arena, 'q> {
     fn drop<'wrapper>(&'wrapper mut self) {
         self.x.in_use.set(false);
     }
 }
-impl<'arena> NetlistView<'arena> for SingleThreadedView<'arena> {
+impl<'arena, 'q> NetlistView<'arena> for SingleThreadedView<'arena, 'q> {
     type CellROGuardTy = SingleThreadedCellGuard<'arena>;
     type WireROGuardTy = SingleThreadedWireGuard<'arena>;
     type CellOwningGuardTy = SingleThreadedCellGuard<'arena>;
@@ -76,23 +77,11 @@ impl<'arena> NetlistView<'arena> for SingleThreadedView<'arena> {
     ) -> Option<SingleThreadedWireGuard<'arena>> {
         self.get_wire_read(_work_item, obj)
     }
-}
-impl<'arena> SingleThreadedView<'arena> {
-    // fixme is there any reason for these to expose &mut?
 
-    pub fn new_work_item<'wrapper>(
-        &'wrapper mut self,
-        node: NetlistRef<'arena>,
-    ) -> &'arena mut WorkItem<'arena, 'arena> {
+    fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>) {
         let (new, _gen) = self.heap_thread_shard.allocate::<WorkItem>();
-        unsafe { WorkItem::init(new.as_mut_ptr(), node) }
-    }
-
-    pub fn delete_work_item<'wrapper>(
-        &'wrapper mut self,
-        work_item: &'arena mut WorkItem<'arena, 'arena>,
-    ) {
-        unsafe { self.heap_thread_shard.free(work_item) }
+        let work_item = unsafe { WorkItem::init(new.as_mut_ptr(), node) };
+        self.workqueue.push(&*work_item);
     }
 }
 type SingleThreadedCellGuard<'arena> = SingleThreadedObjGuard<'arena, NetlistCell<'arena>>;

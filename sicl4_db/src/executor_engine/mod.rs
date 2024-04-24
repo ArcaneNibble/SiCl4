@@ -101,6 +101,8 @@ pub trait NetlistView<'arena> {
         work_item: Self::MaybeWorkItem,
         obj: NetlistWireRef<'arena>,
     ) -> Option<Self::WireOwningGuardTy>;
+
+    fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>);
 }
 macro_rules! impl_view_shared_code {
     () => {
@@ -288,12 +290,16 @@ impl<'arena> NetlistManager<'arena> {
         }
     }
 
-    pub fn access_single_threaded(&'arena self) -> SingleThreadedView<'arena> {
+    pub fn access_single_threaded<'q>(
+        &'arena self,
+        queue: &'q work_queue::Queue<&'arena WorkItem<'arena, 'arena>>,
+    ) -> SingleThreadedView<'arena, 'q> {
         assert!(!self.in_use.get());
         self.in_use.set(true);
         SingleThreadedView {
             x: self,
             heap_thread_shard: self.heap.new_thread(),
+            workqueue: queue,
             debug_id: Cell::new(0),
         }
     }
@@ -346,11 +352,15 @@ impl<'arena> NetlistManager<'arena> {
                         }
                         let ro_ret = ro_ret.unwrap();
 
-                        let mut rw_view = UnorderedAlgorithmRWView {
-                            heap_thread_shard: ro_view.heap_thread_shard,
-                            debug_id: Cell::new(0), // XXX totally fuckered
+                        let heap_thread_shard = {
+                            let mut rw_view = UnorderedAlgorithmRWView {
+                                heap_thread_shard: ro_view.heap_thread_shard,
+                                queue: &mut local_queue_rc.borrow_mut(),
+                                debug_id: Cell::new(0), // XXX totally fuckered
+                            };
+                            algo.process_finish_readwrite(&mut rw_view, work_item, ro_ret);
+                            rw_view.heap_thread_shard
                         };
-                        algo.process_finish_readwrite(&mut rw_view, work_item, ro_ret);
                         unsafe {
                             // release *all* locks, even if the RW phase didn't use one
                             let locks_used = work_item.locks_used.get();
@@ -365,7 +375,7 @@ impl<'arena> NetlistManager<'arena> {
                         }
                         ro_view = UnorderedAlgorithmROView {
                             stroad,
-                            heap_thread_shard: rw_view.heap_thread_shard,
+                            heap_thread_shard,
                         };
                     }
                 });

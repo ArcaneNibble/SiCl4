@@ -13,15 +13,17 @@ fn executor_ensure_obj_safety() {
 #[should_panic]
 fn executor_single_threaded_only_one() {
     let manager = NetlistManager::new();
-    let _view1 = manager.access_single_threaded();
-    let _view2 = manager.access_single_threaded();
+    let workqueue = work_queue::Queue::new(1, 128);
+    let _view1 = manager.access_single_threaded(&workqueue);
+    let _view2 = manager.access_single_threaded(&workqueue);
 }
 
 #[cfg(not(loom))]
 #[test]
 fn executor_single_threaded_smoke_test() {
     let manager = NetlistManager::new();
-    let mut view = manager.access_single_threaded();
+    let workqueue = work_queue::Queue::new(1, 128);
+    let mut view = manager.access_single_threaded(&workqueue);
     let cell_ref;
     let wire_ref;
     {
@@ -33,8 +35,7 @@ fn executor_single_threaded_smoke_test() {
         dbg!(&wire);
         dbg!(&*wire);
         wire_ref = wire.x;
-        let work_item = view.new_work_item(cell_ref.into());
-        dbg!(work_item);
+        view.add_work(cell_ref.into());
 
         connect_driver(&mut cell, 0, &mut wire);
     }
@@ -58,7 +59,8 @@ fn executor_single_threaded_smoke_test() {
 #[test]
 fn executor_single_threaded_only_one_get() {
     let manager = NetlistManager::new();
-    let mut view = manager.access_single_threaded();
+    let workqueue = work_queue::Queue::new(1, 128);
+    let mut view = manager.access_single_threaded(&workqueue);
     let cell = view.new_cell(TEST_LUT_UUID, 0);
     let cell_ref = cell.x;
     drop(cell);
@@ -73,20 +75,20 @@ fn executor_single_threaded_only_one_get() {
 #[test]
 fn executor_asdf() {
     let manager = NetlistManager::new();
-    let mut view = manager.access_single_threaded();
+    let workqueue = work_queue::Queue::new(1, 128);
+    let mut view = manager.access_single_threaded(&workqueue);
     let cell = view.new_cell(TEST_LUT_UUID, 0);
     dbg!(&cell);
     dbg!(&*cell);
     let wire = view.new_wire();
     dbg!(&wire);
     dbg!(&*wire);
-    let work_item = view.new_work_item(cell.x.into());
-    dbg!(work_item);
+    view.add_work(cell.x.into());
     drop(view);
     let cell_ref = cell.x;
     drop(cell);
 
-    let mut view = manager.access_single_threaded();
+    let mut view = manager.access_single_threaded(&workqueue);
     let cell2 = view.get_cell_read((), cell_ref);
     dbg!(&cell2);
     let cell3 = view.get_cell_read((), cell_ref);
@@ -113,9 +115,9 @@ fn executor_asdf2() {
             Ok(())
         }
 
-        fn process_finish_readwrite<'algo_state, 'view, 'arena>(
+        fn process_finish_readwrite<'algo_state, 'view, 'arena, 'q>(
             &'algo_state self,
-            view: &'view mut UnorderedAlgorithmRWView<'arena>,
+            view: &'view mut UnorderedAlgorithmRWView<'arena, 'q>,
             work_item: &'arena WorkItem<'arena, 'arena>,
             _ro_output: Self::ROtoRWTy,
         ) {
@@ -132,17 +134,15 @@ fn executor_asdf2() {
     }
 
     let manager = NetlistManager::new();
-    let mut view = manager.access_single_threaded();
+    let workqueue = work_queue::Queue::new(1, 128);
+    let mut view = manager.access_single_threaded(&workqueue);
     let mut cell = view.new_cell(TEST_LUT_UUID, 1);
     let mut wire = view.new_wire();
     connect_driver(&mut cell, 0, &mut wire);
-    let work_item = view.new_work_item(cell.x.into());
+    view.add_work(cell.x.into());
     drop(view);
     drop(cell);
     drop(wire);
-
-    let workqueue = work_queue::Queue::new(1, 128);
-    workqueue.push(&*work_item);
 
     let algo = TestAlgo {};
     manager.run_unordered_algorithm(&algo, &workqueue);
