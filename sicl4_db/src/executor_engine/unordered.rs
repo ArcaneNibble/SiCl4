@@ -134,11 +134,6 @@ impl<'arena> UnorderedAlgorithmRWView<'arena> {
 pub struct UnorderedObjPhase1Guard<'arena, T> {
     pub x: ObjRef<'arena, T>,
 }
-impl<'arena, T> UnorderedObjPhase1Guard<'arena, T> {
-    pub fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
-        self.x
-    }
-}
 impl<'arena, T> Deref for UnorderedObjPhase1Guard<'arena, T> {
     type Target = T;
 
@@ -154,11 +149,6 @@ pub struct UnorderedObjPhase2ROGuard<'arena, T> {
     stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
     local_queue: Rc<RefCell<LocalQueue<&'arena WorkItem<'arena, 'arena>>>>,
     pub x: ObjRef<'arena, T>,
-}
-impl<'arena, T> UnorderedObjPhase2ROGuard<'arena, T> {
-    pub fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
-        self.x
-    }
 }
 impl<'arena, T> Drop for UnorderedObjPhase2ROGuard<'arena, T> {
     fn drop(&mut self) {
@@ -184,11 +174,6 @@ pub struct UnorderedObjPhase2RWGuard<'arena, T> {
     stroad: &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
     local_queue: Rc<RefCell<LocalQueue<&'arena WorkItem<'arena, 'arena>>>>,
     pub x: ObjRef<'arena, T>,
-}
-impl<'arena, T> UnorderedObjPhase2RWGuard<'arena, T> {
-    pub fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
-        self.x
-    }
 }
 impl<'arena, T> Drop for UnorderedObjPhase2RWGuard<'arena, T> {
     fn drop(&mut self) {
