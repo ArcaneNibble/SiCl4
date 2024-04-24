@@ -106,6 +106,8 @@ fn executor_asdf2() {
             dbg!(work_item.seed_node);
             let x = view.try_lock_cell(work_item, work_item.seed_node.cell(), true)?;
             dbg!(&*x);
+            let y = view.try_lock_wire(work_item, x._wire.unwrap(), false)?;
+            dbg!(&*y);
             Ok(())
         }
 
@@ -118,6 +120,8 @@ fn executor_asdf2() {
             dbg!(work_item.seed_node);
             let x = view.get_cell_write(work_item, work_item.seed_node.cell());
             dbg!(&*x);
+            let y = view.get_wire_read(work_item, x._wire.unwrap());
+            dbg!(&*y);
         }
     }
 
