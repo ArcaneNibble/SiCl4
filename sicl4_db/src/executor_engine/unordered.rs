@@ -94,18 +94,6 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 {
                     panic!("Tried to access a node in the wrong state")
                 }
-                if lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .load(Ordering::Relaxed)
-                {
-                    panic!("Tried to access a node multiple times")
-                    // xxx this is meh
-                }
-                lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .store(true, Ordering::Relaxed);
                 return Some(UnorderedObjPhase2ROGuard { x: obj });
             }
         }
@@ -123,18 +111,6 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 if lock_i.state.get() != LockState::LockedForUnorderedWrite {
                     panic!("Tried to access a node in the wrong state")
                 }
-                if lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .load(Ordering::Relaxed)
-                {
-                    panic!("Tried to access a node multiple times")
-                    // xxx this is meh
-                }
-                lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .store(true, Ordering::Relaxed);
                 return Some(UnorderedObjPhase2RWGuard { x: obj });
             }
         }
@@ -155,18 +131,6 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 {
                     panic!("Tried to access a node in the wrong state")
                 }
-                if lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .load(Ordering::Relaxed)
-                {
-                    panic!("Tried to access a node multiple times")
-                    // xxx this is meh
-                }
-                lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .store(true, Ordering::Relaxed);
                 return Some(UnorderedObjPhase2ROGuard { x: obj });
             }
         }
@@ -185,18 +149,6 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 if lock_i.state.get() != LockState::LockedForUnorderedWrite {
                     panic!("Tried to access a node in the wrong state")
                 }
-                if lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .load(Ordering::Relaxed)
-                {
-                    panic!("Tried to access a node multiple times")
-                    // xxx this is meh
-                }
-                lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .store(true, Ordering::Relaxed);
                 return Some(UnorderedObjPhase2RWGuard { x: obj });
             }
         }

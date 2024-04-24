@@ -170,7 +170,6 @@ const MAX_LOCKS_PER_WORK_ITEM: usize = 4;
 #[derive(Debug)]
 struct WorkItemPerLockData<'arena, 'work_item> {
     w: &'work_item WorkItem<'arena, 'work_item>,
-    guard_handed_out: AtomicBool,
 }
 impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPerLockData<'arena, 'work_item> {
     fn cancel(&self) {
@@ -256,7 +255,6 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
             let inner_payload = LockAndStroadData::unsafe_stroad_work_item_link_ptr(lock_ptr);
             // lifetimes should've made it s.t. this is pinned in place
             (*inner_payload).w = self;
-            (*inner_payload).guard_handed_out = AtomicBool::new(false);
             (lock_idx, &mut *lock_ptr)
         }
     }
