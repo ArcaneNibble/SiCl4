@@ -2,6 +2,8 @@
 //!
 //! In other words, the "fringe" of the graph algorithm is an unordered set.
 
+use std::marker::PhantomData;
+
 use super::*;
 
 pub trait UnorderedAlgorithm: Send + Sync {
@@ -26,6 +28,13 @@ pub struct UnorderedAlgorithmROView<'arena> {
     pub(super) stroad:
         &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
+}
+impl<'arena> NetlistView<'arena> for UnorderedAlgorithmROView<'arena> {
+    fn new_cell<'wrapper>(&'wrapper mut self) -> impl DerefMut<Target = NetlistCell<'arena>> {
+        panic!("Creating new nodes not allowed in RO phase");
+        #[allow(unreachable_code)]
+        RPITITWorkaroundDeref { _pd: PhantomData }
+    }
 }
 impl<'arena> UnorderedAlgorithmROView<'arena> {
     pub fn try_lock_cell<'wrapper>(
@@ -68,6 +77,25 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
 #[derive(Debug)]
 pub struct UnorderedAlgorithmRWView<'arena> {
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
+}
+#[allow(refining_impl_trait)]
+impl<'arena> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena> {
+    fn new_cell<'wrapper>(
+        &'wrapper mut self,
+    ) -> UnorderedObjPhase2RWGuard<'arena, NetlistCell<'arena>> {
+        let (new, gen) = self
+            .heap_thread_shard
+            .allocate::<LockedObj<NetlistCell<'arena>>>();
+        unsafe {
+            LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+            let _ = NetlistCell::init((*new.as_mut_ptr()).payload.get());
+            let new_ref = ObjRef {
+                ptr: new.assume_init_ref(),
+                gen,
+            };
+            UnorderedObjPhase2RWGuard { x: new_ref }
+        }
+    }
 }
 impl<'arena> UnorderedAlgorithmRWView<'arena> {
     pub fn get_cell_read<'wrapper>(

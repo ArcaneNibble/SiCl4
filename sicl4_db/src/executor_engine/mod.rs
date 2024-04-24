@@ -3,6 +3,7 @@
 use std::{
     alloc::Layout,
     cell::{Cell, RefCell, UnsafeCell},
+    marker::PhantomData,
     mem::{self, MaybeUninit},
     ops::{Deref, DerefMut},
     rc::Rc,
@@ -50,6 +51,27 @@ impl<'arena> NetlistRef<'arena> {
             NetlistRef::Cell(x) => x.type_erase(),
             NetlistRef::Wire(x) => x.type_erase(),
         }
+    }
+}
+
+/// common API for doing stuff to a netlist
+pub trait NetlistView<'arena> {
+    fn new_cell<'wrapper>(&'wrapper mut self) -> impl DerefMut<Target = NetlistCell<'arena>>;
+}
+
+struct RPITITWorkaroundDeref<T> {
+    _pd: PhantomData<T>,
+}
+impl<T> Deref for RPITITWorkaroundDeref<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        panic!("This should never be called!")
+    }
+}
+impl<T> DerefMut for RPITITWorkaroundDeref<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        panic!("This should never be called!")
     }
 }
 

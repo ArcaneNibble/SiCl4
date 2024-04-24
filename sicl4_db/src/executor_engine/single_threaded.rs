@@ -15,8 +15,9 @@ impl<'arena> Drop for SingleThreadedView<'arena> {
         self.x.in_use.set(false);
     }
 }
-impl<'arena> SingleThreadedView<'arena> {
-    pub fn new_cell<'wrapper>(&'wrapper mut self) -> SingleThreadedCellGuard<'arena> {
+#[allow(refining_impl_trait)]
+impl<'arena> NetlistView<'arena> for SingleThreadedView<'arena> {
+    fn new_cell<'wrapper>(&'wrapper mut self) -> SingleThreadedCellGuard<'arena> {
         let (new, gen) = self
             .heap_thread_shard
             .allocate::<LockedObj<NetlistCell<'arena>>>();
@@ -30,7 +31,8 @@ impl<'arena> SingleThreadedView<'arena> {
             SingleThreadedObjGuard { x: new_ref }
         }
     }
-
+}
+impl<'arena> SingleThreadedView<'arena> {
     pub fn new_wire<'wrapper>(&'wrapper mut self) -> SingleThreadedWireGuard<'arena> {
         let (new, gen) = self
             .heap_thread_shard
