@@ -165,7 +165,7 @@ macro_rules! impl_view_shared_code {
     };
 }
 
-const MAX_LOCKS_PER_WORK_ITEM: usize = 4;
+const MAX_LOCKS_PER_WORK_ITEM: usize = 8;
 
 #[derive(Debug)]
 struct WorkItemPerLockData<'arena, 'work_item> {
@@ -219,6 +219,7 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
 
         // we *do* need to actually check the "only unpark once" requirement though
         if !self._todo_wip_did_unpark.swap(true, Ordering::Relaxed) {
+            // println!("unpark!");
             local_queue.push(self);
         }
     }
@@ -328,7 +329,7 @@ impl<'arena> NetlistManager<'arena> {
                         work_item.reset_state();
                         let ro_ret = algo.try_process_readonly(&mut ro_view, work_item);
                         if ro_ret.is_err() {
-                            println!("parked!");
+                            // println!("parked!");
                             unsafe {
                                 let locks_used = work_item.locks_used.get();
                                 let lock_that_failed =
