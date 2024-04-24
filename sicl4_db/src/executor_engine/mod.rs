@@ -3,7 +3,6 @@
 use std::{
     alloc::Layout,
     cell::{Cell, RefCell, UnsafeCell},
-    marker::PhantomData,
     mem::{self, MaybeUninit},
     ops::{Deref, DerefMut},
     rc::Rc,
@@ -56,23 +55,88 @@ impl<'arena> NetlistRef<'arena> {
 
 /// common API for doing stuff to a netlist
 pub trait NetlistView<'arena> {
-    fn new_cell<'wrapper>(&'wrapper mut self) -> impl DerefMut<Target = NetlistCell<'arena>>;
-}
+    type CellROGuardTy: Deref<Target = NetlistCell<'arena>>;
+    type WireROGuardTy: Deref<Target = NetlistWire<'arena>>;
+    type CellOwningGuardTy: DerefMut<Target = NetlistCell<'arena>>;
+    type WireOwningGuardTy: DerefMut<Target = NetlistWire<'arena>>;
+    type MaybeWorkItem;
 
-struct RPITITWorkaroundDeref<T> {
-    _pd: PhantomData<T>,
-}
-impl<T> Deref for RPITITWorkaroundDeref<T> {
-    type Target = T;
+    fn new_cell<'wrapper>(&'wrapper mut self) -> Self::CellOwningGuardTy;
+    fn new_wire<'wrapper>(&'wrapper mut self) -> Self::WireOwningGuardTy;
+    fn delete_cell<'wrapper>(&'wrapper mut self, guard: Self::CellOwningGuardTy);
+    fn delete_wire<'wrapper>(&'wrapper mut self, guard: Self::WireOwningGuardTy);
 
-    fn deref(&self) -> &T {
-        panic!("This should never be called!")
-    }
+    // fixme document the semantics of Option
+    fn get_cell_read<'wrapper>(
+        &'wrapper mut self,
+        work_item: Self::MaybeWorkItem,
+        obj: NetlistCellRef<'arena>,
+    ) -> Option<Self::CellROGuardTy>;
+    fn get_cell_write<'wrapper>(
+        &'wrapper mut self,
+        work_item: Self::MaybeWorkItem,
+        obj: NetlistCellRef<'arena>,
+    ) -> Option<Self::CellOwningGuardTy>;
+
+    fn get_wire_read<'wrapper>(
+        &'wrapper mut self,
+        work_item: Self::MaybeWorkItem,
+        obj: NetlistWireRef<'arena>,
+    ) -> Option<Self::WireROGuardTy>;
+    fn get_wire_write<'wrapper>(
+        &'wrapper mut self,
+        work_item: Self::MaybeWorkItem,
+        obj: NetlistWireRef<'arena>,
+    ) -> Option<Self::WireOwningGuardTy>;
 }
-impl<T> DerefMut for RPITITWorkaroundDeref<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        panic!("This should never be called!")
-    }
+macro_rules! impl_view_shared_code {
+    () => {
+        fn new_cell<'wrapper>(&'wrapper mut self) -> Self::CellOwningGuardTy {
+            let (new, gen) = self
+                .heap_thread_shard
+                .allocate::<LockedObj<NetlistCell<'arena>>>();
+            unsafe {
+                LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+                let _ = NetlistCell::init((*new.as_mut_ptr()).payload.get());
+                let new_ref = ObjRef {
+                    ptr: new.assume_init_ref(),
+                    gen,
+                };
+                Self::CellOwningGuardTy { x: new_ref }
+            }
+        }
+        fn new_wire<'wrapper>(&'wrapper mut self) -> Self::WireOwningGuardTy {
+            let (new, gen) = self
+                .heap_thread_shard
+                .allocate::<LockedObj<NetlistWire<'arena>>>();
+            unsafe {
+                LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+                let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get());
+                let new_ref = ObjRef {
+                    ptr: new.assume_init_ref(),
+                    gen,
+                };
+                Self::WireOwningGuardTy { x: new_ref }
+            }
+        }
+
+        fn delete_cell<'wrapper>(&'wrapper mut self, guard: Self::CellOwningGuardTy) {
+            guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
+            unsafe {
+                // safety: the guard represents exclusive access to the node
+                self.heap_thread_shard.free(guard.x.ptr)
+            }
+            mem::forget(guard);
+        }
+        fn delete_wire<'wrapper>(&'wrapper mut self, guard: Self::WireOwningGuardTy) {
+            guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
+            unsafe {
+                // safety: the guard represents exclusive access to the node
+                self.heap_thread_shard.free(guard.x.ptr)
+            }
+            mem::forget(guard);
+        }
+    };
 }
 
 const MAX_LOCKS_PER_WORK_ITEM: usize = 4;

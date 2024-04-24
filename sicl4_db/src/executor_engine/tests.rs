@@ -37,16 +37,16 @@ fn executor_single_threaded_smoke_test() {
         wire._cell = Some(cell_ref);
     }
     {
-        let cell_again = view.get_cell(cell_ref).unwrap();
-        let wire_again = view.get_wire(wire_ref).unwrap();
+        let cell_again = view.get_cell_read((), cell_ref).unwrap();
+        let wire_again = view.get_wire_read((), wire_ref).unwrap();
         assert_eq!(cell_again._wire, Some(wire_ref));
         assert_eq!(wire_again._cell, Some(cell_ref));
         view.delete_cell(cell_again);
         view.delete_wire(wire_again);
     }
     {
-        let cell_again_again = view.get_cell(cell_ref);
-        let wire_again_again = view.get_wire(wire_ref);
+        let cell_again_again = view.get_cell_read((), cell_ref);
+        let wire_again_again = view.get_wire_read((), wire_ref);
         assert!(cell_again_again.is_none());
         assert!(wire_again_again.is_none());
     }
@@ -61,8 +61,8 @@ fn executor_single_threaded_only_one_get() {
     let cell_ref = cell.x;
     drop(cell);
 
-    let cell_again_0 = view.get_cell(cell_ref);
-    let cell_again_1 = view.get_cell(cell_ref);
+    let cell_again_0 = view.get_cell_read((), cell_ref);
+    let cell_again_1 = view.get_cell_read((), cell_ref);
     assert!(cell_again_0.is_some());
     assert!(cell_again_1.is_none());
 }
@@ -85,9 +85,9 @@ fn executor_asdf() {
     drop(cell);
 
     let mut view = manager.access_single_threaded();
-    let cell2 = view.get_cell(cell_ref);
+    let cell2 = view.get_cell_read((), cell_ref);
     dbg!(&cell2);
-    let cell3 = view.get_cell(cell_ref);
+    let cell3 = view.get_cell_read((), cell_ref);
     dbg!(&cell3);
 }
 
@@ -118,9 +118,11 @@ fn executor_asdf2() {
             _ro_output: Self::ROtoRWTy,
         ) {
             dbg!(work_item.seed_node);
-            let x = view.get_cell_write(work_item, work_item.seed_node.cell());
+            let x = view
+                .get_cell_write(work_item, work_item.seed_node.cell())
+                .unwrap();
             dbg!(&*x);
-            let y = view.get_wire_read(work_item, x._wire.unwrap());
+            let y = view.get_wire_read(work_item, x._wire.unwrap()).unwrap();
             dbg!(&*y);
         }
     }

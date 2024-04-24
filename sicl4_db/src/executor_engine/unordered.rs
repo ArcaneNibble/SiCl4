@@ -2,8 +2,6 @@
 //!
 //! In other words, the "fringe" of the graph algorithm is an unordered set.
 
-use std::marker::PhantomData;
-
 use super::*;
 
 pub trait UnorderedAlgorithm: Send + Sync {
@@ -28,13 +26,6 @@ pub struct UnorderedAlgorithmROView<'arena> {
     pub(super) stroad:
         &'arena Stroad<'arena, TypeErasedObjRef<'arena>, WorkItemPerLockData<'arena, 'arena>>,
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
-}
-impl<'arena> NetlistView<'arena> for UnorderedAlgorithmROView<'arena> {
-    fn new_cell<'wrapper>(&'wrapper mut self) -> impl DerefMut<Target = NetlistCell<'arena>> {
-        panic!("Creating new nodes not allowed in RO phase");
-        #[allow(unreachable_code)]
-        RPITITWorkaroundDeref { _pd: PhantomData }
-    }
 }
 impl<'arena> UnorderedAlgorithmROView<'arena> {
     pub fn try_lock_cell<'wrapper>(
@@ -78,149 +69,140 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
 pub struct UnorderedAlgorithmRWView<'arena> {
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
 }
-#[allow(refining_impl_trait)]
 impl<'arena> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena> {
-    fn new_cell<'wrapper>(
+    type CellROGuardTy = UnorderedObjPhase2ROGuard<'arena, NetlistCell<'arena>>;
+    type WireROGuardTy = UnorderedObjPhase2ROGuard<'arena, NetlistWire<'arena>>;
+    type CellOwningGuardTy = UnorderedObjPhase2RWGuard<'arena, NetlistCell<'arena>>;
+    type WireOwningGuardTy = UnorderedObjPhase2RWGuard<'arena, NetlistWire<'arena>>;
+    type MaybeWorkItem = &'arena WorkItem<'arena, 'arena>;
+
+    impl_view_shared_code!();
+
+    fn get_cell_read<'wrapper>(
         &'wrapper mut self,
-    ) -> UnorderedObjPhase2RWGuard<'arena, NetlistCell<'arena>> {
-        let (new, gen) = self
-            .heap_thread_shard
-            .allocate::<LockedObj<NetlistCell<'arena>>>();
-        unsafe {
-            LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
-            let _ = NetlistCell::init((*new.as_mut_ptr()).payload.get());
-            let new_ref = ObjRef {
-                ptr: new.assume_init_ref(),
-                gen,
-            };
-            UnorderedObjPhase2RWGuard { x: new_ref }
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistCellRef<'arena>,
+    ) -> Option<UnorderedObjPhase2ROGuard<'arena, NetlistCell<'arena>>> {
+        // xxx can this be done more efficiently?
+        for lock_idx in 0..work_item.locks_used.get() {
+            let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
+            if lock_i.p == obj.type_erase() {
+                if lock_i.state.get() != LockState::LockedForUnorderedRead
+                    && lock_i.state.get() != LockState::LockedForUnorderedWrite
+                {
+                    panic!("Tried to access a node in the wrong state")
+                }
+                if lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .load(Ordering::Relaxed)
+                {
+                    panic!("Tried to access a node multiple times")
+                    // xxx this is meh
+                }
+                lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .store(true, Ordering::Relaxed);
+                return Some(UnorderedObjPhase2ROGuard { x: obj });
+            }
         }
+        panic!("Tried to access a node that wasn't tagged in phase 1")
+    }
+    fn get_cell_write<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistCellRef<'arena>,
+    ) -> Option<UnorderedObjPhase2RWGuard<'arena, NetlistCell<'arena>>> {
+        // xxx can this be done more efficiently?
+        for lock_idx in 0..work_item.locks_used.get() {
+            let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
+            if lock_i.p == obj.type_erase() {
+                if lock_i.state.get() != LockState::LockedForUnorderedWrite {
+                    panic!("Tried to access a node in the wrong state")
+                }
+                if lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .load(Ordering::Relaxed)
+                {
+                    panic!("Tried to access a node multiple times")
+                    // xxx this is meh
+                }
+                lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .store(true, Ordering::Relaxed);
+                return Some(UnorderedObjPhase2RWGuard { x: obj });
+            }
+        }
+        panic!("Tried to access a node that wasn't tagged in phase 1")
+    }
+
+    fn get_wire_read<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistWireRef<'arena>,
+    ) -> Option<UnorderedObjPhase2ROGuard<'arena, NetlistWire<'arena>>> {
+        // xxx can this be done more efficiently?
+        for lock_idx in 0..work_item.locks_used.get() {
+            let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
+            if lock_i.p == obj.type_erase() {
+                if lock_i.state.get() != LockState::LockedForUnorderedRead
+                    && lock_i.state.get() != LockState::LockedForUnorderedWrite
+                {
+                    panic!("Tried to access a node in the wrong state")
+                }
+                if lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .load(Ordering::Relaxed)
+                {
+                    panic!("Tried to access a node multiple times")
+                    // xxx this is meh
+                }
+                lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .store(true, Ordering::Relaxed);
+                return Some(UnorderedObjPhase2ROGuard { x: obj });
+            }
+        }
+        panic!("Tried to access a node that wasn't tagged in phase 1")
+    }
+
+    fn get_wire_write<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistWireRef<'arena>,
+    ) -> Option<UnorderedObjPhase2RWGuard<'arena, NetlistWire<'arena>>> {
+        // xxx can this be done more efficiently?
+        for lock_idx in 0..work_item.locks_used.get() {
+            let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
+            if lock_i.p == obj.type_erase() {
+                if lock_i.state.get() != LockState::LockedForUnorderedWrite {
+                    panic!("Tried to access a node in the wrong state")
+                }
+                if lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .load(Ordering::Relaxed)
+                {
+                    panic!("Tried to access a node multiple times")
+                    // xxx this is meh
+                }
+                lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .store(true, Ordering::Relaxed);
+                return Some(UnorderedObjPhase2RWGuard { x: obj });
+            }
+        }
+        panic!("Tried to access a node that wasn't tagged in phase 1")
     }
 }
 impl<'arena> UnorderedAlgorithmRWView<'arena> {
-    pub fn get_cell_read<'wrapper>(
-        &'wrapper mut self,
-        work_item: &'arena WorkItem<'arena, 'arena>,
-        obj: NetlistCellRef<'arena>,
-    ) -> UnorderedObjPhase2ROGuard<'arena, NetlistCell<'arena>> {
-        // xxx can this be done more efficiently?
-        for lock_idx in 0..work_item.locks_used.get() {
-            let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
-            if lock_i.p == obj.type_erase() {
-                if lock_i.state.get() != LockState::LockedForUnorderedRead
-                    && lock_i.state.get() != LockState::LockedForUnorderedWrite
-                {
-                    panic!("Tried to access a node in the wrong state")
-                }
-                if lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .load(Ordering::Relaxed)
-                {
-                    panic!("Tried to access a node multiple times")
-                    // xxx this is meh
-                }
-                lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .store(true, Ordering::Relaxed);
-                return UnorderedObjPhase2ROGuard { x: obj };
-            }
-        }
-        panic!("Tried to access a node that wasn't tagged in phase 1")
-    }
-
-    pub fn get_cell_write<'wrapper>(
-        &'wrapper mut self,
-        work_item: &'arena WorkItem<'arena, 'arena>,
-        obj: NetlistCellRef<'arena>,
-    ) -> UnorderedObjPhase2RWGuard<'arena, NetlistCell<'arena>> {
-        // xxx can this be done more efficiently?
-        for lock_idx in 0..work_item.locks_used.get() {
-            let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
-            if lock_i.p == obj.type_erase() {
-                if lock_i.state.get() != LockState::LockedForUnorderedWrite {
-                    panic!("Tried to access a node in the wrong state")
-                }
-                if lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .load(Ordering::Relaxed)
-                {
-                    panic!("Tried to access a node multiple times")
-                    // xxx this is meh
-                }
-                lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .store(true, Ordering::Relaxed);
-                return UnorderedObjPhase2RWGuard { x: obj };
-            }
-        }
-        panic!("Tried to access a node that wasn't tagged in phase 1")
-    }
-
-    pub fn get_wire_read<'wrapper>(
-        &'wrapper mut self,
-        work_item: &'arena WorkItem<'arena, 'arena>,
-        obj: NetlistWireRef<'arena>,
-    ) -> UnorderedObjPhase2ROGuard<'arena, NetlistWire<'arena>> {
-        // xxx can this be done more efficiently?
-        for lock_idx in 0..work_item.locks_used.get() {
-            let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
-            if lock_i.p == obj.type_erase() {
-                if lock_i.state.get() != LockState::LockedForUnorderedRead
-                    && lock_i.state.get() != LockState::LockedForUnorderedWrite
-                {
-                    panic!("Tried to access a node in the wrong state")
-                }
-                if lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .load(Ordering::Relaxed)
-                {
-                    panic!("Tried to access a node multiple times")
-                    // xxx this is meh
-                }
-                lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .store(true, Ordering::Relaxed);
-                return UnorderedObjPhase2ROGuard { x: obj };
-            }
-        }
-        panic!("Tried to access a node that wasn't tagged in phase 1")
-    }
-
-    pub fn get_wire_write<'wrapper>(
-        &'wrapper mut self,
-        work_item: &'arena WorkItem<'arena, 'arena>,
-        obj: NetlistWireRef<'arena>,
-    ) -> UnorderedObjPhase2RWGuard<'arena, NetlistWire<'arena>> {
-        // xxx can this be done more efficiently?
-        for lock_idx in 0..work_item.locks_used.get() {
-            let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
-            if lock_i.p == obj.type_erase() {
-                if lock_i.state.get() != LockState::LockedForUnorderedWrite {
-                    panic!("Tried to access a node in the wrong state")
-                }
-                if lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .load(Ordering::Relaxed)
-                {
-                    panic!("Tried to access a node multiple times")
-                    // xxx this is meh
-                }
-                lock_i
-                    .stroad_work_item_link()
-                    .guard_handed_out
-                    .store(true, Ordering::Relaxed);
-                return UnorderedObjPhase2RWGuard { x: obj };
-            }
-        }
-        panic!("Tried to access a node that wasn't tagged in phase 1")
-    }
+    // xxx?
 }
 
 #[derive(Debug)]
