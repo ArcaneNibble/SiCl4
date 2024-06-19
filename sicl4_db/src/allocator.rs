@@ -20,7 +20,7 @@ use std::{
     collections::HashSet,
     fmt::Debug,
     marker::PhantomData,
-    mem::{self, size_of, MaybeUninit},
+    mem::{self, offset_of, size_of, MaybeUninit},
     ops::Deref,
     ptr::{self, addr_of, addr_of_mut},
     sync::atomic::Ordering,
@@ -235,7 +235,6 @@ impl<'arena, Mapper: TypeMapper> SlabRoot<'arena, Mapper> {
                 SlabPerThreadState::<'arena, Mapper>::init(
                     per_thread_maybe_uninit.as_mut_ptr(),
                     allocated_tid as u64,
-                    self,
                 );
                 self.per_thread_state_inited[allocated_tid].set(true);
             }
@@ -493,11 +492,7 @@ pub struct SlabPerThreadState<'arena, Mapper: TypeMapper> {
     /// Identifies this thread
     ///
     /// Current impl: bit position in the [SlabRoot::thread_inuse] bitfield
-    tid: u64,
-    /// Pointer to the [SlabRoot] this belongs to
-    ///
-    /// Can be removed if `offset_of!` gets stabilized
-    root: &'arena SlabRoot<'arena, Mapper>,
+    pub(crate) tid: u64,
     /// Manages the memory for each type
     per_ty_state: Mapper::BinsArrayTy<SlabPerThreadPerTyState<'arena>>,
     /// ABA generation counter for each type
@@ -511,7 +506,6 @@ impl<'arena, Mapper: TypeMapper> Debug for SlabPerThreadState<'arena, Mapper> {
         f.debug_struct("SlabPerThreadState")
             .field("@addr", &(self as *const _))
             .field("tid", &self.tid)
-            .field("root", &(self.root as *const _))
             .field("per_ty_state", &self.per_ty_state.borrow())
             .field("generation", &self.generation.borrow())
             .finish()
@@ -520,7 +514,7 @@ impl<'arena, Mapper: TypeMapper> Debug for SlabPerThreadState<'arena, Mapper> {
 
 impl<'arena, Mapper: TypeMapper> SlabPerThreadState<'arena, Mapper> {
     /// Initialize state
-    pub unsafe fn init(self_: *mut Self, tid: u64, root: &'arena SlabRoot<'arena, Mapper>) {
+    pub unsafe fn init(self_: *mut Self, tid: u64) {
         // calculate layouts
         let mut layouts = Mapper::BinsArrayTy::<(usize, usize)>::init((0, 0));
         let layouts = layouts.borrow_mut();
@@ -548,7 +542,6 @@ impl<'arena, Mapper: TypeMapper> SlabPerThreadState<'arena, Mapper> {
         }
 
         (*self_).tid = tid;
-        (*self_).root = root;
 
         let generations =
             Mapper::BinsArrayTy::<Cell<u64>>::as_mut_ptr(addr_of_mut!((*self_).generation));
@@ -968,7 +961,12 @@ impl<'arena, Mapper: TypeMapper> Deref for SlabThreadShard<'arena, Mapper> {
 
 impl<'arena, Mapper: TypeMapper> Drop for SlabThreadShard<'arena, Mapper> {
     fn drop(&mut self) {
-        let root = self.0.root;
+        let per_thread_state_offs = offset_of!(SlabRoot<Mapper>, per_thread_state);
+        let my_offs =
+            per_thread_state_offs + (self.tid as usize) * size_of::<SlabPerThreadState<Mapper>>();
+        let my_ptr = self.0 as *const SlabPerThreadState<Mapper> as usize;
+        let root_ptr = my_ptr - my_offs;
+        let root = unsafe { &*(root_ptr as *const SlabRoot<Mapper>) };
         let mask = !(1 << self.0.tid);
         // ordering: need all manipulation of thread-owned data to stick
         root.thread_inuse.fetch_and(mask, Ordering::Release);
