@@ -1,7 +1,7 @@
 #[cfg(loom)]
-pub use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize};
+pub use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize};
 #[cfg(not(loom))]
-pub use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize};
+pub use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize};
 
 #[cfg(loom)]
 pub fn spin_hint() {

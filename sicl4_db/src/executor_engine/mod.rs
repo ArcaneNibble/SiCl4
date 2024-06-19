@@ -130,7 +130,11 @@ impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPerLockData<'arena, 'w
 #[derive(Debug)]
 pub struct WorkItem<'arena, 'work_item> {
     pub seed_node: NetlistRef<'arena>,
-    _todo_wip_did_unpark: AtomicBool,
+    // 00 = running the speculative RO phase (incl. running lock abandon)
+    // 01 = finished lock abandon, is parked now
+    // 10 = unpark was triggered, but parking wasn't finished
+    // 11 = unpark was triggered *after* lock was abandoned
+    _todo_wip_did_unpark: AtomicU32,
     _todo_wip_cancelled: AtomicBool,
     locks_used: Cell<usize>,
     locks: [MaybeUninit<
@@ -144,7 +148,7 @@ unsafe impl<'arena, 'work_item> Sync for WorkItem<'arena, 'work_item> {}
 impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     pub unsafe fn init(self_: *mut Self, node: NetlistRef<'arena>) -> &'work_item mut Self {
         (*self_).seed_node = node;
-        (*self_)._todo_wip_did_unpark = AtomicBool::new(false);
+        (*self_)._todo_wip_did_unpark = AtomicU32::new(0);
         (*self_)._todo_wip_cancelled = AtomicBool::new(false);
         (*self_).locks_used = Cell::new(0);
         &mut *self_
@@ -162,21 +166,36 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         // additionally, unparking happens with the stroad bucket lock held -- can only happen from one thread
 
         // we *do* need to actually check the "only unpark once" requirement though
-        if !self._todo_wip_did_unpark.swap(true, Ordering::Relaxed) {
-            // println!("unpark!");
-            tracing::event!(
-                name: "unordered_algo::unpark",
-                Level::TRACE,
-                unparked_work = ?UsizePtr::from(self)
-            );
-            local_queue.push(self);
-        } else {
-            tracing::event!(
-                name: "unordered_algo::dup_unpark",
-                Level::TRACE,
-                unparked_work = ?UsizePtr::from(self)
-            );
-            local_queue.push(self);
+        // FIXME: why???
+        let _xxx_unpark_state = self._todo_wip_did_unpark.fetch_or(0b10, Ordering::Relaxed);
+        match _xxx_unpark_state {
+            0b00 => {
+                tracing::event!(
+                    name: "unordered_algo::unpark_tooearly",
+                    Level::TRACE,
+                    unparked_work = ?UsizePtr::from(self)
+                );
+            }
+            0b01 => {
+                // println!("unparked");
+                tracing::event!(
+                    name: "unordered_algo::unpark",
+                    Level::TRACE,
+                    unparked_work = ?UsizePtr::from(self)
+                );
+                local_queue.push(self);
+            }
+            0b10 | 0b11 => {
+                tracing::event!(
+                    name: "unordered_algo::unpark_duplicate",
+                    Level::TRACE,
+                    unparked_work = ?UsizePtr::from(self)
+                );
+                panic!("pretty sure this can't happen???");
+            }
+            _ => {
+                panic!("invalid park state bits?");
+            }
         }
     }
 
@@ -218,7 +237,7 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
 
     /// after this work item pops back out after unparking, reset everything so that it's ready to try again
     fn reset_state(&self) {
-        self._todo_wip_did_unpark.store(false, Ordering::Relaxed);
+        self._todo_wip_did_unpark.store(0, Ordering::Relaxed);
         self._todo_wip_cancelled.store(false, Ordering::Relaxed);
         self.locks_used.set(0);
     }
@@ -298,7 +317,6 @@ impl<'arena> NetlistManager<'arena> {
                         work_item.reset_state();
                         let ro_ret = algo.try_process_readonly(&mut ro_view, work_item);
                         if ro_ret.is_err() {
-                            // println!("parked!");
                             tracing::event!(
                                 name: "unordered_algo::park",
                                 Level::TRACE,
@@ -321,6 +339,28 @@ impl<'arena> NetlistManager<'arena> {
                                     lock.unlock(stroad, &mut local_queue_rc.borrow_mut());
                                 }
                             }
+
+                            let _xxx_unpark_state = work_item._todo_wip_did_unpark.fetch_or(0b01, Ordering::Relaxed);
+                            match _xxx_unpark_state {
+                                0b00 => {
+                                    // just park, don't do anything
+                                    // println!("parked!");
+                                }
+                                0b10 => {
+                                    // an unpark happened already while we were trying to release locks
+                                    let local_queue = &mut local_queue_rc.borrow_mut();
+                                    tracing::event!(
+                                        name: "unordered_algo::unpark_tooearly_recovery",
+                                        Level::TRACE,
+                                        unparked_work = ?UsizePtr::from(work_item)
+                                    );
+                                    local_queue.push(work_item);
+                                }
+                                _ => {
+                                    panic!("invalid park state bits?");
+                                }
+                            }
+
                             continue;
                         }
                         let ro_ret = ro_ret.unwrap();
