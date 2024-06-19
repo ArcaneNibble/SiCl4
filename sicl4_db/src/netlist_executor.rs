@@ -10,7 +10,11 @@ use std::{
     thread,
 };
 
-use crate::{allocator::*, lock_ops::*, netlist::*, stroad::*};
+use crate::allocator::*;
+use crate::lock_ops::*;
+use crate::loom_testing::*;
+use crate::netlist::*;
+use crate::stroad::*;
 
 pub trait UnorderedAlgorithm: Send + Sync {
     type ROtoRWTy;
@@ -61,7 +65,7 @@ const MAX_ORDERED_LOCKS_PER_WORK_ITEM: usize = 4;
 #[derive(Debug)]
 struct WorkItemPerLockData<'arena, 'work_item> {
     w: &'work_item WorkItem<'arena, 'work_item>,
-    // guard_handed_out: Cell<bool>,
+    guard_handed_out: AtomicBool,
 }
 impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPerLockData<'arena, 'work_item> {
     fn cancel<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
@@ -125,10 +129,10 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         unsafe {
             let lock_ptr = (*self.locks[lock_idx].as_ptr()).get();
             LockAndStroadData::init(lock_ptr, obj.type_erase());
-            let inner_payload = LockAndStroadData::unsafe_inner_payload_ptr(lock_ptr);
+            let inner_payload = LockAndStroadData::unsafe_stroad_work_item_link_ptr(lock_ptr);
             // lifetimes should've made it s.t. this is pinned in place
             (*inner_payload).w = self;
-            // (*inner_payload).guard_handed_out = Cell::new(false);
+            (*inner_payload).guard_handed_out = AtomicBool::new(false);
             (lock_idx, &mut *lock_ptr)
         }
     }
@@ -255,16 +259,22 @@ impl<'arena> UnorderedAlgorithmRWView<'arena> {
                 {
                     panic!("Tried to access a node in the wrong state")
                 }
-                todo!();
-                // if lock_i.inner_payload_ref().guard_handed_out.get() {
-                //     panic!("Tried to access a node multiple times")
-                //     // xxx this is meh
-                // }
-                // lock_i.inner_payload_ref().guard_handed_out.set(true);
-                // return UnorderedObjROGuard {
-                //     lock: lock_i,
-                //     _pd1: PhantomData,
-                // };
+                if lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .load(Ordering::Relaxed)
+                {
+                    panic!("Tried to access a node multiple times")
+                    // xxx this is meh
+                }
+                lock_i
+                    .stroad_work_item_link()
+                    .guard_handed_out
+                    .store(true, Ordering::Relaxed);
+                return UnorderedObjROGuard {
+                    lock: lock_i,
+                    _pd1: PhantomData,
+                };
             }
         }
         panic!("Tried to access a node that wasn't tagged in RO phase")
