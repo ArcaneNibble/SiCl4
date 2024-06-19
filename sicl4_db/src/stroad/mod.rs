@@ -598,44 +598,6 @@ impl<'stroad_node, K: Hash + Eq, P: StroadToWorkItemLink> Stroad<'stroad_node, K
         }
     }
 
-    pub(crate) fn _debug_dump(&self)
-    where
-        K: Debug,
-    {
-        let mut any_bad_found = false;
-        for shard_i in 0..HASH_NUM_SHARDS {
-            // XXX this doesn't take locks or prevent data races
-            let shard = unsafe { &*self.shards[shard_i].get() };
-            if shard.nents > 0 {
-                // dbg!(shard);
-
-                let buckets_ptr_usz = shard.buckets_and_lock.load(Ordering::Relaxed) & !1;
-                assert_ne!(buckets_ptr_usz, 0);
-                let buckets_ptr = buckets_ptr_usz as *mut StroadBucket<'stroad_node, K, P>;
-                let buckets =
-                    unsafe { &*slice_from_raw_parts_mut(buckets_ptr, 1 << shard.capacity_shift) };
-
-                for (bucket_i, bucket) in buckets.iter().enumerate() {
-                    // dbg!(bucket_i, bucket);
-                    let mut ll = &bucket.wants_lock;
-                    while let Some(ll_ent) = ll.next {
-                        let ll_ent = unsafe { &*ll_ent.get() };
-                        // dbg!(&ll_ent.key);
-                        println!("Stroad shard 0x{shard_i:X} bucket 0x{bucket_i:X} still wanting lock {:?} from work item {:?}", ll_ent.key(), &ll_ent.work_item_link as *const _);
-                        any_bad_found = true;
-
-                        ll = &ll_ent.link;
-                        if ll as *const _ == &bucket.wants_lock as *const _ {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        assert!(!any_bad_found);
-    }
-
     /// For an unordered algorithm, perform the park operation
     /// (blocking the work item) onto the [wants_lock](StroadBucket::wants_lock) list
     pub fn unordered_park_conditionally<VAL>(
@@ -984,6 +946,47 @@ impl<'stroad_node, K: Hash + Eq, P: StroadToWorkItemLink> Stroad<'stroad_node, K
         bucket.unlink_item(stroad_node, true);
         unmark_item();
         unsafe { &mut *stroad_node.get() }
+    }
+}
+
+impl<'stroad_node, 'arena, 'work_item, K: Hash + Eq + Debug>
+    Stroad<'stroad_node, K, crate::executor_engine::WorkItemPerLockData<'arena, 'work_item>>
+{
+    pub(crate) fn _debug_dump(&self) {
+        let mut any_bad_found = false;
+        for shard_i in 0..HASH_NUM_SHARDS {
+            // XXX this doesn't take locks or prevent data races
+            let shard = unsafe { &*self.shards[shard_i].get() };
+            if shard.nents > 0 {
+                // dbg!(shard);
+
+                let buckets_ptr_usz = shard.buckets_and_lock.load(Ordering::Relaxed) & !1;
+                assert_ne!(buckets_ptr_usz, 0);
+                let buckets_ptr = buckets_ptr_usz
+                    as *mut StroadBucket<
+                        'stroad_node,
+                        K,
+                        crate::executor_engine::WorkItemPerLockData<'arena, 'work_item>,
+                    >;
+                let buckets =
+                    unsafe { &*slice_from_raw_parts_mut(buckets_ptr, 1 << shard.capacity_shift) };
+
+                for (bucket_i, bucket) in buckets.iter().enumerate() {
+                    // dbg!(bucket_i, bucket);
+                    let mut ll = &bucket.wants_lock;
+                    while let Some(ll_ent) = ll.next {
+                        let ll_ent = unsafe { &*ll_ent.get() };
+                        // dbg!(&ll_ent.key);
+                        println!("Stroad shard 0x{shard_i:X} bucket 0x{bucket_i:X} still wanting lock {:?} from work item {:?}", ll_ent.key(), ll_ent.work_item_link.w as *const crate::executor_engine::WorkItem);
+                        any_bad_found = true;
+
+                        ll = &ll_ent.link;
+                    }
+                }
+            }
+        }
+
+        assert!(!any_bad_found);
     }
 }
 

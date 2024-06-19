@@ -112,8 +112,8 @@ pub trait NetlistView<'arena> {
 const MAX_LOCKS_PER_WORK_ITEM: usize = 8;
 
 #[derive(Debug)]
-struct WorkItemPerLockData<'arena, 'work_item> {
-    w: &'work_item WorkItem<'arena, 'work_item>,
+pub(crate) struct WorkItemPerLockData<'arena, 'work_item> {
+    pub(crate) w: &'work_item WorkItem<'arena, 'work_item>,
 }
 impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPerLockData<'arena, 'work_item> {
     fn cancel(&self) {
