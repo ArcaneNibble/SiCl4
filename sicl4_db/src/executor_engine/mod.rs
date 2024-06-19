@@ -2,9 +2,10 @@
 
 use std::{
     alloc::Layout,
-    cell::{Cell, UnsafeCell},
+    cell::{Cell, RefCell, UnsafeCell},
     mem::{self, MaybeUninit},
     ops::{Deref, DerefMut},
+    rc::Rc,
     sync::atomic::Ordering,
     thread,
 };
@@ -51,10 +52,11 @@ impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPerLockData<'arena, 'w
         self.w.cancel()
     }
 
-    fn unpark(&self, unpark_xtra: &u32) {
-        // fixme wtf
-        self.w.unpark(unpark_xtra)
+    fn unpark(&self, q: &mut Self::UnparkXtraTy) {
+        self.w.unpark(q)
     }
+
+    type UnparkXtraTy = LocalQueue<&'work_item WorkItem<'arena, 'work_item>>;
 }
 
 #[derive(Debug)]
@@ -167,15 +169,16 @@ impl<'arena> NetlistManager<'arena> {
         assert!(!self.in_use.get());
         self.in_use.set(true);
         thread::scope(|s| {
-            for mut local_queue in queue.local_queues() {
+            for local_queue in queue.local_queues() {
                 let heap_thread_shard = self.heap.new_thread();
                 let stroad = &self.stroad;
                 s.spawn(move || {
+                    let local_queue_rc = Rc::new(RefCell::new(local_queue));
                     let mut ro_view = UnorderedAlgorithmROView {
                         stroad,
                         heap_thread_shard,
                     };
-                    while let Some(work_item) = local_queue.pop() {
+                    while let Some(work_item) = local_queue_rc.borrow_mut().pop() {
                         let seed_node = work_item.seed_node;
                         let ro_ret = algo.try_process_readonly(&mut ro_view, seed_node, work_item);
                         if ro_ret.is_err() {
@@ -194,7 +197,7 @@ impl<'arena> NetlistManager<'arena> {
                                             || lock.state.get()
                                                 == LockState::LockedForUnorderedWrite
                                     );
-                                    lock.unlock(stroad, ());
+                                    lock.unlock(stroad, &mut local_queue_rc.borrow_mut());
                                 }
                             }
                             continue;
@@ -204,6 +207,7 @@ impl<'arena> NetlistManager<'arena> {
                         let mut rw_view = UnorderedAlgorithmRWView {
                             stroad,
                             heap_thread_shard: ro_view.heap_thread_shard,
+                            local_queue: local_queue_rc.clone(),
                         };
                         algo.process_finish_readwrite(&mut rw_view, seed_node, work_item, ro_ret);
                         ro_view = UnorderedAlgorithmROView {
