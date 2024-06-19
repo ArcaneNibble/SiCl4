@@ -1,6 +1,12 @@
 //! Manages a netlist and running algorithms on it
 
-use std::{alloc::Layout, mem::MaybeUninit, thread};
+use std::{
+    alloc::Layout,
+    cell::Cell,
+    mem::{self, MaybeUninit},
+    ops::{Deref, DerefMut},
+    sync::atomic::Ordering,
+};
 
 use crate::{allocator::*, locking::*, netlist::*, stroad::*};
 
@@ -71,33 +77,151 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
 #[derive(Debug)]
 pub struct NetlistManager<'arena> {
     heap: SlabRoot<'arena, NetlistTypeMapper>,
-    stroad: Box<Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>>,
+    // stroad: Box<Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>>,
+    /// Ensure that this isn't Sync (only various sub-accessors are),
+    /// and that only one algorithm can be running at once
+    in_use: Cell<bool>,
 }
 impl<'arena> NetlistManager<'arena> {
     /// Construct a new unified data structure
     pub fn new() -> Self {
         Self {
             heap: SlabRoot::new(),
-            stroad: Stroad::new(),
+            // stroad: Stroad::new(),
+            in_use: Cell::new(false),
         }
     }
 
-    pub fn run_unordered_algorithm<A: UnorderedAlgorithm>(&'arena self, algo: A) {
-        thread::scope(|s| {
-            for _ in 0..NUM_THREADS_FOR_NOW {
-                s.spawn(move || {
-                    let thread_heap_shard = self.heap.new_thread();
-                });
-            }
-        })
+    pub fn access_single_threaded(&'arena self) -> SingleThreadedView<'arena> {
+        assert!(!self.in_use.get());
+        self.in_use.set(true);
+        SingleThreadedView {
+            x: self,
+            heap_thread_shard: self.heap.new_thread(),
+        }
     }
 
-    /// Get a thread shard for performing operations on the netlist
-    pub fn new_thread(&'arena self) -> NetlistManagerThread<'arena> {
-        NetlistManagerThread {
-            heap_shard: self.heap.new_thread(),
-            stroad: &self.stroad,
+    // pub fn run_unordered_algorithm<A: UnorderedAlgorithm>(&'arena self, algo: A) {
+    //     thread::scope(|s| {
+    //         for _ in 0..NUM_THREADS_FOR_NOW {
+    //             s.spawn(move || {
+    //                 let thread_heap_shard = self.new_thread();
+    //             });
+    //         }
+    //     })
+    // }
+
+    // /// Get a thread shard for performing operations on the netlist
+    // pub fn new_thread(&'arena self) -> NetlistManagerThread<'arena> {
+    //     NetlistManagerThread {
+    //         heap_shard: self.heap.new_thread(),
+    //         stroad: &self.stroad,
+    //     }
+    // }
+}
+
+#[derive(Debug)]
+pub struct SingleThreadedView<'arena> {
+    x: &'arena NetlistManager<'arena>,
+    heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
+}
+// safety: only one of these objects can exist at once
+unsafe impl<'arena> Send for SingleThreadedView<'arena> {}
+impl<'arena> Drop for SingleThreadedView<'arena> {
+    fn drop<'wrapper>(&'wrapper mut self) {
+        self.x.in_use.set(false);
+    }
+}
+impl<'arena> SingleThreadedView<'arena> {
+    pub fn new_cell<'wrapper>(&'wrapper mut self) -> SingleThreadedCellGuard<'arena> {
+        let (new, gen) = self
+            .heap_thread_shard
+            .allocate::<LockedObj<NetlistCell<'arena>>>();
+        unsafe {
+            LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+            let _ = NetlistCell::init((*new.as_mut_ptr()).payload.get());
+            let new_ref = ObjRef {
+                ptr: new.assume_init_ref(),
+                gen,
+            };
+            SingleThreadedObjGuard { x: new_ref }
         }
+    }
+
+    pub fn new_wire<'wrapper>(&'wrapper mut self) -> SingleThreadedWireGuard<'arena> {
+        let (new, gen) = self
+            .heap_thread_shard
+            .allocate::<LockedObj<NetlistWire<'arena>>>();
+        unsafe {
+            LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+            let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get());
+            let new_ref = ObjRef {
+                ptr: new.assume_init_ref(),
+                gen,
+            };
+            SingleThreadedObjGuard { x: new_ref }
+        }
+    }
+
+    pub fn delete_cell<'wrapper>(&'wrapper mut self, guard: SingleThreadedCellGuard<'arena>) {
+        guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
+        unsafe {
+            // safety: the guard represents exclusive access to the node
+            self.heap_thread_shard.free(guard.x.ptr)
+        }
+        mem::forget(guard);
+    }
+
+    pub fn delete_wire<'wrapper>(&'wrapper mut self, guard: SingleThreadedWireGuard<'arena>) {
+        guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
+        unsafe {
+            // safety: the guard represents exclusive access to the node
+            self.heap_thread_shard.free(guard.x.ptr)
+        }
+        mem::forget(guard);
+    }
+
+    pub fn new_work_item<'wrapper>(
+        &'wrapper mut self,
+        node: NetlistRef<'arena>,
+    ) -> &'arena mut WorkItem<'arena, 'arena> {
+        let (new, _gen) = self.heap_thread_shard.allocate::<WorkItem>();
+        unsafe { WorkItem::init(new.as_mut_ptr(), node) }
+    }
+
+    pub fn delete_work_item<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena mut WorkItem<'arena, 'arena>,
+    ) {
+        unsafe { self.heap_thread_shard.free(work_item) }
+    }
+}
+type SingleThreadedCellGuard<'arena> = SingleThreadedObjGuard<'arena, NetlistCell<'arena>>;
+type SingleThreadedWireGuard<'arena> = SingleThreadedObjGuard<'arena, NetlistWire<'arena>>;
+#[derive(Debug)]
+pub struct SingleThreadedObjGuard<'arena, T> {
+    pub x: ObjRef<'arena, T>,
+}
+impl<'arena, T> Drop for SingleThreadedObjGuard<'arena, T> {
+    fn drop(&mut self) {
+        self.x
+            .ptr
+            .lock_and_generation
+            .fetch_and(!0x7f, Ordering::Relaxed);
+    }
+}
+impl<'arena, T> Deref for SingleThreadedObjGuard<'arena, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // safety: single-threaded environment
+        unsafe { &*self.x.ptr.payload.get() }
+    }
+}
+impl<'arena, T> DerefMut for SingleThreadedObjGuard<'arena, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // safety: single-threaded environment
+        unsafe { &mut *self.x.ptr.payload.get() }
     }
 }
 
@@ -121,23 +245,6 @@ impl<'arena, 'work_item> TypeMappable<NetlistTypeMapper> for WorkItem<'arena, 'w
     const I: usize = 2;
 }
 
-/// Provides one thread with access to the netlist
-#[derive(Debug)]
-pub struct NetlistManagerThread<'arena> {
-    heap_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
-    stroad: &'arena Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>,
-}
-
-impl<'arena> NetlistManagerThread<'arena> {
-    pub fn new_work_item<'wrapper>(
-        &'wrapper self,
-        node: NetlistRef<'arena>,
-    ) -> &'arena mut WorkItem<'arena, 'arena> {
-        let (new, _gen) = self.heap_shard.allocate::<WorkItem>();
-        unsafe { WorkItem::init(new.as_mut_ptr(), node) }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,12 +257,15 @@ mod tests {
     #[cfg(not(loom))]
     #[test]
     fn executor_asdf() {
-        let all_the_stuff = NetlistManager::new();
-        // dbg!(&all_the_stuff);
-        let thread_shard = all_the_stuff.new_thread();
-        // dbg!(&thread_shard);
-
-        // let work = thread_shard.new_work_item();
-        // dbg!(work);
+        let manager = NetlistManager::new();
+        let mut view = manager.access_single_threaded();
+        let cell = view.new_cell();
+        dbg!(&cell);
+        dbg!(&*cell);
+        let wire = view.new_wire();
+        dbg!(&wire);
+        dbg!(&*wire);
+        let work_item = view.new_work_item(cell.x.into());
+        dbg!(work_item);
     }
 }
