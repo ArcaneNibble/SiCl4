@@ -3,6 +3,8 @@ use std::time::Instant;
 use super::*;
 use memory_stats::memory_stats;
 use rand::{Rng, SeedableRng};
+use tracing::subscriber;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use uuid::uuid;
 
 const TEST_LUT_UUID: Uuid = uuid!("00000000-0000-0000-0000-000000000000");
@@ -153,24 +155,37 @@ fn executor_asdf2() {
     manager.run_unordered_algorithm(&algo, &workqueue);
 }
 
+fn trace_filt<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>>(
+    metadata: &tracing::Metadata,
+    _ctx: &tracing_subscriber::layer::Context<S>,
+) -> bool {
+    let meta_name = metadata.name();
+    if meta_name.starts_with("unordered_algo::")
+        && meta_name != "unordered_algo::ro_done"
+        && meta_name != "unordered_algo::rw_done"
+    {
+        true
+    } else {
+        false
+    }
+}
+
 #[test]
 fn bench_full_custom_netlist() {
-    const NLUTS: usize = 10;
+    const NLUTS: usize = 1_000_000;
     const AVG_FANIN: f64 = 3.0;
-    const N_INITIAL_WORK: usize = 1;
-    const NTHREADS: usize = 1;
+    const N_INITIAL_WORK: usize = 1000;
+    const NTHREADS: usize = 8;
 
-    if atty::isnt(atty::Stream::Stdout) {
-        tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
-            // .json()
+    let filter = tracing_subscriber::filter::dynamic_filter_fn(trace_filt);
+    let layer = if atty::isnt(atty::Stream::Stdout) {
+        tracing_subscriber::fmt::layer()
             .with_ansi(false)
-            .init();
+            .with_filter(filter)
     } else {
-        tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
-            .init();
-    }
+        tracing_subscriber::fmt::layer().with_filter(filter)
+    };
+    tracing_subscriber::registry().with(layer).init();
 
     let manager = NetlistManager::new();
     let workqueue = work_queue::Queue::new(NTHREADS, 128);
