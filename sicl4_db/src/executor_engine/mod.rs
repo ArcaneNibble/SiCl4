@@ -10,11 +10,11 @@ use std::{
     thread,
 };
 
-use crate::allocator::*;
 use crate::lock_ops::*;
 use crate::loom_testing::*;
 use crate::netlist::*;
 use crate::stroad::*;
+use crate::{allocator::*, util::UsizePtr};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum NetlistRef<'arena> {
@@ -163,7 +163,8 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
 
         // we *do* need to actually check the "only unpark once" requirement though
         if !self._todo_wip_did_unpark.swap(true, Ordering::Relaxed) {
-            println!("unpark!");
+            // println!("unpark!");
+            tracing::event!(Level::TRACE, unparked_work = ?UsizePtr::from(self));
             local_queue.push(self);
         }
     }
@@ -255,10 +256,15 @@ impl<'arena> NetlistManager<'arena> {
         assert!(!self.in_use.get());
         self.in_use.set(true);
         thread::scope(|s| {
-            for local_queue in queue.local_queues() {
+            for (thread_i, local_queue) in queue.local_queues().enumerate() {
                 let heap_thread_shard = self.heap.new_thread();
                 let stroad = &self.stroad;
                 s.spawn(move || {
+                    let tracing_span =
+                        tracing::span!(Level::TRACE, "unordered_algo::thread", thread_i);
+                    let _span_enter = tracing_span.enter();
+                    tracing::event!(Level::TRACE, thread_i, heap_tid = heap_thread_shard.tid);
+
                     let local_queue_rc = Rc::new(RefCell::new(local_queue));
                     let mut ro_view = UnorderedAlgorithmROView {
                         stroad,
@@ -270,10 +276,14 @@ impl<'arena> NetlistManager<'arena> {
                         drop(q);
                         work_item
                     } {
+                        let work_span = tracing::span!(Level::TRACE, "unordered_algo::thread::work_item", attempted_work = ?UsizePtr::from(work_item));
+                        let _work_span_enter = work_span.enter();
+
                         work_item.reset_state();
                         let ro_ret = algo.try_process_readonly(&mut ro_view, work_item);
                         if ro_ret.is_err() {
-                            println!("parked!");
+                            // println!("parked!");
+                            tracing::event!(Level::TRACE, parked_work = ?UsizePtr::from(work_item));
                             unsafe {
                                 let locks_used = work_item.locks_used.get();
                                 let lock_that_failed =
@@ -294,6 +304,7 @@ impl<'arena> NetlistManager<'arena> {
                             continue;
                         }
                         let ro_ret = ro_ret.unwrap();
+                        tracing::event!(Level::TRACE, "RO phase completed successfully!");
 
                         let heap_thread_shard = {
                             let mut rw_view = UnorderedAlgorithmRWView {
@@ -316,6 +327,7 @@ impl<'arena> NetlistManager<'arena> {
                                 lock.unlock(stroad, &mut local_queue_rc.borrow_mut());
                             }
                         }
+                        tracing::event!(Level::TRACE, "RW phase completed successfully!");
                         ro_view = UnorderedAlgorithmROView {
                             stroad,
                             heap_thread_shard,
@@ -353,6 +365,7 @@ mod single_threaded;
 pub use single_threaded::*;
 
 mod unordered;
+use tracing::Level;
 pub use unordered::*;
 use uuid::Uuid;
 use work_queue::LocalQueue;

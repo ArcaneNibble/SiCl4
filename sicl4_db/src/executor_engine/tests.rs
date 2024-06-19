@@ -172,7 +172,11 @@ fn bench_full_custom_netlist() {
     const N_INITIAL_WORK: usize = 1;
     const NTHREADS: usize = 1;
 
-    tracing_subscriber::fmt::init();
+    let mut tracking_fmt = tracing_subscriber::fmt().with_max_level(Level::TRACE);
+    if atty::isnt(atty::Stream::Stdout) {
+        tracking_fmt = tracking_fmt.with_ansi(false);
+    }
+    tracking_fmt.init();
 
     let manager = NetlistManager::new();
     let workqueue = work_queue::Queue::new(NTHREADS, 128);
