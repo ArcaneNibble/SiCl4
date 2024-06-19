@@ -32,11 +32,11 @@ fn executor_single_threaded_smoke_test() {
     let cell_ref;
     let wire_ref;
     {
-        let mut cell = view.new_cell(TEST_LUT_UUID, 1);
+        let mut cell = view.new_cell((), TEST_LUT_UUID, 1);
         dbg!(&cell);
         dbg!(&*cell);
         cell_ref = cell.x;
-        let mut wire = view.new_wire();
+        let mut wire = view.new_wire(());
         dbg!(&wire);
         dbg!(&*wire);
         wire_ref = wire.x;
@@ -66,7 +66,7 @@ fn executor_single_threaded_only_one_get() {
     let manager = NetlistManager::new();
     let workqueue = work_queue::Queue::new(1, 128);
     let mut view = manager.access_single_threaded(&workqueue);
-    let cell = view.new_cell(TEST_LUT_UUID, 0);
+    let cell = view.new_cell((), TEST_LUT_UUID, 0);
     let cell_ref = cell.x;
     drop(cell);
 
@@ -82,10 +82,10 @@ fn executor_asdf() {
     let manager = NetlistManager::new();
     let workqueue = work_queue::Queue::new(1, 128);
     let mut view = manager.access_single_threaded(&workqueue);
-    let cell = view.new_cell(TEST_LUT_UUID, 0);
+    let cell = view.new_cell((), TEST_LUT_UUID, 0);
     dbg!(&cell);
     dbg!(&*cell);
-    let wire = view.new_wire();
+    let wire = view.new_wire(());
     dbg!(&wire);
     dbg!(&*wire);
     view.add_work(cell.x.into());
@@ -141,8 +141,8 @@ fn executor_asdf2() {
     let manager = NetlistManager::new();
     let workqueue = work_queue::Queue::new(1, 128);
     let mut view = manager.access_single_threaded(&workqueue);
-    let mut cell = view.new_cell(TEST_LUT_UUID, 1);
-    let mut wire = view.new_wire();
+    let mut cell = view.new_cell((), TEST_LUT_UUID, 1);
+    let mut wire = view.new_wire(());
     connect_driver(&mut cell, 0, &mut wire);
     view.add_work(cell.x.into());
     drop(view);
@@ -173,8 +173,8 @@ fn bench_full_custom_netlist() {
         let mut generate_hax_wires_vec = Vec::new();
 
         for _ in 0..NLUTS {
-            let mut lut = init_thread_view.new_cell(TEST_LUT_UUID, 5);
-            let mut outwire = init_thread_view.new_wire();
+            let mut lut = init_thread_view.new_cell((), TEST_LUT_UUID, 5);
+            let mut outwire = init_thread_view.new_wire(());
             connect_driver(&mut lut, 4, &mut outwire);
             generate_hax_luts_vec.push(lut);
             generate_hax_wires_vec.push(outwire);
@@ -301,8 +301,8 @@ fn bench_full_custom_netlist() {
                 // grab output wire for write
                 let mut outwire = view.get_wire_write(work_item, outwire_ref).unwrap();
 
-                let mut added_buf = view.new_cell(TEST_BUF_UUID, 2);
-                let mut added_wire = view.new_wire();
+                let mut added_buf = view.new_cell(work_item, TEST_BUF_UUID, 2);
+                let mut added_wire = view.new_wire(work_item);
 
                 // actual updates
                 cell.visited_marker = true;

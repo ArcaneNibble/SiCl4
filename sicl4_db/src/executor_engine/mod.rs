@@ -72,10 +72,14 @@ pub trait NetlistView<'arena> {
 
     fn new_cell<'wrapper>(
         &'wrapper mut self,
+        work_item: Self::MaybeWorkItem,
         cell_type: Uuid,
         num_connections: usize,
     ) -> Self::CellOwningGuardTy;
-    fn new_wire<'wrapper>(&'wrapper mut self) -> Self::WireOwningGuardTy;
+    fn new_wire<'wrapper>(
+        &'wrapper mut self,
+        work_item: Self::MaybeWorkItem,
+    ) -> Self::WireOwningGuardTy;
     fn delete_cell<'wrapper>(&'wrapper mut self, guard: Self::CellOwningGuardTy);
     fn delete_wire<'wrapper>(&'wrapper mut self, guard: Self::WireOwningGuardTy);
 
@@ -103,66 +107,6 @@ pub trait NetlistView<'arena> {
     ) -> Option<Self::WireOwningGuardTy>;
 
     fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>);
-}
-macro_rules! impl_view_shared_code {
-    () => {
-        fn new_cell<'wrapper>(
-            &'wrapper mut self,
-            cell_type: Uuid,
-            num_connections: usize,
-        ) -> Self::CellOwningGuardTy {
-            let (new, gen) = self
-                .heap_thread_shard
-                .allocate::<LockedObj<NetlistCell<'arena>>>();
-            unsafe {
-                LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
-                let _ = NetlistCell::init(
-                    (*new.as_mut_ptr()).payload.get(),
-                    cell_type,
-                    self.debug_id.get(),
-                    num_connections,
-                );
-                self.debug_id.set(self.debug_id.get() + 1);
-                let new_ref = ObjRef {
-                    ptr: new.assume_init_ref(),
-                    gen,
-                };
-                Self::CellOwningGuardTy { x: new_ref }
-            }
-        }
-        fn new_wire<'wrapper>(&'wrapper mut self) -> Self::WireOwningGuardTy {
-            let (new, gen) = self
-                .heap_thread_shard
-                .allocate::<LockedObj<NetlistWire<'arena>>>();
-            unsafe {
-                LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
-                let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get(), self.debug_id.get());
-                self.debug_id.set(self.debug_id.get() + 1);
-                let new_ref = ObjRef {
-                    ptr: new.assume_init_ref(),
-                    gen,
-                };
-                Self::WireOwningGuardTy { x: new_ref }
-            }
-        }
-
-        fn delete_cell<'wrapper>(&'wrapper mut self, guard: Self::CellOwningGuardTy) {
-            guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
-            unsafe {
-                // safety: the guard represents exclusive access to the node
-                self.heap_thread_shard.free(guard.x.ptr)
-            }
-            mem::forget(guard);
-        }
-        fn delete_wire<'wrapper>(&'wrapper mut self, guard: Self::WireOwningGuardTy) {
-            guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
-            unsafe {
-                // safety: the guard represents exclusive access to the node
-                self.heap_thread_shard.free(guard.x.ptr)
-            }
-            mem::forget(guard);
-        }
-    };
 }
 
 const MAX_LOCKS_PER_WORK_ITEM: usize = 8;

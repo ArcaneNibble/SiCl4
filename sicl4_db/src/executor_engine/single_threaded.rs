@@ -24,13 +24,69 @@ impl<'arena, 'q> NetlistView<'arena> for SingleThreadedView<'arena, 'q> {
     type WireOwningGuardTy = SingleThreadedWireGuard<'arena>;
     type MaybeWorkItem = ();
 
-    impl_view_shared_code!();
+    fn new_cell<'wrapper>(
+        &'wrapper mut self,
+        _work_item: (),
+        cell_type: Uuid,
+        num_connections: usize,
+    ) -> Self::CellOwningGuardTy {
+        let (new, gen) = self
+            .heap_thread_shard
+            .allocate::<LockedObj<NetlistCell<'arena>>>();
+        unsafe {
+            LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+            let _ = NetlistCell::init(
+                (*new.as_mut_ptr()).payload.get(),
+                cell_type,
+                self.debug_id.get(),
+                num_connections,
+            );
+            self.debug_id.set(self.debug_id.get() + 1);
+            let new_ref = ObjRef {
+                ptr: new.assume_init_ref(),
+                gen,
+            };
+            SingleThreadedObjGuard { x: new_ref }
+        }
+    }
+    fn new_wire<'wrapper>(&'wrapper mut self, _work_item: ()) -> Self::WireOwningGuardTy {
+        let (new, gen) = self
+            .heap_thread_shard
+            .allocate::<LockedObj<NetlistWire<'arena>>>();
+        unsafe {
+            LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+            let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get(), self.debug_id.get());
+            self.debug_id.set(self.debug_id.get() + 1);
+            let new_ref = ObjRef {
+                ptr: new.assume_init_ref(),
+                gen,
+            };
+            SingleThreadedObjGuard { x: new_ref }
+        }
+    }
+
+    fn delete_cell<'wrapper>(&'wrapper mut self, guard: Self::CellOwningGuardTy) {
+        guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
+        unsafe {
+            // safety: the guard represents exclusive access to the node
+            self.heap_thread_shard.free(guard.x.ptr)
+        }
+        mem::forget(guard);
+    }
+    fn delete_wire<'wrapper>(&'wrapper mut self, guard: Self::WireOwningGuardTy) {
+        guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
+        unsafe {
+            // safety: the guard represents exclusive access to the node
+            self.heap_thread_shard.free(guard.x.ptr)
+        }
+        mem::forget(guard);
+    }
 
     fn get_cell_read<'wrapper>(
         &'wrapper mut self,
         _work_item: (),
         obj: NetlistCellRef<'arena>,
-    ) -> Option<SingleThreadedCellGuard<'arena>> {
+    ) -> Option<Self::CellROGuardTy> {
         let stored_lock_gen = obj.ptr.lock_and_generation.load(Ordering::Relaxed);
         if !lock_gen_valid(stored_lock_gen) || lock_gen_gen(stored_lock_gen) != obj.gen {
             return None;
@@ -48,7 +104,7 @@ impl<'arena, 'q> NetlistView<'arena> for SingleThreadedView<'arena, 'q> {
         &'wrapper mut self,
         _work_item: (),
         obj: NetlistCellRef<'arena>,
-    ) -> Option<SingleThreadedCellGuard<'arena>> {
+    ) -> Option<Self::CellOwningGuardTy> {
         self.get_cell_read(_work_item, obj)
     }
 
@@ -56,7 +112,7 @@ impl<'arena, 'q> NetlistView<'arena> for SingleThreadedView<'arena, 'q> {
         &'wrapper mut self,
         _work_item: (),
         obj: NetlistWireRef<'arena>,
-    ) -> Option<SingleThreadedWireGuard<'arena>> {
+    ) -> Option<Self::WireROGuardTy> {
         let stored_lock_gen = obj.ptr.lock_and_generation.load(Ordering::Relaxed);
         if !lock_gen_valid(stored_lock_gen) || lock_gen_gen(stored_lock_gen) != obj.gen {
             return None;
@@ -74,7 +130,7 @@ impl<'arena, 'q> NetlistView<'arena> for SingleThreadedView<'arena, 'q> {
         &'wrapper mut self,
         _work_item: (),
         obj: NetlistWireRef<'arena>,
-    ) -> Option<SingleThreadedWireGuard<'arena>> {
+    ) -> Option<Self::WireOwningGuardTy> {
         self.get_wire_read(_work_item, obj)
     }
 

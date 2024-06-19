@@ -78,13 +78,80 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
     type WireOwningGuardTy = UnorderedObjPhase2RWGuard<'arena, NetlistWire<'arena>>;
     type MaybeWorkItem = &'arena WorkItem<'arena, 'arena>;
 
-    impl_view_shared_code!();
+    fn new_cell<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        cell_type: Uuid,
+        num_connections: usize,
+    ) -> Self::CellOwningGuardTy {
+        let (new, gen) = self
+            .heap_thread_shard
+            .allocate::<LockedObj<NetlistCell<'arena>>>();
+        unsafe {
+            LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+            let _ = NetlistCell::init(
+                (*new.as_mut_ptr()).payload.get(),
+                cell_type,
+                self.debug_id.get(),
+                num_connections,
+            );
+            self.debug_id.set(self.debug_id.get() + 1);
+            let new_ref = ObjRef {
+                ptr: new.assume_init_ref(),
+                gen,
+            };
+            let (_lock_idx, lock) = work_item.next_lock(NetlistRef::Cell(new_ref));
+            lock.state.set(LockState::LockedForUnorderedWrite);
+            Self::CellOwningGuardTy { x: new_ref }
+        }
+    }
+    fn new_wire<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+    ) -> Self::WireOwningGuardTy {
+        let (new, gen) = self
+            .heap_thread_shard
+            .allocate::<LockedObj<NetlistWire<'arena>>>();
+        unsafe {
+            LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+            let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get(), self.debug_id.get());
+            self.debug_id.set(self.debug_id.get() + 1);
+            let new_ref = ObjRef {
+                ptr: new.assume_init_ref(),
+                gen,
+            };
+            let (_lock_idx, lock) = work_item.next_lock(NetlistRef::Wire(new_ref));
+            lock.state.set(LockState::LockedForUnorderedWrite);
+            Self::WireOwningGuardTy { x: new_ref }
+        }
+    }
+
+    fn delete_cell<'wrapper>(&'wrapper mut self, guard: Self::CellOwningGuardTy) {
+        // FIXME THIS MIGHT BE BORKED
+        panic!("THIS IS PROBABLY BROKEN");
+        guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
+        unsafe {
+            // safety: the guard represents exclusive access to the node
+            self.heap_thread_shard.free(guard.x.ptr)
+        }
+        mem::forget(guard);
+    }
+    fn delete_wire<'wrapper>(&'wrapper mut self, guard: Self::WireOwningGuardTy) {
+        // FIXME THIS MIGHT BE BORKED
+        panic!("THIS IS PROBABLY BROKEN");
+        guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
+        unsafe {
+            // safety: the guard represents exclusive access to the node
+            self.heap_thread_shard.free(guard.x.ptr)
+        }
+        mem::forget(guard);
+    }
 
     fn get_cell_read<'wrapper>(
         &'wrapper mut self,
         work_item: &'arena WorkItem<'arena, 'arena>,
         obj: NetlistCellRef<'arena>,
-    ) -> Option<UnorderedObjPhase2ROGuard<'arena, NetlistCell<'arena>>> {
+    ) -> Option<Self::CellROGuardTy> {
         // xxx can this be done more efficiently?
         for lock_idx in 0..work_item.locks_used.get() {
             let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
@@ -103,7 +170,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
         &'wrapper mut self,
         work_item: &'arena WorkItem<'arena, 'arena>,
         obj: NetlistCellRef<'arena>,
-    ) -> Option<UnorderedObjPhase2RWGuard<'arena, NetlistCell<'arena>>> {
+    ) -> Option<Self::CellOwningGuardTy> {
         // xxx can this be done more efficiently?
         for lock_idx in 0..work_item.locks_used.get() {
             let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
@@ -121,7 +188,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
         &'wrapper mut self,
         work_item: &'arena WorkItem<'arena, 'arena>,
         obj: NetlistWireRef<'arena>,
-    ) -> Option<UnorderedObjPhase2ROGuard<'arena, NetlistWire<'arena>>> {
+    ) -> Option<Self::WireROGuardTy> {
         // xxx can this be done more efficiently?
         for lock_idx in 0..work_item.locks_used.get() {
             let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
@@ -141,7 +208,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
         &'wrapper mut self,
         work_item: &'arena WorkItem<'arena, 'arena>,
         obj: NetlistWireRef<'arena>,
-    ) -> Option<UnorderedObjPhase2RWGuard<'arena, NetlistWire<'arena>>> {
+    ) -> Option<Self::WireOwningGuardTy> {
         // xxx can this be done more efficiently?
         for lock_idx in 0..work_item.locks_used.get() {
             let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
