@@ -217,7 +217,13 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     pub unsafe fn init(self_: *mut Self, obj: TypeErasedObjRef<'arena>) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::init");
         let _span_enter = tracing_span.enter();
-        tracing::event!(Level::TRACE, lock_ptr = ?UsizePtr::from(self_), target.ptr = ?UsizePtr::from(obj.ptr), target.gen = obj.gen);
+        tracing::event!(
+            name: "LockAndStroadData::init",
+            Level::TRACE,
+            lock_ptr = ?UsizePtr::from(self_),
+            target.ptr = ?UsizePtr::from(obj.ptr),
+            target.gen = obj.gen
+        );
 
         (*self_).state = Cell::new(LockState::Unlocked);
         (*self_).p = obj;
@@ -240,7 +246,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     ) -> Result<bool, ()> {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unordered_try_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
-        tracing::event!(Level::TRACE, "lock");
+        tracing::event!(name: "lock_ops::lock", Level::TRACE, "lock");
 
         assert!(self.state.get() == LockState::Unlocked);
         let mut lock_inst = unsafe {
@@ -356,7 +362,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     ) -> Result<bool, ()> {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unordered_try_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
-        tracing::event!(Level::TRACE, "lock");
+        tracing::event!(name: "lock_ops::lock", Level::TRACE, "lock");
 
         assert!(self.state.get() == LockState::Unlocked);
         let mut lock_inst = unsafe {
@@ -474,7 +480,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     ) -> Result<bool, ()> {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
-        tracing::event!(Level::TRACE, "lock");
+        tracing::event!(name: "lock_ops::lock", Level::TRACE, "lock");
 
         assert!(self.state.get() == LockState::Unlocked);
         let lock_inst = unsafe {
@@ -532,7 +538,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     ) -> Result<bool, ()> {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
-        tracing::event!(Level::TRACE, "lock");
+        tracing::event!(name: "lock_ops::lock", Level::TRACE, "lock");
 
         assert!(self.state.get() == LockState::Unlocked);
         let lock_inst = unsafe {
@@ -616,7 +622,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
-        tracing::event!(Level::TRACE, "unlock");
+        tracing::event!(name: "lock_ops::unlock", Level::TRACE, "unlock");
 
         // we have exclusive access
         // we need to push out all previous memory accesses
@@ -649,7 +655,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
-        tracing::event!(Level::TRACE, "unlock");
+        tracing::event!(name: "lock_ops::unlock", Level::TRACE, "unlock");
 
         let mut old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
         loop {
@@ -695,7 +701,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
-        tracing::event!(Level::TRACE, "unlock");
+        tracing::event!(name: "lock_ops::unlock", Level::TRACE, "unlock");
 
         let lock_inst = unsafe {
             // safety: this can only be called when we hold the lock
@@ -730,7 +736,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
-        tracing::event!(Level::TRACE, "unlock");
+        tracing::event!(name: "lock_ops::unlock", Level::TRACE, "unlock");
 
         let lock_inst = unsafe {
             // safety: this can only be called when we hold the lock

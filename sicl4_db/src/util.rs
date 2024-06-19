@@ -76,7 +76,7 @@ pub unsafe fn _debug_hexdump(p: *const u8, mut sz: usize) -> Result<String, fmt:
 pub struct UsizePtr(pub usize);
 impl Debug for UsizePtr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "0x{:016x}", self.0)
+        write!(f, "0x{:x}", self.0)
     }
 }
 impl From<usize> for UsizePtr {

@@ -577,6 +577,7 @@ impl<'arena, Mapper: TypeMapper> SlabPerThreadState<'arena, Mapper> {
         gen_ent.set(cur_gen + 1);
         let allocated_ptr = ty_state.alloc(self.tid);
         tracing::event!(
+            name: "allocator::allocate::allocated_object",
             Level::TRACE,
             type_bin,
             ptr = ?UsizePtr::from(allocated_ptr),
@@ -599,7 +600,11 @@ impl<'arena, Mapper: TypeMapper> SlabPerThreadState<'arena, Mapper> {
             "type" = std::any::type_name::<T>()
         );
         let _span_enter = trace_span.enter();
-        tracing::event!(Level::TRACE, ptr = ?UsizePtr::from(obj));
+        tracing::event!(
+            name: "allocator::allocate::free_object",
+            Level::TRACE,
+            ptr = ?UsizePtr::from(obj)
+        );
 
         let type_bin = Mapper::type_to_bin::<T>();
         let ty_state = &self.per_ty_state.borrow()[type_bin];
@@ -720,7 +725,11 @@ impl<'arena> SlabPerThreadPerTyState<'arena> {
         self.pages.set(&new_seg.pages[0]);
         self.last_page.set(&new_seg.pages[PAGES_PER_SEG - 1]);
 
-        tracing::event!(Level::TRACE, ptr = ?UsizePtr::from(new_seg));
+        tracing::event!(
+            name: "allocator::allocate::allocated_new_seg",
+            Level::TRACE,
+            ptr = ?UsizePtr::from(new_seg)
+        );
     }
 
     /// Allocation slow path
