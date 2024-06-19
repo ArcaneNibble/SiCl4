@@ -1,8 +1,40 @@
-//! Core of the custom netlist data structure
-//!
-//! This contains logic for managing locks on netlist nodes
+//! Netlist data model
 
-use std::{
+use crate::locking::*;
+
+/// Cells in a netlist
+#[derive(Debug)]
+pub struct NetlistCell<'arena> {
+    // todo
+    _wire: Option<NetlistWireRef<'arena>>,
+}
+pub type NetlistCellRef<'arena> = ObjRef<'arena, NetlistCell<'arena>>;
+impl<'arena> NetlistCell<'arena> {
+    pub unsafe fn init(self_: *mut Self) -> &'arena mut Self {
+        (*self_)._wire = None;
+
+        // safety: assert that we initialized everything
+        &mut *self_
+    }
+}
+
+/// Wires in a netlist
+#[derive(Debug)]
+pub struct NetlistWire<'arena> {
+    // todo
+    _cell: Option<NetlistCellRef<'arena>>,
+}
+pub type NetlistWireRef<'arena> = ObjRef<'arena, NetlistWire<'arena>>;
+impl<'arena> NetlistWire<'arena> {
+    pub unsafe fn init(self_: *mut Self) -> &'arena mut Self {
+        (*self_)._cell = None;
+
+        // safety: assert that we initialized everything
+        &mut *self_
+    }
+}
+
+/*use std::{
     alloc::Layout,
     cell::UnsafeCell,
     fmt::Debug,
@@ -378,45 +410,6 @@ impl<'shard, 'arena, T: Send + Sync> Drop for NetlistNodeReadGuard<'shard, 'aren
     }
 }
 
-/// Cells in a netlist
-#[derive(Debug)]
-pub struct NetlistCell<'arena> {
-    // todo
-    _wire: Option<NetlistWireRef<'arena>>,
-}
-pub type NetlistCellRef<'arena> = NetlistNodeRef<'arena, NetlistCell<'arena>>;
-pub type NetlistCellWriteGuard<'shard, 'arena> =
-    NetlistNodeWriteGuard<'shard, 'arena, NetlistCell<'arena>>;
-pub type NetlistCellReadGuard<'shard, 'arena> =
-    NetlistNodeReadGuard<'shard, 'arena, NetlistCell<'arena>>;
-impl<'arena> NetlistCell<'arena> {
-    pub unsafe fn init(self_: *mut Self) -> &'arena mut Self {
-        (*self_)._wire = None;
-
-        // safety: assert that we initialized everything
-        &mut *self_
-    }
-}
-
-/// Wires in a netlist
-#[derive(Debug)]
-pub struct NetlistWire<'arena> {
-    // todo
-    _cell: Option<NetlistCellRef<'arena>>,
-}
-pub type NetlistWireRef<'arena> = NetlistNodeRef<'arena, NetlistWire<'arena>>;
-pub type NetlistWireWriteGuard<'shard, 'arena> =
-    NetlistNodeWriteGuard<'shard, 'arena, NetlistWire<'arena>>;
-pub type NetlistWireReadGuard<'shard, 'arena> =
-    NetlistNodeReadGuard<'shard, 'arena, NetlistWire<'arena>>;
-impl<'arena> NetlistWire<'arena> {
-    pub unsafe fn init(self_: *mut Self) -> &'arena mut Self {
-        (*self_)._cell = None;
-
-        // safety: assert that we initialized everything
-        &mut *self_
-    }
-}
 
 /// Top-level netlist data structure
 #[derive(Debug)]
@@ -920,4 +913,4 @@ mod tests {
         dbg!(&cell_0);
         dbg!(&*cell_0);
     }
-}
+}*/
