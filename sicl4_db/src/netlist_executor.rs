@@ -10,7 +10,7 @@ use std::{
     thread,
 };
 
-use crate::{allocator::*, locking::*, netlist::*, stroad::*};
+use crate::{allocator::*, lock_ops::*, netlist::*, stroad::*};
 
 pub trait UnorderedAlgorithm: Send + Sync {
     type ROtoRWTy;
@@ -84,7 +84,7 @@ pub struct WorkItem<'arena, 'work_item> {
     seed_node: NetlistRef<'arena>,
     locks_used: Cell<usize>,
     locks: [MaybeUninit<
-        UnsafeCell<RWLock<'arena, 'work_item, WorkItemPayload<'arena, 'work_item>>>,
+        UnsafeCell<LockAndStroadData<'arena, 'work_item, WorkItemPayload<'arena, 'work_item>>>,
     >; MAX_ORDERED_LOCKS_PER_WORK_ITEM],
 }
 // xxx fixme wtf is this
@@ -111,7 +111,7 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         obj: NetlistRef<'arena>,
     ) -> (
         usize,
-        &'work_item mut RWLock<'arena, 'work_item, WorkItemPayload<'arena, 'work_item>>,
+        &'work_item mut LockAndStroadData<'arena, 'work_item, WorkItemPayload<'arena, 'work_item>>,
     ) {
         let lock_idx = self.locks_used.get();
         if lock_idx == MAX_ORDERED_LOCKS_PER_WORK_ITEM {
@@ -120,8 +120,8 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         self.locks_used.set(lock_idx + 1);
         unsafe {
             let lock_ptr = (*self.locks[lock_idx].as_ptr()).get();
-            RWLock::init(lock_ptr, obj.type_erase());
-            let inner_payload = RWLock::unsafe_inner_payload_ptr(lock_ptr);
+            LockAndStroadData::init(lock_ptr, obj.type_erase());
+            let inner_payload = LockAndStroadData::unsafe_inner_payload_ptr(lock_ptr);
             // lifetimes should've made it s.t. this is pinned in place
             (*inner_payload).w = self;
             // (*inner_payload).guard_handed_out = Cell::new(false);
@@ -269,7 +269,7 @@ impl<'arena> UnorderedAlgorithmRWView<'arena> {
 
 #[derive(Debug)]
 pub struct UnorderedObjROGuard<'arena, T> {
-    lock: &'arena RWLock<'arena, 'arena, WorkItemPayload<'arena, 'arena>>,
+    lock: &'arena LockAndStroadData<'arena, 'arena, WorkItemPayload<'arena, 'arena>>,
     // todo fixme variance?
     _pd1: PhantomData<&'arena T>,
     // todo
