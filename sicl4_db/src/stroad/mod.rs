@@ -192,6 +192,16 @@ impl<'lock_inst, K, P: LockInstPayload> LockInstance<'lock_inst, K, P> {
         }
     }
 
+    /// Initialize in place, *EXCEPT* the external payload
+    pub unsafe fn init(self_: *mut Self) {
+        (*self_).link = DoubleLL {
+            next: None,
+            prev: None,
+        };
+        (*self_).key = None;
+        (*self_).prio = 0;
+    }
+
     /// Retrieve hash key
     pub fn key(&self) -> &K {
         self.key.as_ref().unwrap()

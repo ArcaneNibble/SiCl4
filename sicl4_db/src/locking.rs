@@ -88,6 +88,14 @@ pub struct LockedObj<T> {
 // shared xor mutable rules using atomics
 unsafe impl<T: Send + Sync> Send for LockedObj<T> {}
 unsafe impl<T: Send + Sync> Sync for LockedObj<T> {}
+impl<T> LockedObj<T> {
+    pub unsafe fn init(self_: *mut Self, gen: u64, xtra: u64) {
+        (*self_)
+            .lock_and_generation
+            .store(LOCK_GEN_VALID_BIT | (gen << 8) | xtra, Ordering::Relaxed);
+        *(*self_).num_rw.get() = 0;
+    }
+}
 
 /// References to a node that has a lifetime from a particular heap
 ///
@@ -186,6 +194,13 @@ impl<'arena, 'lock_inst, T, P: LockInstPayload> RWLock<'arena, 'lock_inst, T, P>
             stroad_state: UnsafeCell::new(LockInstance::new(payload)),
             _pd1: PhantomData,
         }
+    }
+
+    /// Initialize a lock object in place, *EXCEPT* the external payload
+    pub unsafe fn init(self_: *mut Self, obj: ObjRef<'arena, T>) {
+        (*self_).state = Cell::new(LockState::Unlocked);
+        (*self_).p = obj;
+        LockInstance::init((*self_).stroad_state.get());
     }
 
     /// Try to acquire an exclusive read/write lock, for an unordered algorithm
