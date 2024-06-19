@@ -1,6 +1,6 @@
 //! Netlist data model
 
-use crate::locking::*;
+use crate::lock_ops::*;
 
 /// Cells in a netlist
 #[derive(Debug)]
