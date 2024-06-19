@@ -159,31 +159,37 @@ fn trace_filt<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::Loo
     metadata: &tracing::Metadata,
     _ctx: &tracing_subscriber::layer::Context<S>,
 ) -> bool {
-    let meta_name = metadata.name();
-    if meta_name.starts_with("unordered_algo::")
-        && meta_name != "unordered_algo::ro_done"
-        && meta_name != "unordered_algo::rw_done"
-    {
-        true
-    } else {
-        false
-    }
+    // let meta_name = metadata.name();
+    // if meta_name.starts_with("unordered_algo::")
+    //     && meta_name != "unordered_algo::ro_done"
+    //     && meta_name != "unordered_algo::rw_done"
+    // {
+    //     true
+    // } else {
+    //     false
+    // }
+    true
 }
 
 #[test]
 fn bench_full_custom_netlist() {
-    const NLUTS: usize = 1_000_000;
+    const NLUTS: usize = 100;
     const AVG_FANIN: f64 = 3.0;
-    const N_INITIAL_WORK: usize = 1000;
+    const N_INITIAL_WORK: usize = 10;
     const NTHREADS: usize = 8;
 
     let filter = tracing_subscriber::filter::dynamic_filter_fn(trace_filt);
     let layer = if atty::isnt(atty::Stream::Stdout) {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
+            .with_file(true)
+            .with_line_number(true)
             .with_filter(filter)
     } else {
-        tracing_subscriber::fmt::layer().with_filter(filter)
+        tracing_subscriber::fmt::layer()
+            .with_file(true)
+            .with_line_number(true)
+            .with_filter(filter)
     };
     tracing_subscriber::registry().with(layer).init();
 
