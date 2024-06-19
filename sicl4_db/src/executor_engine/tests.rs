@@ -153,18 +153,6 @@ fn executor_asdf2() {
     manager.run_unordered_algorithm(&algo, &workqueue);
 }
 
-struct CustomFormatFields;
-impl<'writer> tracing_subscriber::fmt::FormatFields<'writer> for CustomFormatFields {
-    fn format_fields<R: tracing_subscriber::field::RecordFields>(
-        &self,
-        writer: tracing_subscriber::fmt::format::Writer<'writer>,
-        fields: R,
-    ) -> std::fmt::Result {
-        let default = tracing_subscriber::fmt::format::DefaultFields::new();
-        default.format_fields(writer, fields)
-    }
-}
-
 #[test]
 fn bench_full_custom_netlist() {
     const NLUTS: usize = 10;
