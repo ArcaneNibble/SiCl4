@@ -244,7 +244,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) -> Result<bool, ()> {
-        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unordered_try_write", lock_ptr = ?UsizePtr::from(self));
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unordered_try_write", lock_ptr = ?UsizePtr::from(self), obj_ptr = ?self.p);
         let _span_enter = tracing_span.enter();
         tracing::event!(name: "lock_ops::lock", Level::TRACE, "lock");
 
@@ -360,7 +360,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) -> Result<bool, ()> {
-        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unordered_try_read", lock_ptr = ?UsizePtr::from(self));
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unordered_try_read", lock_ptr = ?UsizePtr::from(self), obj_ptr = ?self.p);
         let _span_enter = tracing_span.enter();
         tracing::event!(name: "lock_ops::lock", Level::TRACE, "lock");
 
@@ -478,7 +478,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         prio: u64,
     ) -> Result<bool, ()> {
-        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_write", lock_ptr = ?UsizePtr::from(self));
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_write", lock_ptr = ?UsizePtr::from(self), obj_ptr = ?self.p);
         let _span_enter = tracing_span.enter();
         tracing::event!(name: "lock_ops::lock", Level::TRACE, "lock");
 
@@ -536,7 +536,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         prio: u64,
     ) -> Result<bool, ()> {
-        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_read", lock_ptr = ?UsizePtr::from(self));
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_read", lock_ptr = ?UsizePtr::from(self), obj_ptr = ?self.p);
         let _span_enter = tracing_span.enter();
         tracing::event!(name: "lock_ops::lock", Level::TRACE, "lock");
 
@@ -620,7 +620,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
-        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_write", lock_ptr = ?UsizePtr::from(self));
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_write", lock_ptr = ?UsizePtr::from(self), obj_ptr = ?self.p);
         let _span_enter = tracing_span.enter();
         tracing::event!(name: "lock_ops::unlock", Level::TRACE, "unlock");
 
@@ -653,7 +653,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
-        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_read", lock_ptr = ?UsizePtr::from(self));
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_read", lock_ptr = ?UsizePtr::from(self), obj_ptr = ?self.p);
         let _span_enter = tracing_span.enter();
         tracing::event!(name: "lock_ops::unlock", Level::TRACE, "unlock");
 
@@ -699,7 +699,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
-        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_write", lock_ptr = ?UsizePtr::from(self));
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_write", lock_ptr = ?UsizePtr::from(self), obj_ptr = ?self.p);
         let _span_enter = tracing_span.enter();
         tracing::event!(name: "lock_ops::unlock", Level::TRACE, "unlock");
 
@@ -734,7 +734,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
-        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_read", lock_ptr = ?UsizePtr::from(self));
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_read", lock_ptr = ?UsizePtr::from(self), obj_ptr = ?self.p);
         let _span_enter = tracing_span.enter();
         tracing::event!(name: "lock_ops::unlock", Level::TRACE, "unlock");
 
