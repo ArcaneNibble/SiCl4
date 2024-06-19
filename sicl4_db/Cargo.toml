@@ -16,7 +16,7 @@ atty = "0.2"
 rand = "0.8"
 rand_xorshift = "0.3"
 memory-stats = "1.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["json"] }
 
 [target.'cfg(loom)'.dependencies]
 loom = { version = "0.7", features = ["checkpoint"] }
