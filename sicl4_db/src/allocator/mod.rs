@@ -26,7 +26,12 @@ use std::{
     sync::atomic::Ordering,
 };
 
-use crate::{loom_testing::*, util::roundto};
+use tracing::Level;
+
+use crate::{
+    loom_testing::*,
+    util::{roundto, UsizePtr},
+};
 
 /// Absolute maximum number of threads that can be supported.
 ///
@@ -556,15 +561,30 @@ impl<'arena, Mapper: TypeMapper> SlabPerThreadState<'arena, Mapper> {
     ///
     /// Does *NOT* initialize any of the resulting memory
     pub fn allocate<T: TypeMappable<Mapper>>(&'arena self) -> (&'arena mut MaybeUninit<T>, u64) {
+        let trace_span = tracing::span!(
+            Level::TRACE,
+            "allocator::allocate",
+            tid = self.tid,
+            "type" = std::any::type_name::<T>()
+        );
+        let _span_enter = trace_span.enter();
+
         let type_bin = Mapper::type_to_bin::<T>();
         let ty_state = &self.per_ty_state.borrow()[type_bin];
         let gen_ent = &self.generation.borrow()[type_bin];
 
         let cur_gen = gen_ent.get();
         gen_ent.set(cur_gen + 1);
+        let allocated_ptr = ty_state.alloc(self.tid);
+        tracing::event!(
+            Level::TRACE,
+            type_bin,
+            ptr = ?UsizePtr::from(allocated_ptr),
+            gen = cur_gen
+        );
         // safety: when object leaves us, it's big enough and aligned enough for a T
         // we don't try to use it as a SlabFreeBlock until it comes back
-        (unsafe { mem::transmute(ty_state.alloc(self.tid)) }, cur_gen)
+        (unsafe { mem::transmute(allocated_ptr) }, cur_gen)
     }
 
     /// Deallocates an object from this shard
@@ -572,6 +592,15 @@ impl<'arena, Mapper: TypeMapper> SlabPerThreadState<'arena, Mapper> {
     /// Object must be part of this slab, not already be freed,
     /// and no other references may exist after calling free
     pub unsafe fn free<T: TypeMappable<Mapper>>(&'arena self, obj: &'arena T) {
+        let trace_span = tracing::span!(
+            Level::TRACE,
+            "allocator::free",
+            tid = self.tid,
+            "type" = std::any::type_name::<T>()
+        );
+        let _span_enter = trace_span.enter();
+        tracing::event!(Level::TRACE, ptr = ?UsizePtr::from(obj));
+
         let type_bin = Mapper::type_to_bin::<T>();
         let ty_state = &self.per_ty_state.borrow()[type_bin];
 
@@ -674,6 +703,9 @@ impl<'arena> SlabPerThreadPerTyState<'arena> {
     /// Memory unsafety is contained, but this can mess up invariants
     /// (and thus isn't public)
     fn new_seg(&'arena self, tid: u64) {
+        let trace_span = tracing::span!(Level::TRACE, "allocator::per_thread_per_ty::new_seg");
+        let _span_enter = trace_span.enter();
+
         let new_seg = unsafe { alloc::alloc_zeroed(SEGMENT_LAYOUT) as *mut SlabSegmentHdr<'arena> };
         let old_seg_head = Some(self.segments.get());
         let new_seg = unsafe {
@@ -687,6 +719,8 @@ impl<'arena> SlabPerThreadPerTyState<'arena> {
         self.segments.set(new_seg);
         self.pages.set(&new_seg.pages[0]);
         self.last_page.set(&new_seg.pages[PAGES_PER_SEG - 1]);
+
+        tracing::event!(Level::TRACE, ptr = ?UsizePtr::from(new_seg));
     }
 
     /// Allocation slow path

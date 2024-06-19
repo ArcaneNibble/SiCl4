@@ -1,4 +1,7 @@
-use std::{cell::UnsafeCell, fmt, fmt::Write};
+use std::{
+    cell::UnsafeCell,
+    fmt::{self, Debug, Write},
+};
 
 /// Convert `&T` to `&UnsafeCell<T>`
 pub fn to_unsafecell<T>(ptr: &T) -> &UnsafeCell<T> {
@@ -49,6 +52,38 @@ pub unsafe fn _debug_hexdump(p: *const u8, mut sz: usize) -> Result<String, fmt:
     }
 
     Ok(s)
+}
+
+pub struct UsizePtr(pub usize);
+impl Debug for UsizePtr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "0x{:016x}", self.0)
+    }
+}
+impl From<usize> for UsizePtr {
+    fn from(value: usize) -> Self {
+        Self(value)
+    }
+}
+impl<T> From<*const T> for UsizePtr {
+    fn from(value: *const T) -> Self {
+        Self(value as usize)
+    }
+}
+impl<T> From<*mut T> for UsizePtr {
+    fn from(value: *mut T) -> Self {
+        Self(value as usize)
+    }
+}
+impl<T> From<&T> for UsizePtr {
+    fn from(value: &T) -> Self {
+        Self(value as *const T as usize)
+    }
+}
+impl<T> From<&mut T> for UsizePtr {
+    fn from(value: &mut T) -> Self {
+        Self(value as *const T as usize)
+    }
 }
 
 #[cfg(test)]
