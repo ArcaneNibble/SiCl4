@@ -39,9 +39,12 @@ use std::mem;
 use std::ptr::addr_of_mut;
 use std::sync::atomic::Ordering;
 
+use tracing::Level;
+
 use crate::allocator::*;
 use crate::loom_testing::*;
 use crate::stroad::*;
+use crate::util::UsizePtr;
 
 const _: () = assert!(MAX_THREADS <= 126);
 /// Indicates that there is a valid object in this heap block (i.e. not a next pointer)
@@ -212,6 +215,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
 
     /// Initialize a lock object in place, *EXCEPT* the external work item link
     pub unsafe fn init(self_: *mut Self, obj: TypeErasedObjRef<'arena>) {
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::init");
+        let _span_enter = tracing_span.enter();
+        tracing::event!(Level::TRACE, lock_ptr = ?UsizePtr::from(self_), target.ptr = ?UsizePtr::from(obj.ptr), target.gen = obj.gen);
+
         (*self_).state = Cell::new(LockState::Unlocked);
         (*self_).p = obj;
         StroadNode::init((*self_).stroad_state.get());
@@ -231,6 +238,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) -> Result<bool, ()> {
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unordered_try_write", lock_ptr = ?UsizePtr::from(self));
+        let _span_enter = tracing_span.enter();
+        tracing::event!(Level::TRACE, "lock");
+
         assert!(self.state.get() == LockState::Unlocked);
         let mut lock_inst = unsafe {
             // because
@@ -343,6 +354,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
     ) -> Result<bool, ()> {
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unordered_try_read", lock_ptr = ?UsizePtr::from(self));
+        let _span_enter = tracing_span.enter();
+        tracing::event!(Level::TRACE, "lock");
+
         assert!(self.state.get() == LockState::Unlocked);
         let mut lock_inst = unsafe {
             // safety: see above
@@ -457,6 +472,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         prio: u64,
     ) -> Result<bool, ()> {
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_write", lock_ptr = ?UsizePtr::from(self));
+        let _span_enter = tracing_span.enter();
+        tracing::event!(Level::TRACE, "lock");
+
         assert!(self.state.get() == LockState::Unlocked);
         let lock_inst = unsafe {
             // safety: see above
@@ -511,6 +530,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         prio: u64,
     ) -> Result<bool, ()> {
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_read", lock_ptr = ?UsizePtr::from(self));
+        let _span_enter = tracing_span.enter();
+        tracing::event!(Level::TRACE, "lock");
+
         assert!(self.state.get() == LockState::Unlocked);
         let lock_inst = unsafe {
             // safety: see above
@@ -591,6 +614,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_write", lock_ptr = ?UsizePtr::from(self));
+        let _span_enter = tracing_span.enter();
+        tracing::event!(Level::TRACE, "unlock");
+
         // we have exclusive access
         // we need to push out all previous memory accesses
         // and establish synchronizes-with trying to get access
@@ -620,6 +647,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_read", lock_ptr = ?UsizePtr::from(self));
+        let _span_enter = tracing_span.enter();
+        tracing::event!(Level::TRACE, "unlock");
+
         let mut old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
         loop {
             debug_assert!(lock_gen_valid(old_atomic_val));
@@ -662,6 +693,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_write", lock_ptr = ?UsizePtr::from(self));
+        let _span_enter = tracing_span.enter();
+        tracing::event!(Level::TRACE, "unlock");
+
         let lock_inst = unsafe {
             // safety: this can only be called when we hold the lock
             // so we know there's no &mut out there
@@ -693,6 +728,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
+        let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_read", lock_ptr = ?UsizePtr::from(self));
+        let _span_enter = tracing_span.enter();
+        tracing::event!(Level::TRACE, "unlock");
+
         let lock_inst = unsafe {
             // safety: this can only be called when we hold the lock
             // so we know there's no &mut out there
