@@ -51,14 +51,16 @@ impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPerLockData<'arena, 'w
         self.w.cancel()
     }
 
-    fn unpark(&self) {
-        self.w.unpark()
+    fn unpark(&self, unpark_xtra: &u32) {
+        // fixme wtf
+        self.w.unpark(unpark_xtra)
     }
 }
 
 #[derive(Debug)]
 pub struct WorkItem<'arena, 'work_item> {
     seed_node: NetlistRef<'arena>,
+    _todo_wip_cancelled: AtomicBool,
     locks_used: Cell<usize>,
     locks: [MaybeUninit<
         UnsafeCell<LockAndStroadData<'arena, 'work_item, WorkItemPerLockData<'arena, 'work_item>>>,
@@ -71,18 +73,22 @@ unsafe impl<'arena, 'work_item> Sync for WorkItem<'arena, 'work_item> {}
 impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     pub unsafe fn init(self_: *mut Self, node: NetlistRef<'arena>) -> &'work_item mut Self {
         (*self_).seed_node = node;
+        (*self_)._todo_wip_cancelled = AtomicBool::new(false);
         (*self_).locks_used = Cell::new(0);
         &mut *self_
     }
 
-    fn unpark(&'work_item self) {
+    fn unpark(
+        &'work_item self,
+        local_queue: &mut LocalQueue<&'work_item WorkItem<'arena, 'work_item>>,
+    ) {
         // unpark happens *only* on lock release
         // and *only* happens once
         // it happens for both ordered and unordered algorithms
         // it cannot happen multiple times simultaneously from different threads, because
         // a work item can only be blocked on *one* lock at a time (at least in a correct impl).
         // additionally, unparking happens with the stroad bucket lock held -- can only happen from one thread
-        todo!()
+        local_queue.push(self);
     }
 
     fn cancel(&'work_item self) {
@@ -92,7 +98,7 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         // even though cancelling happens with the stroad bucket lock held,
         // a speculative work item waiting to commit can hold multiple *different* locks.
         // a cancellation can be triggered because of two *different* ones in a racy way
-        todo!()
+        self._todo_wip_cancelled.store(true, Ordering::Relaxed);
     }
 
     fn next_lock(
@@ -188,7 +194,7 @@ impl<'arena> NetlistManager<'arena> {
                                             || lock.state.get()
                                                 == LockState::LockedForUnorderedWrite
                                     );
-                                    lock.unlock(stroad);
+                                    lock.unlock(stroad, ());
                                 }
                             }
                             continue;
@@ -237,6 +243,7 @@ pub use single_threaded::*;
 
 mod unordered;
 pub use unordered::*;
+use work_queue::LocalQueue;
 
 #[cfg(test)]
 mod tests;

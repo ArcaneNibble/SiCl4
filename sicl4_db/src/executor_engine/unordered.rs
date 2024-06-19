@@ -160,7 +160,8 @@ impl<'arena, T> Drop for UnorderedObjPhase2ROGuard<'arena, T> {
     fn drop(&mut self) {
         // safety: we hold the lock
         unsafe {
-            self.lock.unlock(self.stroad);
+            // self.lock.unlock(self.stroad);
+            todo!()
         }
     }
 }
@@ -188,7 +189,8 @@ impl<'arena, T> Drop for UnorderedObjPhase2RWGuard<'arena, T> {
     fn drop(&mut self) {
         // safety: we hold the lock
         unsafe {
-            self.lock.unlock(self.stroad);
+            // self.lock.unlock(self.stroad);
+            todo!()
         }
     }
 }
