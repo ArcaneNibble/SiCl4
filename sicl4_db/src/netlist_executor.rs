@@ -12,12 +12,22 @@ use std::{
 use crate::{allocator::*, locking::*, netlist::*, stroad::*};
 
 pub trait UnorderedAlgorithm: Send + Sync {
-    fn process_node<'algo_state, 'view, 'arena, 'work_item>(
+    type ROtoRWTy;
+
+    fn try_process_readonly<'algo_state, 'view, 'arena, 'work_item>(
         &'algo_state self,
-        view: &'view mut UnorderedAlgorithmThreadView,
+        view: &'view mut UnorderedAlgorithmROView,
         node: NetlistRef<'arena>,
         work_item: &'work_item mut WorkItem<'arena, 'work_item>,
-    ) -> Result<(), ()>;
+    ) -> Result<(Self::ROtoRWTy, &'work_item mut WorkItem<'arena, 'work_item>), ()>;
+
+    fn process_finish_readwrite<'algo_state, 'view, 'arena, 'work_item>(
+        &'algo_state self,
+        view: &'view mut UnorderedAlgorithmRWView,
+        node: NetlistRef<'arena>,
+        work_item: &'work_item mut WorkItem<'arena, 'work_item>,
+        ro_output: Self::ROtoRWTy,
+    );
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -61,6 +71,7 @@ impl<'arena, 'work_item> LockInstPayload for WorkItemPayload<'arena, 'work_item>
 #[derive(Debug)]
 pub struct WorkItem<'arena, 'work_item> {
     seed_node: NetlistRef<'arena>,
+    locks_used: usize,
     locks: [MaybeUninit<
         RWLock<'arena, 'work_item, NetlistRef<'arena>, WorkItemPayload<'arena, 'work_item>>,
     >; MAX_ORDERED_LOCKS_PER_WORK_ITEM],
@@ -70,6 +81,7 @@ unsafe impl<'arena, 'work_item> Sync for WorkItem<'arena, 'work_item> {}
 impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     pub unsafe fn init(self_: *mut Self, node: NetlistRef<'arena>) -> &'work_item mut Self {
         (*self_).seed_node = node;
+        (*self_).locks_used = 0;
         &mut *self_
     }
 
@@ -78,6 +90,28 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     }
 
     fn cancel(&'work_item self) {
+        todo!()
+    }
+
+    fn next_lock(
+        &'work_item mut self,
+        obj: NetlistRef<'arena>,
+    ) -> (
+        usize,
+        &'work_item mut RWLock<
+            'arena,
+            'work_item,
+            NetlistRef<'arena>,
+            WorkItemPayload<'arena, 'work_item>,
+        >,
+    ) {
+        if self.locks_used == MAX_ORDERED_LOCKS_PER_WORK_ITEM {
+            todo!("need to allocate a spill block?");
+        }
+        let lock_ptr = self.locks[self.locks_used].as_mut_ptr();
+        unsafe {
+            RWLock::init(lock_ptr, obj);
+        }
         todo!()
     }
 }
@@ -124,12 +158,28 @@ impl<'arena> NetlistManager<'arena> {
                 let heap_thread_shard = self.heap.new_thread();
                 let stroad = &self.stroad;
                 s.spawn(move || {
-                    let mut view = UnorderedAlgorithmThreadView {
+                    let mut ro_view = UnorderedAlgorithmROView {
                         stroad,
                         heap_thread_shard,
                     };
                     while let Some(work_item) = local_queue.pop() {
-                        let _ret = algo.process_node(&mut view, work_item.seed_node, work_item);
+                        let seed_node = work_item.seed_node;
+                        let ro_ret = algo.try_process_readonly(&mut ro_view, seed_node, work_item);
+                        if ro_ret.is_err() {
+                            println!("parked!");
+                            continue;
+                        }
+                        let (ro_ret, work_item) = ro_ret.unwrap();
+
+                        let mut rw_view = UnorderedAlgorithmRWView {
+                            stroad,
+                            heap_thread_shard: ro_view.heap_thread_shard,
+                        };
+                        algo.process_finish_readwrite(&mut rw_view, seed_node, work_item, ro_ret);
+                        ro_view = UnorderedAlgorithmROView {
+                            stroad,
+                            heap_thread_shard: rw_view.heap_thread_shard,
+                        };
                     }
                 });
             }
@@ -138,12 +188,38 @@ impl<'arena> NetlistManager<'arena> {
     }
 }
 
+// the following code is for an *unordered* algorithm
+
 #[derive(Debug)]
-pub struct UnorderedAlgorithmThreadView<'arena> {
+pub struct UnorderedAlgorithmROView<'arena> {
     stroad: &'arena Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>,
     heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
 }
-impl<'arena> UnorderedAlgorithmThreadView<'arena> {}
+impl<'arena> UnorderedAlgorithmROView<'arena> {
+    pub fn try_lock_cell<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena mut WorkItem<'arena, 'arena>,
+        obj: NetlistCellRef<'arena>,
+        want_write: bool,
+    ) -> Result<UnorderedObjROGuard<'arena, NetlistCell<'arena>>, ()> {
+        todo!()
+    }
+}
+
+#[derive(Debug)]
+pub struct UnorderedAlgorithmRWView<'arena> {
+    stroad: &'arena Stroad<'arena, NetlistRef<'arena>, WorkItemPayload<'arena, 'arena>>,
+    heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
+}
+impl<'arena> UnorderedAlgorithmRWView<'arena> {}
+
+#[derive(Debug)]
+pub struct UnorderedObjROGuard<'arena, T> {
+    // todo
+    pub x: ObjRef<'arena, T>,
+}
+
+// the following code is for *single-threaded* operation
 
 #[derive(Debug)]
 pub struct SingleThreadedView<'arena> {
@@ -312,7 +388,7 @@ mod tests {
 
     #[test]
     fn executor_ensure_obj_safety() {
-        let _x: &dyn UnorderedAlgorithm;
+        let _x: &dyn UnorderedAlgorithm<ROtoRWTy = u32>;
     }
 
     #[cfg(not(loom))]
