@@ -63,19 +63,19 @@ struct WorkItemPayload<'arena, 'work_item> {
     w: &'work_item WorkItem<'arena, 'work_item>,
     guard_handed_out: Cell<bool>,
 }
-impl<'arena, 'work_item> LockInstPayload for WorkItemPayload<'arena, 'work_item> {
-    fn cancel<'lock_inst, K>(e: &'lock_inst mut LockInstance<'lock_inst, K, Self>)
+impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPayload<'arena, 'work_item> {
+    fn cancel<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
     where
         Self: Sized,
     {
-        e.payload.w.cancel()
+        e.work_item_link.w.cancel()
     }
 
-    fn unpark<'lock_inst, K>(e: &'lock_inst mut LockInstance<'lock_inst, K, Self>)
+    fn unpark<'lock_inst, K>(e: &'lock_inst mut StroadNode<'lock_inst, K, Self>)
     where
         Self: Sized,
     {
-        e.payload.w.unpark()
+        e.work_item_link.w.unpark()
     }
 }
 
