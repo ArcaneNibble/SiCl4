@@ -73,7 +73,7 @@ fn alloc_layout_compute() {
 fn test_num_that_fits() {
     assert_eq!(num_that_fits(Layout::new::<u32>(), 256), 256 / 4);
     #[repr(align(4))]
-    struct WithPadding(u8);
+    struct WithPadding(#[allow(dead_code)] u8);
     assert_eq!(num_that_fits(Layout::new::<WithPadding>(), 256), 256 / 4);
 }
 
