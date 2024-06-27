@@ -1,5 +1,7 @@
 //! Manages a netlist and running algorithms on it
 
+pub mod ordered_commit_queue;
+
 use std::{
     alloc::Layout,
     cell::{Cell, RefCell, UnsafeCell},
