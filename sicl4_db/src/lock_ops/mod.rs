@@ -489,7 +489,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
             &mut *stroad_state
         };
 
-        debug_assert!(prio <= i64::MAX as u64);
+        debug_assert!(prio < i64::MAX as u64);
         let prio = -(prio as i64) - 1;
 
         let old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
@@ -547,7 +547,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
             &mut *stroad_state
         };
 
-        debug_assert!(prio <= i64::MAX as u64);
+        debug_assert!(prio < i64::MAX as u64);
         let prio = prio as i64;
 
         let old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);

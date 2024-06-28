@@ -8,6 +8,8 @@ use tracing::Level;
 
 use crate::loom_testing::*;
 
+pub const MAX_THREADS: usize = 64;
+
 /// Struct holding payload and a priority, where traits are implemented
 /// s.t. equality and ordering *only* look at the priority, and
 /// s.t. ordering is inverted for turning a max-heap into a min-heap
@@ -50,8 +52,8 @@ impl<T> PartialOrd for ItemWithPriority<T> {
 }
 
 struct QueueInnards<T> {
-    /// priority -> number of items
-    item_count: HashMap<i64, usize>,
+    /// priority of whatever's been handed out to each thread
+    wip_priority: [i64; MAX_THREADS],
     /// work that is not started i.e. no locks grabbed
     items_not_started: BinaryHeap<ItemWithPriority<T>>,
     /// work that has locks grabbed but isn't allowed to commit yet
@@ -61,7 +63,7 @@ struct QueueInnards<T> {
 impl<T> QueueInnards<T> {
     pub fn new() -> Self {
         Self {
-            item_count: HashMap::new(),
+            wip_priority: [i64::MAX; MAX_THREADS],
             items_not_started: BinaryHeap::new(),
             items_waiting: BinaryHeap::new(),
         }
@@ -88,7 +90,7 @@ impl<T: Debug> OrderedCommitQueue<T> {
     }
 
     pub fn create_new_work(&self, item: ItemWithPriority<T>) {
-        debug_assert!(item.prio >= 0);
+        debug_assert!(item.prio >= 0 && item.prio < i64::MAX);
         let mut inside = self.inside.lock().unwrap();
         tracing::event!(
             name: "ordered_commit_queue::create_new_work",
@@ -96,20 +98,16 @@ impl<T: Debug> OrderedCommitQueue<T> {
             item = ?item,
         );
         println!("{:?} new work {:?}", loom::thread::current().id(), item);
-        inside
-            .item_count
-            .entry(item.prio)
-            .and_modify(|x| *x += 1)
-            .or_insert(1);
         inside.items_not_started.push(item);
         self.wait_not_empty.notify_one();
     }
 
-    pub fn put_back_waiting_item(&self, item: ItemWithPriority<T>) {
+    pub fn put_back_waiting_item(&self, tid: usize, item: ItemWithPriority<T>) {
         let mut inside = self.inside.lock().unwrap();
         tracing::event!(
             name: "ordered_commit_queue::put_back_waiting_item",
             Level::TRACE,
+            tid,
             item = ?item,
         );
         println!(
@@ -117,86 +115,80 @@ impl<T: Debug> OrderedCommitQueue<T> {
             loom::thread::current().id(),
             item,
         );
+        assert_eq!(inside.wip_priority[tid], item.prio);
+        inside.wip_priority[tid] = i64::MAX;
         inside.items_waiting.push(item);
     }
 
-    pub fn finish_work(&self, item: ItemWithPriority<T>) {
+    pub fn finish_work(&self, tid: usize, item: ItemWithPriority<T>) {
         let mut inside = self.inside.lock().unwrap();
         tracing::event!(
             name: "ordered_commit_queue::finish_work",
             Level::TRACE,
+            tid,
             item = ?item,
         );
         println!("{:?} finish work {:?}", loom::thread::current().id(), item);
-        let QueueInnards {
-            ref mut item_count,
-            ref mut items_not_started,
-            ref mut items_waiting,
-        } = *inside;
-        if let Entry::Occupied(mut e) = item_count.entry(item.prio) {
-            if *e.get() == 1 {
-                let prev_commit_priority = self.commit_priority();
-                assert!(item.prio <= prev_commit_priority); // cannot be committing a higher-priority item, wtf?
 
-                // the next priority can be found in *either* queue
-                // (example: this item unparked a work item of the next highest priority)
-                let waiting_highest_prio =
-                    items_waiting.peek().map_or_else(|| i64::MAX, |e| e.prio);
-                let not_started_highest_prio = items_not_started
-                    .peek()
-                    .map_or_else(|| i64::MAX, |e| e.prio);
-                let next_highest_prio = i64::min(waiting_highest_prio, not_started_highest_prio);
-                assert!(next_highest_prio > item.prio); // must be strictly increasing
+        assert_eq!(inside.wip_priority[tid], item.prio);
+        inside.wip_priority[tid] = i64::MAX;
 
-                self.commit_priority
-                    .store(next_highest_prio as usize, Ordering::Relaxed);
-                tracing::event!(
-                    name: "ordered_commit_queue::advance_priority",
-                    Level::TRACE,
-                    item_priority = item.prio,
-                    finished_priority = prev_commit_priority,
-                    new_priority = next_highest_prio,
-                );
-                e.remove_entry();
+        let prev_commit_priority = self.commit_priority();
+        assert!(item.prio <= prev_commit_priority); // cannot be committing a higher-priority item, wtf?
 
-                println!(
-                    "{:?} finish last of prio {} now prio {}",
-                    loom::thread::current().id(),
-                    prev_commit_priority,
-                    next_highest_prio,
-                );
+        // the next priority has to be somewhere amongst these queues
+        let waiting_highest_prio = inside
+            .items_waiting
+            .peek()
+            .map_or_else(|| i64::MAX, |e| e.prio);
+        let wip_highest_prio = *inside.wip_priority.iter().min().unwrap();
+        let not_started_highest_prio = inside
+            .items_not_started
+            .peek()
+            .map_or_else(|| i64::MAX, |e| e.prio);
+        let next_highest_prio = i64::min(
+            waiting_highest_prio,
+            i64::min(wip_highest_prio, not_started_highest_prio),
+        );
+        assert!(next_highest_prio > item.prio); // must be strictly increasing
 
-                if item_count.len() == 0 {
-                    // we just handed in the *last ever* work item
-                    // tell everybody to go home
-                    self.wait_not_empty.notify_all();
-                }
-            } else {
-                *e.get_mut() -= 1;
-                println!(
-                    "{:?} not last of prio {}, now {:?}",
-                    loom::thread::current().id(),
-                    item.prio,
-                    item_count
-                );
-            }
-        } else {
-            panic!("finishing work, but we lost track of item!")
+        self.commit_priority
+            .store(next_highest_prio as usize, Ordering::Relaxed);
+
+        tracing::event!(
+            name: "ordered_commit_queue::advance_priority",
+            Level::TRACE,
+            item_priority = item.prio,
+            finished_priority = prev_commit_priority,
+            new_priority = next_highest_prio,
+        );
+        println!(
+            "{:?} finish last of prio {} now prio {}",
+            loom::thread::current().id(),
+            prev_commit_priority,
+            next_highest_prio,
+        );
+
+        if inside.items_not_started.len() == 0
+            && inside.items_waiting.len() == 0
+            && wip_highest_prio == i64::MAX
+        {
+            // we just handed in the *last ever* work item
+            // tell everybody to go home
+            self.wait_not_empty.notify_all();
         }
     }
 
-    pub fn get_some_work(&self) -> Option<ItemWithPriority<T>> {
+    pub fn get_some_work(&self, tid: usize) -> Option<ItemWithPriority<T>> {
         let mut inside = self.inside.lock().unwrap();
 
         loop {
             // iff there's *no* items, there *cannot* be any work left
             // (thread termination condition)
-            println!(
-                "{:?} stuff {:?}",
-                loom::thread::current().id(),
-                inside.item_count
-            );
-            if inside.item_count.len() == 0 {
+            if inside.items_not_started.len() == 0
+                && inside.items_waiting.len() == 0
+                && *inside.wip_priority.iter().min().unwrap() == i64::MAX
+            {
                 return None;
             }
 
@@ -205,6 +197,7 @@ impl<T: Debug> OrderedCommitQueue<T> {
             if let Some(item) = inside.items_waiting.peek() {
                 if item.prio <= self.commit_priority() {
                     let item = inside.items_waiting.pop().unwrap();
+                    inside.wip_priority[tid] = item.prio;
                     tracing::event!(
                         name: "ordered_commit_queue::get_some_work",
                         Level::TRACE,
@@ -224,6 +217,7 @@ impl<T: Debug> OrderedCommitQueue<T> {
             // isn't allowed to commit yet (which means nothing else in there is either)
             // so we try to speculate something
             if let Some(item) = inside.items_not_started.pop() {
+                inside.wip_priority[tid] = item.prio;
                 tracing::event!(
                     name: "ordered_commit_queue::get_some_work",
                     Level::TRACE,
