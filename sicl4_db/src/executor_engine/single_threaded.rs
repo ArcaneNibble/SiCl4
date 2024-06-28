@@ -134,7 +134,7 @@ impl<'arena, 'q> NetlistView<'arena> for SingleThreadedView<'arena, 'q> {
         self.get_wire_read(_work_item, obj)
     }
 
-    fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>) {
+    fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>, _prio: i64) {
         let (new, _gen) = self.heap_thread_shard.allocate::<WorkItem>();
         let work_item = unsafe { WorkItem::init(new.as_mut_ptr(), node) };
         self.workqueue.push(&*work_item);

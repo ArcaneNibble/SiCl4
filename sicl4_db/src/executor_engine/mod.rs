@@ -116,7 +116,7 @@ pub trait NetlistView<'arena> {
         obj: NetlistWireRef<'arena>,
     ) -> Option<Self::WireOwningGuardTy>;
 
-    fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>);
+    fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>, prio: i64);
 }
 
 const MAX_LOCKS_PER_WORK_ITEM: usize = 8;

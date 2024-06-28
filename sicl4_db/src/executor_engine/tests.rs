@@ -41,7 +41,7 @@ fn executor_single_threaded_smoke_test() {
         dbg!(&wire);
         dbg!(&*wire);
         wire_ref = wire.x;
-        view.add_work(cell_ref.into());
+        view.add_work(cell_ref.into(), 0);
 
         connect_driver(&mut cell, 0, &mut wire);
     }
@@ -89,7 +89,7 @@ fn executor_asdf() {
     let wire = view.new_wire(());
     dbg!(&wire);
     dbg!(&*wire);
-    view.add_work(cell.x.into());
+    view.add_work(cell.x.into(), 0);
     drop(view);
     let cell_ref = cell.x;
     drop(cell);
@@ -145,7 +145,7 @@ fn executor_asdf2() {
     let mut cell = view.new_cell((), TEST_LUT_UUID, 1);
     let mut wire = view.new_wire(());
     connect_driver(&mut cell, 0, &mut wire);
-    view.add_work(cell.x.into());
+    view.add_work(cell.x.into(), 0);
     drop(view);
     drop(cell);
     drop(wire);
@@ -236,7 +236,7 @@ fn bench_full_custom_netlist() {
             for _ in 0..N_INITIAL_WORK {
                 let luti = rng.gen_range(0..NLUTS);
                 let lut = generate_hax_luts_vec[luti].x;
-                init_thread_view.add_work(lut.into());
+                init_thread_view.add_work(lut.into(), 0);
                 // println!("Initial work item: {}", luti);
             }
         }
@@ -313,7 +313,7 @@ fn bench_full_custom_netlist() {
 
                 let driver_cell_ref = inp_wire.drivers[0];
                 cell.visited_marker = true;
-                view.add_work(driver_cell_ref.into());
+                view.add_work(driver_cell_ref.into(), 0);
             } else {
                 // hack for self-loop
                 let outwire_ref = cell.connections[4].unwrap();
@@ -341,7 +341,7 @@ fn bench_full_custom_netlist() {
 
                 for inp_wire in &inp_wires {
                     if let Some(inp_wire) = inp_wire {
-                        view.add_work(inp_wire.drivers[0].into());
+                        view.add_work(inp_wire.drivers[0].into(), 0);
                     }
                 }
 
