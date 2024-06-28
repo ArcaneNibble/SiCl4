@@ -33,7 +33,7 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
         work_item: &'arena WorkItem<'arena, 'arena>,
         obj: NetlistCellRef<'arena>,
         want_write: bool,
-    ) -> Result<UnorderedObjPhase1Guard<'arena, NetlistCell<'arena>>, ()> {
+    ) -> Result<ROGuard<'arena, NetlistCell<'arena>>, ()> {
         let (_lock_idx, lock) = work_item.next_lock(NetlistRef::Cell(obj));
         let lock_gotten = if !want_write {
             lock.unordered_try_read(self.stroad)?
@@ -43,7 +43,7 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
         if !lock_gotten {
             return Err(());
         }
-        Ok(UnorderedObjPhase1Guard { x: obj })
+        Ok(ROGuard { x: obj })
     }
 
     pub fn try_lock_wire<'wrapper>(
@@ -51,7 +51,7 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
         work_item: &'arena WorkItem<'arena, 'arena>,
         obj: NetlistWireRef<'arena>,
         want_write: bool,
-    ) -> Result<UnorderedObjPhase1Guard<'arena, NetlistWire<'arena>>, ()> {
+    ) -> Result<ROGuard<'arena, NetlistWire<'arena>>, ()> {
         let (_lock_idx, lock) = work_item.next_lock(NetlistRef::Wire(obj));
         let lock_gotten = if !want_write {
             lock.unordered_try_read(self.stroad)?
@@ -61,7 +61,7 @@ impl<'arena> UnorderedAlgorithmROView<'arena> {
         if !lock_gotten {
             return Err(());
         }
-        Ok(UnorderedObjPhase1Guard { x: obj })
+        Ok(ROGuard { x: obj })
     }
 }
 
@@ -72,8 +72,8 @@ pub struct UnorderedAlgorithmRWView<'arena, 'q> {
     pub(super) debug_id: Cell<usize>,
 }
 impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
-    type CellROGuardTy = UnorderedObjPhase2ROGuard<'arena, NetlistCell<'arena>>;
-    type WireROGuardTy = UnorderedObjPhase2ROGuard<'arena, NetlistWire<'arena>>;
+    type CellROGuardTy = ROGuard<'arena, NetlistCell<'arena>>;
+    type WireROGuardTy = ROGuard<'arena, NetlistWire<'arena>>;
     type CellOwningGuardTy = UnorderedObjPhase2RWGuard<'arena, NetlistCell<'arena>>;
     type WireOwningGuardTy = UnorderedObjPhase2RWGuard<'arena, NetlistWire<'arena>>;
     type MaybeWorkItem = &'arena WorkItem<'arena, 'arena>;
@@ -177,7 +177,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 {
                     panic!("Tried to access a node in the wrong state")
                 }
-                return Some(UnorderedObjPhase2ROGuard { x: obj });
+                return Some(ROGuard { x: obj });
             }
         }
         panic!("Tried to access a node that wasn't tagged in phase 1")
@@ -214,7 +214,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 {
                     panic!("Tried to access a node in the wrong state")
                 }
-                return Some(UnorderedObjPhase2ROGuard { x: obj });
+                return Some(ROGuard { x: obj });
             }
         }
         panic!("Tried to access a node that wasn't tagged in phase 1")
@@ -246,37 +246,6 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
 }
 impl<'arena, 'q> UnorderedAlgorithmRWView<'arena, 'q> {
     // xxx?
-}
-
-#[derive(Debug)]
-pub struct UnorderedObjPhase1Guard<'arena, T> {
-    pub x: ObjRef<'arena, T>,
-}
-impl<'arena, T> Deref for UnorderedObjPhase1Guard<'arena, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        // safety: atomic ops (in lock_ops) ensures that there is no conflict
-        unsafe { &*self.x.ptr.payload.get() }
-    }
-}
-
-#[derive(Debug)]
-pub struct UnorderedObjPhase2ROGuard<'arena, T> {
-    pub x: ObjRef<'arena, T>,
-}
-impl<'arena, T> NetlistGuard<'arena, T> for UnorderedObjPhase2ROGuard<'arena, T> {
-    fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
-        self.x
-    }
-}
-impl<'arena, T> Deref for UnorderedObjPhase2ROGuard<'arena, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        // safety: atomic ops (in lock_ops) ensures that there is no conflict
-        unsafe { &*self.x.ptr.payload.get() }
-    }
 }
 
 #[derive(Debug)]

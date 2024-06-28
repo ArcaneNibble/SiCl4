@@ -253,6 +253,25 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     }
 }
 
+/// Allows read-only access to something in the netlist
+#[derive(Debug)]
+pub struct ROGuard<'arena, T> {
+    pub x: ObjRef<'arena, T>,
+}
+impl<'arena, T> NetlistGuard<'arena, T> for ROGuard<'arena, T> {
+    fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
+        self.x
+    }
+}
+impl<'arena, T> Deref for ROGuard<'arena, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // safety: atomic ops (in lock_ops) ensures that there is no conflict
+        unsafe { &*self.x.ptr.payload.get() }
+    }
+}
+
 /// Top-level netlist + work items unified data structure
 ///
 /// This doesn't actually *have* to be unified, but it's simpler this way
