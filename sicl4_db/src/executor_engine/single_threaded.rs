@@ -65,7 +65,7 @@ impl<'arena, 'q> NetlistView<'arena> for SingleThreadedView<'arena, 'q> {
         }
     }
 
-    fn delete_cell<'wrapper>(&'wrapper mut self, guard: Self::CellOwningGuardTy) {
+    fn delete_cell<'wrapper>(&'wrapper mut self, _work_item: (), guard: Self::CellOwningGuardTy) {
         guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
         unsafe {
             // safety: the guard represents exclusive access to the node
@@ -73,7 +73,7 @@ impl<'arena, 'q> NetlistView<'arena> for SingleThreadedView<'arena, 'q> {
         }
         mem::forget(guard);
     }
-    fn delete_wire<'wrapper>(&'wrapper mut self, guard: Self::WireOwningGuardTy) {
+    fn delete_wire<'wrapper>(&'wrapper mut self, _work_item: (), guard: Self::WireOwningGuardTy) {
         guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
         unsafe {
             // safety: the guard represents exclusive access to the node

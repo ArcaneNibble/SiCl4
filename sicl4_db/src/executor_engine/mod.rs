@@ -82,8 +82,16 @@ pub trait NetlistView<'arena> {
         &'wrapper mut self,
         work_item: Self::MaybeWorkItem,
     ) -> Self::WireOwningGuardTy;
-    fn delete_cell<'wrapper>(&'wrapper mut self, guard: Self::CellOwningGuardTy);
-    fn delete_wire<'wrapper>(&'wrapper mut self, guard: Self::WireOwningGuardTy);
+    fn delete_cell<'wrapper>(
+        &'wrapper mut self,
+        work_item: Self::MaybeWorkItem,
+        guard: Self::CellOwningGuardTy,
+    );
+    fn delete_wire<'wrapper>(
+        &'wrapper mut self,
+        work_item: Self::MaybeWorkItem,
+        guard: Self::WireOwningGuardTy,
+    );
 
     // fixme document the semantics of Option
     fn get_cell_read<'wrapper>(
@@ -387,7 +395,8 @@ impl<'arena> NetlistManager<'arena> {
                             for lock_idx in 0..locks_used {
                                 let lock = &*work_item.locks[lock_idx].assume_init_ref().get();
                                 debug_assert!(
-                                    (lock.state.get() == LockState::LockedForUnorderedRead)
+                                    lock.state.get() == LockState::Unlocked
+                                        || lock.state.get() == LockState::LockedForUnorderedRead
                                         || lock.state.get() == LockState::LockedForUnorderedWrite
                                 );
                                 lock.unlock(stroad, &mut local_queue_rc.borrow_mut());

@@ -100,9 +100,12 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 ptr: new.assume_init_ref(),
                 gen,
             };
-            let (_lock_idx, lock) = work_item.next_lock(NetlistRef::Cell(new_ref));
+            let (lock_idx, lock) = work_item.next_lock(NetlistRef::Cell(new_ref));
             lock.state.set(LockState::LockedForUnorderedWrite);
-            Self::CellOwningGuardTy { x: new_ref }
+            Self::CellOwningGuardTy {
+                x: new_ref,
+                lock_idx,
+            }
         }
     }
     fn new_wire<'wrapper>(
@@ -120,15 +123,23 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 ptr: new.assume_init_ref(),
                 gen,
             };
-            let (_lock_idx, lock) = work_item.next_lock(NetlistRef::Wire(new_ref));
+            let (lock_idx, lock) = work_item.next_lock(NetlistRef::Wire(new_ref));
             lock.state.set(LockState::LockedForUnorderedWrite);
-            Self::WireOwningGuardTy { x: new_ref }
+            Self::WireOwningGuardTy {
+                x: new_ref,
+                lock_idx,
+            }
         }
     }
 
-    fn delete_cell<'wrapper>(&'wrapper mut self, guard: Self::CellOwningGuardTy) {
-        // FIXME THIS MIGHT BE BORKED
-        panic!("THIS IS PROBABLY BROKEN");
+    fn delete_cell<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        guard: Self::CellOwningGuardTy,
+    ) {
+        // FIXME THIS IS NOT TESTED
+        let lock = unsafe { &*work_item.locks[guard.lock_idx].assume_init_ref().get() };
+        lock.state.set(LockState::Unlocked);
         guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
         unsafe {
             // safety: the guard represents exclusive access to the node
@@ -136,9 +147,14 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
         }
         mem::forget(guard);
     }
-    fn delete_wire<'wrapper>(&'wrapper mut self, guard: Self::WireOwningGuardTy) {
-        // FIXME THIS MIGHT BE BORKED
-        panic!("THIS IS PROBABLY BROKEN");
+    fn delete_wire<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        guard: Self::WireOwningGuardTy,
+    ) {
+        // FIXME THIS IS NOT TESTED
+        let lock = unsafe { &*work_item.locks[guard.lock_idx].assume_init_ref().get() };
+        lock.state.set(LockState::Unlocked);
         guard.x.ptr.lock_and_generation.store(0, Ordering::Relaxed);
         unsafe {
             // safety: the guard represents exclusive access to the node
@@ -178,7 +194,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 if lock_i.state.get() != LockState::LockedForUnorderedWrite {
                     panic!("Tried to access a node in the wrong state")
                 }
-                return Some(UnorderedObjPhase2RWGuard { x: obj });
+                return Some(UnorderedObjPhase2RWGuard { x: obj, lock_idx });
             }
         }
         panic!("Tried to access a node that wasn't tagged in phase 1")
@@ -216,7 +232,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 if lock_i.state.get() != LockState::LockedForUnorderedWrite {
                     panic!("Tried to access a node in the wrong state")
                 }
-                return Some(UnorderedObjPhase2RWGuard { x: obj });
+                return Some(UnorderedObjPhase2RWGuard { x: obj, lock_idx });
             }
         }
         panic!("Tried to access a node that wasn't tagged in phase 1")
@@ -266,6 +282,7 @@ impl<'arena, T> Deref for UnorderedObjPhase2ROGuard<'arena, T> {
 #[derive(Debug)]
 pub struct UnorderedObjPhase2RWGuard<'arena, T> {
     pub x: ObjRef<'arena, T>,
+    lock_idx: usize,
 }
 impl<'arena, T> NetlistGuard<'arena, T> for UnorderedObjPhase2RWGuard<'arena, T> {
     fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {

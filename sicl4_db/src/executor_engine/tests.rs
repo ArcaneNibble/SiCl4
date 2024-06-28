@@ -3,7 +3,6 @@ use std::time::Instant;
 use super::*;
 use memory_stats::memory_stats;
 use rand::{Rng, SeedableRng};
-use tracing::subscriber;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use uuid::uuid;
 
@@ -51,8 +50,8 @@ fn executor_single_threaded_smoke_test() {
         let wire_again = view.get_wire_read((), wire_ref).unwrap();
         assert_eq!(cell_again.connections[0], Some(wire_ref));
         assert_eq!(wire_again.drivers[0], cell_ref);
-        view.delete_cell(cell_again);
-        view.delete_wire(wire_again);
+        view.delete_cell((), cell_again);
+        view.delete_wire((), wire_again);
     }
     {
         let cell_again_again = view.get_cell_read((), cell_ref);
@@ -156,7 +155,7 @@ fn executor_asdf2() {
 }
 
 fn trace_filt<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>>(
-    metadata: &tracing::Metadata,
+    _metadata: &tracing::Metadata,
     _ctx: &tracing_subscriber::layer::Context<S>,
 ) -> bool {
     // let meta_name = metadata.name();
