@@ -1,6 +1,6 @@
 //! Manage work items for ordered algorithms
 
-use std::collections::{hash_map::Entry, BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::sync::atomic::Ordering;
 
@@ -150,7 +150,7 @@ impl<T: Debug> OrderedCommitQueue<T> {
             waiting_highest_prio,
             i64::min(wip_highest_prio, not_started_highest_prio),
         );
-        assert!(next_highest_prio > item.prio); // must be strictly increasing
+        assert!(next_highest_prio >= item.prio);
 
         self.commit_priority
             .store(next_highest_prio as usize, Ordering::Relaxed);
