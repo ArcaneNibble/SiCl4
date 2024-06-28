@@ -272,6 +272,32 @@ impl<'arena, T> Deref for ROGuard<'arena, T> {
     }
 }
 
+/// Allows read-write access (including delete) to something in the netlist
+#[derive(Debug)]
+pub struct RWGuard<'arena, T> {
+    pub x: ObjRef<'arena, T>,
+    lock_idx: usize,
+}
+impl<'arena, T> NetlistGuard<'arena, T> for RWGuard<'arena, T> {
+    fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
+        self.x
+    }
+}
+impl<'arena, T> Deref for RWGuard<'arena, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // safety: atomic ops (in lock_ops) ensures that there is no conflict
+        unsafe { &*self.x.ptr.payload.get() }
+    }
+}
+impl<'arena, T> DerefMut for RWGuard<'arena, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // safety: atomic ops (in lock_ops) ensures that there is no conflict
+        unsafe { &mut *self.x.ptr.payload.get() }
+    }
+}
+
 /// Top-level netlist + work items unified data structure
 ///
 /// This doesn't actually *have* to be unified, but it's simpler this way

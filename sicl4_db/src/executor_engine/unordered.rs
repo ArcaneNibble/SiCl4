@@ -74,8 +74,8 @@ pub struct UnorderedAlgorithmRWView<'arena, 'q> {
 impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
     type CellROGuardTy = ROGuard<'arena, NetlistCell<'arena>>;
     type WireROGuardTy = ROGuard<'arena, NetlistWire<'arena>>;
-    type CellOwningGuardTy = UnorderedObjPhase2RWGuard<'arena, NetlistCell<'arena>>;
-    type WireOwningGuardTy = UnorderedObjPhase2RWGuard<'arena, NetlistWire<'arena>>;
+    type CellOwningGuardTy = RWGuard<'arena, NetlistCell<'arena>>;
+    type WireOwningGuardTy = RWGuard<'arena, NetlistWire<'arena>>;
     type MaybeWorkItem = &'arena WorkItem<'arena, 'arena>;
 
     fn new_cell<'wrapper>(
@@ -194,7 +194,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 if lock_i.state.get() != LockState::LockedForUnorderedWrite {
                     panic!("Tried to access a node in the wrong state")
                 }
-                return Some(UnorderedObjPhase2RWGuard { x: obj, lock_idx });
+                return Some(RWGuard { x: obj, lock_idx });
             }
         }
         panic!("Tried to access a node that wasn't tagged in phase 1")
@@ -232,7 +232,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
                 if lock_i.state.get() != LockState::LockedForUnorderedWrite {
                     panic!("Tried to access a node in the wrong state")
                 }
-                return Some(UnorderedObjPhase2RWGuard { x: obj, lock_idx });
+                return Some(RWGuard { x: obj, lock_idx });
             }
         }
         panic!("Tried to access a node that wasn't tagged in phase 1")
@@ -246,29 +246,4 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
 }
 impl<'arena, 'q> UnorderedAlgorithmRWView<'arena, 'q> {
     // xxx?
-}
-
-#[derive(Debug)]
-pub struct UnorderedObjPhase2RWGuard<'arena, T> {
-    pub x: ObjRef<'arena, T>,
-    lock_idx: usize,
-}
-impl<'arena, T> NetlistGuard<'arena, T> for UnorderedObjPhase2RWGuard<'arena, T> {
-    fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {
-        self.x
-    }
-}
-impl<'arena, T> Deref for UnorderedObjPhase2RWGuard<'arena, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        // safety: atomic ops (in lock_ops) ensures that there is no conflict
-        unsafe { &*self.x.ptr.payload.get() }
-    }
-}
-impl<'arena, T> DerefMut for UnorderedObjPhase2RWGuard<'arena, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        // safety: atomic ops (in lock_ops) ensures that there is no conflict
-        unsafe { &mut *self.x.ptr.payload.get() }
-    }
 }
