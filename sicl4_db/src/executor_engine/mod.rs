@@ -159,6 +159,7 @@ unsafe impl<'arena, 'work_item> Sync for WorkItem<'arena, 'work_item> {}
 impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     pub unsafe fn init(self_: *mut Self, node: NetlistRef<'arena>) -> &'work_item mut Self {
         (*self_).seed_node = node;
+        (*self_).prio = 0;
         (*self_)._todo_wip_did_unpark = AtomicU32::new(0);
         (*self_)._todo_wip_cancelled = AtomicBool::new(false);
         (*self_).locks_used = Cell::new(0);

@@ -104,7 +104,7 @@ impl<'arena, 'q> NetlistView<'arena> for OrderedAlgorithmRWView<'arena, 'q> {
                 gen,
             };
             let (lock_idx, lock) = work_item.next_lock(NetlistRef::Cell(new_ref));
-            lock.state.set(LockState::LockedForUnorderedWrite);
+            lock.state.set(LockState::LockedForOrderedWrite);
             Self::CellOwningGuardTy {
                 x: new_ref,
                 lock_idx,
@@ -127,7 +127,7 @@ impl<'arena, 'q> NetlistView<'arena> for OrderedAlgorithmRWView<'arena, 'q> {
                 gen,
             };
             let (lock_idx, lock) = work_item.next_lock(NetlistRef::Wire(new_ref));
-            lock.state.set(LockState::LockedForUnorderedWrite);
+            lock.state.set(LockState::LockedForOrderedWrite);
             Self::WireOwningGuardTy {
                 x: new_ref,
                 lock_idx,
@@ -175,8 +175,8 @@ impl<'arena, 'q> NetlistView<'arena> for OrderedAlgorithmRWView<'arena, 'q> {
         for lock_idx in 0..work_item.locks_used.get() {
             let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
             if lock_i.p == obj.type_erase() {
-                if lock_i.state.get() != LockState::LockedForUnorderedRead
-                    && lock_i.state.get() != LockState::LockedForUnorderedWrite
+                if lock_i.state.get() != LockState::LockedForOrderedRead
+                    && lock_i.state.get() != LockState::LockedForOrderedWrite
                 {
                     panic!("Tried to access a node in the wrong state")
                 }
@@ -194,7 +194,7 @@ impl<'arena, 'q> NetlistView<'arena> for OrderedAlgorithmRWView<'arena, 'q> {
         for lock_idx in 0..work_item.locks_used.get() {
             let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
             if lock_i.p == obj.type_erase() {
-                if lock_i.state.get() != LockState::LockedForUnorderedWrite {
+                if lock_i.state.get() != LockState::LockedForOrderedWrite {
                     panic!("Tried to access a node in the wrong state")
                 }
                 return Some(RWGuard { x: obj, lock_idx });
@@ -212,8 +212,8 @@ impl<'arena, 'q> NetlistView<'arena> for OrderedAlgorithmRWView<'arena, 'q> {
         for lock_idx in 0..work_item.locks_used.get() {
             let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
             if lock_i.p == obj.type_erase() {
-                if lock_i.state.get() != LockState::LockedForUnorderedRead
-                    && lock_i.state.get() != LockState::LockedForUnorderedWrite
+                if lock_i.state.get() != LockState::LockedForOrderedRead
+                    && lock_i.state.get() != LockState::LockedForOrderedWrite
                 {
                     panic!("Tried to access a node in the wrong state")
                 }
@@ -231,7 +231,7 @@ impl<'arena, 'q> NetlistView<'arena> for OrderedAlgorithmRWView<'arena, 'q> {
         for lock_idx in 0..work_item.locks_used.get() {
             let lock_i = unsafe { &*work_item.locks[lock_idx].assume_init_ref().get() };
             if lock_i.p == obj.type_erase() {
-                if lock_i.state.get() != LockState::LockedForUnorderedWrite {
+                if lock_i.state.get() != LockState::LockedForOrderedWrite {
                     panic!("Tried to access a node in the wrong state")
                 }
                 return Some(RWGuard { x: obj, lock_idx });
@@ -240,8 +240,12 @@ impl<'arena, 'q> NetlistView<'arena> for OrderedAlgorithmRWView<'arena, 'q> {
         panic!("Tried to access a node that wasn't tagged in phase 1")
     }
 
-    fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>, prio: u64) {
+    fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>, mut prio: u64) {
         assert!(prio < i64::MAX as u64);
+
+        // HAXXXX
+        prio = 0;
+
         let (new, _gen) = self.heap_thread_shard.allocate::<WorkItem>();
         let work_item = unsafe { WorkItem::init(new.as_mut_ptr(), node) };
         work_item.prio = prio;
