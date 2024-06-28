@@ -97,7 +97,6 @@ impl<T: Debug> OrderedCommitQueue<T> {
             Level::TRACE,
             item = ?item,
         );
-        println!("{:?} new work {:?}", loom::thread::current().id(), item);
         inside.items_not_started.push(item);
         self.wait_not_empty.notify_one();
     }
@@ -110,12 +109,7 @@ impl<T: Debug> OrderedCommitQueue<T> {
             tid,
             item = ?item,
         );
-        println!(
-            "{:?} put back waiting {:?}",
-            loom::thread::current().id(),
-            item,
-        );
-        assert_eq!(inside.wip_priority[tid], item.prio);
+        debug_assert_eq!(inside.wip_priority[tid], item.prio);
         inside.wip_priority[tid] = i64::MAX;
         inside.items_waiting.push(item);
     }
@@ -128,13 +122,12 @@ impl<T: Debug> OrderedCommitQueue<T> {
             tid,
             item = ?item,
         );
-        println!("{:?} finish work {:?}", loom::thread::current().id(), item);
 
-        assert_eq!(inside.wip_priority[tid], item.prio);
+        debug_assert_eq!(inside.wip_priority[tid], item.prio);
         inside.wip_priority[tid] = i64::MAX;
 
         let prev_commit_priority = self.commit_priority();
-        assert!(item.prio <= prev_commit_priority); // cannot be committing a higher-priority item, wtf?
+        debug_assert!(item.prio <= prev_commit_priority); // cannot be committing a higher-priority item, wtf?
 
         // the next priority has to be somewhere amongst these queues
         let waiting_highest_prio = inside
@@ -150,7 +143,7 @@ impl<T: Debug> OrderedCommitQueue<T> {
             waiting_highest_prio,
             i64::min(wip_highest_prio, not_started_highest_prio),
         );
-        assert!(next_highest_prio >= item.prio);
+        debug_assert!(next_highest_prio >= item.prio);
 
         self.commit_priority
             .store(next_highest_prio as usize, Ordering::Relaxed);
@@ -161,12 +154,6 @@ impl<T: Debug> OrderedCommitQueue<T> {
             item_priority = item.prio,
             finished_priority = prev_commit_priority,
             new_priority = next_highest_prio,
-        );
-        println!(
-            "{:?} finish last of prio {} now prio {}",
-            loom::thread::current().id(),
-            prev_commit_priority,
-            next_highest_prio,
         );
 
         if inside.items_not_started.len() == 0
@@ -197,18 +184,13 @@ impl<T: Debug> OrderedCommitQueue<T> {
             if let Some(item) = inside.items_waiting.peek() {
                 if item.prio <= self.commit_priority() {
                     let item = inside.items_waiting.pop().unwrap();
-                    inside.wip_priority[tid] = item.prio;
                     tracing::event!(
                         name: "ordered_commit_queue::get_some_work",
                         Level::TRACE,
                         work_type = "waiting to commit",
                         item = ?item,
                     );
-                    println!(
-                        "{:?} got some work (waiting to commit) {:?}",
-                        loom::thread::current().id(),
-                        item
-                    );
+                    inside.wip_priority[tid] = item.prio;
                     return Some(item);
                 }
             }
@@ -217,18 +199,13 @@ impl<T: Debug> OrderedCommitQueue<T> {
             // isn't allowed to commit yet (which means nothing else in there is either)
             // so we try to speculate something
             if let Some(item) = inside.items_not_started.pop() {
-                inside.wip_priority[tid] = item.prio;
                 tracing::event!(
                     name: "ordered_commit_queue::get_some_work",
                     Level::TRACE,
                     work_type = "lock grabbing",
                     item = ?item,
                 );
-                println!(
-                    "{:?} got some work (lock grabbing) {:?}",
-                    loom::thread::current().id(),
-                    item
-                );
+                inside.wip_priority[tid] = item.prio;
                 return Some(item);
             } else {
                 // there's no work to do right now
@@ -237,11 +214,6 @@ impl<T: Debug> OrderedCommitQueue<T> {
                     Level::TRACE,
                     "no work to do! blocking!"
                 );
-                println!(
-                    "{:?} no work to do! blocking!",
-                    loom::thread::current().id()
-                );
-
                 inside = self.wait_not_empty.wait(inside).unwrap();
             }
         }
