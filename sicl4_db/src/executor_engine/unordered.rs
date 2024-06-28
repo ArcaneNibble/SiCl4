@@ -88,7 +88,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
             .heap_thread_shard
             .allocate::<LockedObj<NetlistCell<'arena>>>();
         unsafe {
-            LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+            LockedObj::init_unordered(new.as_mut_ptr(), gen);
             let _ = NetlistCell::init(
                 (*new.as_mut_ptr()).payload.get(),
                 cell_type,
@@ -116,7 +116,7 @@ impl<'arena, 'q> NetlistView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
             .heap_thread_shard
             .allocate::<LockedObj<NetlistWire<'arena>>>();
         unsafe {
-            LockedObj::init(new.as_mut_ptr(), gen, 0x7f);
+            LockedObj::init_unordered(new.as_mut_ptr(), gen);
             let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get(), self.debug_id.get());
             self.debug_id.set(self.debug_id.get() + 1);
             let new_ref = ObjRef {

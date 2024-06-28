@@ -139,7 +139,8 @@ impl<'arena, 'work_item> StroadToWorkItemLink for WorkItemPerLockData<'arena, 'w
 
 #[derive(Debug)]
 pub struct WorkItem<'arena, 'work_item> {
-    pub seed_node: NetlistRef<'arena>,
+    seed_node: NetlistRef<'arena>,
+    prio: u64,
     // 00 = running the speculative RO phase (incl. running lock abandon)
     // 01 = finished lock abandon, is parked now
     // 10 = unpark was triggered, but parking wasn't finished
@@ -463,6 +464,87 @@ impl<'arena> NetlistManager<'arena> {
         self.stroad._debug_dump();
         self.in_use.set(false);
     }
+
+    pub fn run_ordered_algorithm<A: OrderedAlgorithm>(
+        &'arena self,
+        algo: &A,
+        queue: &ordered_commit_queue::OrderedCommitQueue<&'arena WorkItem<'arena, 'arena>>,
+        num_threads: usize,
+    ) {
+        assert!(num_threads <= ordered_commit_queue::MAX_THREADS);
+        assert!(!self.in_use.get());
+        self.in_use.set(true);
+
+        thread::scope(|s| {
+            for thread_i in 0..num_threads {
+                let heap_thread_shard = self.heap.new_thread();
+                let stroad = &self.stroad;
+                s.spawn(move || {
+                    let tracing_span =
+                        tracing::span!(Level::TRACE, "ordered_algo::thread", thread_i);
+                    let _span_enter = tracing_span.enter();
+
+                    let mut ro_view = OrderedAlgorithmROView {
+                        stroad,
+                        heap_thread_shard,
+                    };
+                    while let Some(work_item_with_prio) = queue.get_some_work(thread_i) {
+                        let ItemWithPriority {
+                            item: work_item,
+                            prio: work_prio,
+                        } = work_item_with_prio;
+                        let work_span = tracing::span!(
+                            Level::TRACE,
+                            "ordered_algo::thread::work_item",
+                            attempted_work.item = ?UsizePtr::from(work_item),
+                            attempted_work.prio = work_prio,
+                        );
+                        let _work_span_enter = work_span.enter();
+
+                        work_item.reset_state();
+                        let ro_ret = algo.try_process_readonly(&mut ro_view, work_item);
+                        if ro_ret.is_err() {
+                            tracing::event!(
+                                name: "ordered_algo::park",
+                                Level::TRACE,
+                                parked_work = ?UsizePtr::from(work_item)
+                            );
+
+                            todo!();
+                        }
+                        let ro_ret = ro_ret.unwrap();
+                        tracing::event!(
+                            name: "ordered_algo::ro_done",
+                            Level::TRACE,
+                            "RO phase completed successfully!"
+                        );
+
+                        let heap_thread_shard = {
+                            let mut rw_view = OrderedAlgorithmRWView {
+                                heap_thread_shard: ro_view.heap_thread_shard,
+                                queue,
+                                debug_id: Cell::new(0), // XXX totally fuckered
+                            };
+                            algo.process_finish_readwrite(&mut rw_view, work_item, ro_ret);
+                            rw_view.heap_thread_shard
+                        };
+                        tracing::event!(
+                            name: "ordered_algo::rw_done",
+                            Level::TRACE,
+                            "RW phase completed successfully!"
+                        );
+                        ro_view = OrderedAlgorithmROView {
+                            stroad,
+                            heap_thread_shard,
+                        };
+                    }
+                });
+            }
+        });
+
+        self.stroad._debug_dump();
+        self.in_use.set(false);
+    }
 }
 
 /// Separate cells/wires/work items into separate type bins
@@ -492,8 +574,10 @@ mod ordered;
 pub use ordered::*;
 
 mod unordered;
-use tracing::Level;
 pub use unordered::*;
+
+use ordered_commit_queue::ItemWithPriority;
+use tracing::Level;
 use uuid::Uuid;
 use work_queue::LocalQueue;
 

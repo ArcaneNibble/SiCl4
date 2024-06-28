@@ -51,6 +51,7 @@ impl<T> PartialOrd for ItemWithPriority<T> {
     }
 }
 
+#[derive(Debug)]
 struct QueueInnards<T> {
     /// priority of whatever's been handed out to each thread
     wip_priority: [i64; MAX_THREADS],
@@ -70,6 +71,7 @@ impl<T> QueueInnards<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct OrderedCommitQueue<T> {
     inside: Mutex<QueueInnards<T>>,
     wait_not_empty: Condvar,
