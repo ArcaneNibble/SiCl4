@@ -60,8 +60,9 @@ fn commit_queue_loom_smoke_test() {
                     );
                 }
 
-                done[item.prio as usize * ITEMS_AT_PRIORITY + item.item.idx]
-                    .store(true, Ordering::Relaxed);
+                let old_done = done[item.prio as usize * ITEMS_AT_PRIORITY + item.item.idx]
+                    .swap(true, Ordering::Relaxed);
+                assert!(!old_done);
 
                 q.finish_work(tid, item);
             } else {
