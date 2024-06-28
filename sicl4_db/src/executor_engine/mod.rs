@@ -443,6 +443,9 @@ impl<'arena, 'work_item> TypeMappable<NetlistTypeMapper> for WorkItem<'arena, 'w
 mod single_threaded;
 pub use single_threaded::*;
 
+mod ordered;
+pub use ordered::*;
+
 mod unordered;
 use tracing::Level;
 pub use unordered::*;
