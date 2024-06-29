@@ -43,8 +43,10 @@ use tracing::Level;
 
 use crate::allocator::*;
 use crate::loom_testing::*;
-use crate::stroad::*;
 use crate::util::UsizePtr;
+
+pub mod stroad;
+use stroad::*;
 
 const _: () = assert!(MAX_THREADS <= 126);
 /// Indicates that there is a valid object in this heap block (i.e. not a next pointer)
