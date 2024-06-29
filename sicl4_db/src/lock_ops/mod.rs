@@ -1,4 +1,4 @@
-//! Locks built on top of [crate::stroad]
+//! Locks built on top of [stroad]
 //!
 //! Locks contain an AtomicU64 fast path, bit packed as follows:
 //! - `bits[6:0]` = rwlock
@@ -36,7 +36,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::mem;
-use std::ptr::addr_of_mut;
+use std::ptr::{addr_of, addr_of_mut};
 use std::sync::atomic::Ordering;
 
 use tracing::Level;
@@ -115,7 +115,7 @@ pub struct ObjRef<'arena, T> {
     pub gen: u64,
 }
 impl<'arena, T> ObjRef<'arena, T> {
-    pub fn type_erase(self) -> TypeErasedObjRef<'arena> {
+    pub const fn type_erase(self) -> TypeErasedObjRef<'arena> {
         TypeErasedObjRef {
             // safety: repr(C) and we don't actually access the payload
             ptr: unsafe { mem::transmute(self.ptr) },
@@ -185,11 +185,9 @@ impl Default for LockState {
 pub struct LockAndStroadData<'arena, 'lock_inst, P> {
     /// State the lock is in
     pub(crate) state: Cell<LockState>,
-    /// Object that this lock is protecting / potentially accessing
-    pub(crate) p: TypeErasedObjRef<'arena>,
     /// Stroad module's state data
     // FIXME does this enforce too much invariance on lifetimes?
-    stroad_state: UnsafeCell<StroadNode<'lock_inst, TypeErasedObjRef<'arena>, P>>,
+    stroad_state: UnsafeCell<StroadNode<'lock_inst, 'arena, P>>,
     /// Prevent this type from being `Sync`, and
     /// ensure `'lock_inst` lifetime is invariant
     _pd1: PhantomData<UnsafeCell<&'lock_inst ()>>,
@@ -199,7 +197,6 @@ impl<'arena, 'lock_inst, P: Debug> Debug for LockAndStroadData<'arena, 'lock_ins
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut dbg = f.debug_struct("LockAndStroadData");
         dbg.field("state", &(self.state.get()));
-        dbg.field("p", &self.p);
         dbg.field("stroad_state", unsafe { &*self.stroad_state.get() });
         dbg.finish()
     }
@@ -212,8 +209,18 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         tracing::event!(Level::TRACE, lock_ptr = ?UsizePtr::from(self_), target.ptr = ?UsizePtr::from(obj.ptr), target.gen = obj.gen);
 
         (*self_).state = Cell::new(LockState::Unlocked);
-        (*self_).p = obj;
-        StroadNode::init((*self_).stroad_state.get());
+        StroadNode::init((*self_).stroad_state.get(), obj);
+    }
+
+    /// Object that this lock is protecting / potentially accessing
+    #[inline]
+    pub fn target(&'lock_inst self) -> TypeErasedObjRef<'arena> {
+        unsafe {
+            // safety: this value is never written again after init
+            let stroad_state = self.stroad_state.get();
+            let target = addr_of!((*stroad_state).key);
+            target.read()
+        }
     }
 
     /// Ugly get access to the work item link stored inside, so that it can be init-ed
@@ -228,11 +235,13 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// where the bool indicates whether or not the locking was successful.
     pub fn unordered_try_write<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
     ) -> Result<bool, ()> {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unordered_try_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
         tracing::event!(Level::TRACE, "lock");
+
+        let p = self.target();
 
         assert!(self.state.get() == LockState::Unlocked);
         let mut lock_inst = unsafe {
@@ -248,11 +257,11 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
 
         'batch_of_spins: loop {
             let mut spins = 0;
-            let mut old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
+            let mut old_atomic_val = p.ptr.lock_and_generation.load(Ordering::Relaxed);
             'one_spin: loop {
                 if spins == SPIN_LIMIT {
                     // try to set the "maybe has parked" bit, but spurious failures are ??? FIXME
-                    let _ = self.p.ptr.lock_and_generation.compare_exchange_weak(
+                    let _ = p.ptr.lock_and_generation.compare_exchange_weak(
                         old_atomic_val,
                         old_atomic_val | LOCK_GEN_MAYBE_PARKED_BIT,
                         Ordering::Relaxed,
@@ -260,8 +269,8 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     );
 
                     // park us
-                    match stroad.unordered_park_conditionally(lock_inst, self.p, || {
-                        let lock_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
+                    match stroad.unordered_park_conditionally(lock_inst, || {
+                        let lock_val = p.ptr.lock_and_generation.load(Ordering::Relaxed);
                         // park as long as object didn't get invalidated,
                         // and lock is still not available for us,
                         // and the "maybe has parked" bit is still set
@@ -269,7 +278,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                             // object invalidated (gone, deleted)
                             return false;
                         }
-                        if lock_gen_gen(lock_val) != self.p.gen {
+                        if lock_gen_gen(lock_val) != p.gen {
                             // object invalidated (gone, deleted)
                             return false;
                         }
@@ -298,7 +307,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     // object invalidated (gone, deleted)
                     return Err(());
                 }
-                if lock_gen_gen(old_atomic_val) != self.p.gen {
+                if lock_gen_gen(old_atomic_val) != p.gen {
                     // object invalidated (gone, deleted)
                     return Err(());
                 }
@@ -309,13 +318,13 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     } else {
                         spins += 1;
                     }
-                    old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
+                    old_atomic_val = p.ptr.lock_and_generation.load(Ordering::Relaxed);
                     spin_hint();
                     continue 'one_spin;
                 }
                 // lock available!
                 let new_atomic_val = old_atomic_val | 0x7f;
-                match self.p.ptr.lock_and_generation.compare_exchange_weak(
+                match p.ptr.lock_and_generation.compare_exchange_weak(
                     old_atomic_val,
                     new_atomic_val,
                     Ordering::Acquire,
@@ -344,11 +353,13 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// where the bool indicates whether or not the locking was successful.
     pub fn unordered_try_read<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
     ) -> Result<bool, ()> {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unordered_try_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
         tracing::event!(Level::TRACE, "lock");
+
+        let p = self.target();
 
         assert!(self.state.get() == LockState::Unlocked);
         let mut lock_inst = unsafe {
@@ -359,11 +370,11 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
 
         'batch_of_spins: loop {
             let mut spins = 0;
-            let mut old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
+            let mut old_atomic_val = p.ptr.lock_and_generation.load(Ordering::Relaxed);
             'one_spin: loop {
                 if spins == SPIN_LIMIT {
                     // try to set the "maybe has parked" bit, but spurious failures are ??? FIXME
-                    let _ = self.p.ptr.lock_and_generation.compare_exchange_weak(
+                    let _ = p.ptr.lock_and_generation.compare_exchange_weak(
                         old_atomic_val,
                         old_atomic_val | LOCK_GEN_MAYBE_PARKED_BIT,
                         Ordering::Relaxed,
@@ -371,8 +382,8 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     );
 
                     // park us
-                    match stroad.unordered_park_conditionally(lock_inst, self.p, || {
-                        let lock_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
+                    match stroad.unordered_park_conditionally(lock_inst, || {
+                        let lock_val = p.ptr.lock_and_generation.load(Ordering::Relaxed);
                         // park as long as object didn't get invalidated,
                         // and lock is still not available for us,
                         // and the "maybe has parked" bit is still set
@@ -380,7 +391,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                             // object invalidated (gone, deleted)
                             return false;
                         }
-                        if lock_gen_gen(lock_val) != self.p.gen {
+                        if lock_gen_gen(lock_val) != p.gen {
                             // object invalidated (gone, deleted)
                             return false;
                         }
@@ -409,7 +420,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     // object invalidated (gone, deleted)
                     return Err(());
                 }
-                if lock_gen_gen(old_atomic_val) != self.p.gen {
+                if lock_gen_gen(old_atomic_val) != p.gen {
                     // object invalidated (gone, deleted)
                     return Err(());
                 }
@@ -420,13 +431,13 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     } else {
                         spins += 1;
                     }
-                    old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
+                    old_atomic_val = p.ptr.lock_and_generation.load(Ordering::Relaxed);
                     spin_hint();
                     continue 'one_spin;
                 }
                 // lock available!
                 let new_atomic_val = old_atomic_val + 1;
-                match self.p.ptr.lock_and_generation.compare_exchange_weak(
+                match p.ptr.lock_and_generation.compare_exchange_weak(
                     old_atomic_val,
                     new_atomic_val,
                     Ordering::Acquire,
@@ -461,12 +472,14 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// where the bool indicates whether or not the locking was successful.
     pub fn ordered_try_write<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
         prio: u64,
     ) -> Result<bool, ()> {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
         tracing::event!(Level::TRACE, "lock");
+
+        let p = self.target();
 
         assert!(self.state.get() == LockState::Unlocked);
         let lock_inst = unsafe {
@@ -478,12 +491,12 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         debug_assert!(prio <= i64::MAX as u64);
         let prio = -(prio as i64) - 1;
 
-        let old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
+        let old_atomic_val = p.ptr.lock_and_generation.load(Ordering::Relaxed);
         if !lock_gen_valid(old_atomic_val) {
             // object invalidated (gone, deleted)
             return Err(());
         }
-        if lock_gen_gen(old_atomic_val) != self.p.gen {
+        if lock_gen_gen(old_atomic_val) != p.gen {
             // object invalidated (gone, deleted)
             return Err(());
         }
@@ -492,10 +505,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         // xxx is this right?
 
         // object exists, try to lock it
-        let (locked, _) = stroad.ordered_do_locking(lock_inst, self.p, prio, || {
+        let (locked, _) = stroad.ordered_do_locking(lock_inst, prio, || {
             // here the bucket lock is held, so we indirectly have exclusive access to the
             // object we are trying to lock, which means that we can manipulate this counter
-            let num_rw = self.p.ptr.num_rw.get();
+            let num_rw = p.ptr.num_rw.get();
             unsafe {
                 *num_rw |= 0x8000000000000000;
             }
@@ -519,12 +532,14 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// where the bool indicates whether or not the locking was successful.
     pub fn ordered_try_read<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
         prio: u64,
     ) -> Result<bool, ()> {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
         tracing::event!(Level::TRACE, "lock");
+
+        let p = self.target();
 
         assert!(self.state.get() == LockState::Unlocked);
         let lock_inst = unsafe {
@@ -536,12 +551,12 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         debug_assert!(prio <= i64::MAX as u64);
         let prio = prio as i64;
 
-        let old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
+        let old_atomic_val = p.ptr.lock_and_generation.load(Ordering::Relaxed);
         if !lock_gen_valid(old_atomic_val) {
             // object invalidated (gone, deleted)
             return Err(());
         }
-        if lock_gen_gen(old_atomic_val) != self.p.gen {
+        if lock_gen_gen(old_atomic_val) != p.gen {
             // object invalidated (gone, deleted)
             return Err(());
         }
@@ -550,10 +565,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         // xxx is this right?
 
         // object exists, try to lock it
-        let (locked, _) = stroad.ordered_do_locking(lock_inst, self.p, prio, || {
+        let (locked, _) = stroad.ordered_do_locking(lock_inst, prio, || {
             // here the bucket lock is held, so we indirectly have exclusive access to the
             // object we are trying to lock, which means that we can manipulate this counter
-            let num_rw = self.p.ptr.num_rw.get();
+            let num_rw = p.ptr.num_rw.get();
             unsafe {
                 let old_num_rw = *num_rw;
                 *num_rw =
@@ -581,7 +596,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// * you can only call this when no references to the protected data exist
     pub unsafe fn unlock<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
         match self.state.get() {
@@ -603,29 +618,30 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// Always unparks everything
     fn unlock_unordered_write<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
         tracing::event!(Level::TRACE, "unlock");
 
+        let p = self.target();
+
         // we have exclusive access
         // we need to push out all previous memory accesses
         // and establish synchronizes-with trying to get access
-        let old_atomic_val = self
-            .p
+        let old_atomic_val = p
             .ptr
             .lock_and_generation
             .fetch_and(!0xff, Ordering::Release);
         // note that we cleared *both* the rwlock and "maybe has parked" bits
 
         debug_assert!(lock_gen_valid(old_atomic_val));
-        debug_assert_eq!(lock_gen_gen(old_atomic_val), self.p.gen);
+        debug_assert_eq!(lock_gen_gen(old_atomic_val), p.gen);
         debug_assert_eq!(lock_gen_rwlock(old_atomic_val), 0x7f);
 
         if lock_gen_maybe_parked(old_atomic_val) {
-            stroad.unordered_unpark_all(&self.p, unpark_xtra);
+            stroad.unordered_unpark_all(p, unpark_xtra);
         }
 
         self.state.set(LockState::Unlocked);
@@ -636,17 +652,19 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// Unparks if we are the final reader
     fn unlock_unordered_read<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
         tracing::event!(Level::TRACE, "unlock");
 
-        let mut old_atomic_val = self.p.ptr.lock_and_generation.load(Ordering::Relaxed);
+        let p = self.target();
+
+        let mut old_atomic_val = p.ptr.lock_and_generation.load(Ordering::Relaxed);
         loop {
             debug_assert!(lock_gen_valid(old_atomic_val));
-            debug_assert_eq!(lock_gen_gen(old_atomic_val), self.p.gen);
+            debug_assert_eq!(lock_gen_gen(old_atomic_val), p.gen);
             debug_assert_ne!(lock_gen_rwlock(old_atomic_val), 0x7f);
             debug_assert_ne!(lock_gen_rwlock(old_atomic_val), 0);
             let mut new_atomic_val = old_atomic_val - 1;
@@ -656,7 +674,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
             // ordering: in order to prevent reads to data from moving
             // after this atomic update, we *still* need release ordering
             // (even though no data is modified)
-            match self.p.ptr.lock_and_generation.compare_exchange_weak(
+            match p.ptr.lock_and_generation.compare_exchange_weak(
                 old_atomic_val,
                 new_atomic_val,
                 Ordering::Release,
@@ -666,7 +684,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     if lock_gen_rwlock(old_atomic_val) == 1 && lock_gen_maybe_parked(old_atomic_val)
                     {
                         // fixme can we optimize this?
-                        stroad.unordered_unpark_all(&self.p, unpark_xtra);
+                        stroad.unordered_unpark_all(p, unpark_xtra);
                     }
                     break;
                 }
@@ -682,12 +700,14 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// Always unparks everything
     fn unlock_ordered_write<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
         tracing::event!(Level::TRACE, "unlock");
+
+        let p = self.target();
 
         let lock_inst = unsafe {
             // safety: this can only be called when we hold the lock
@@ -701,7 +721,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
             || {
                 // here we clearing this flag
                 // and bucket lock is still held
-                let num_rw = self.p.ptr.num_rw.get();
+                let num_rw = p.ptr.num_rw.get();
                 unsafe {
                     *num_rw &= !0x8000000000000000;
                 }
@@ -717,12 +737,14 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// Unparks if we are the final reader *and* there isn't a writer
     fn unlock_ordered_read<'stroad>(
         &'lock_inst self,
-        stroad: &'stroad Stroad<'lock_inst, TypeErasedObjRef<'arena>, P>,
+        stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
         unpark_xtra: &mut P::UnparkXtraTy,
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
         tracing::event!(Level::TRACE, "unlock");
+
+        let p = self.target();
 
         let lock_inst = unsafe {
             // safety: this can only be called when we hold the lock
@@ -733,12 +755,12 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         stroad.ordered_do_unlocking(
             lock_inst,
             || {
-                let num_rw = self.p.ptr.num_rw.get();
+                let num_rw = p.ptr.num_rw.get();
                 // check if we are the last reader, and that there is no writer
                 unsafe { *num_rw == 1 }
             },
             || {
-                let num_rw = self.p.ptr.num_rw.get();
+                let num_rw = p.ptr.num_rw.get();
                 unsafe {
                     let old_num_rw = *num_rw;
                     *num_rw =

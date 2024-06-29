@@ -1,4 +1,6 @@
-use std::mem::{self, size_of};
+use std::mem::{self, size_of, MaybeUninit};
+
+use crate::lock_ops::*;
 
 use super::*;
 
@@ -20,13 +22,45 @@ impl StroadToWorkItemLink for StroadTestingPayload {
 }
 
 #[cfg(not(loom))]
+static DUMMY_OBJ_0: LockedObj<()> = LockedObj {
+    lock_and_generation: AtomicU64::new(LOCK_GEN_VALID_BIT),
+    num_rw: UnsafeCell::new(0),
+    payload: UnsafeCell::new(()),
+};
+#[cfg(not(loom))]
+static DUMMY_OBJ_0_REF: TypeErasedObjRef = ObjRef {
+    ptr: &DUMMY_OBJ_0,
+    gen: 0,
+}
+.type_erase();
+#[cfg(not(loom))]
+static DUMMY_OBJ_1: LockedObj<()> = LockedObj {
+    lock_and_generation: AtomicU64::new(LOCK_GEN_VALID_BIT),
+    num_rw: UnsafeCell::new(0),
+    payload: UnsafeCell::new(()),
+};
+#[cfg(not(loom))]
+static DUMMY_OBJ_1_REF: TypeErasedObjRef = ObjRef {
+    ptr: &DUMMY_OBJ_1,
+    gen: 0,
+}
+.type_erase();
+
+#[cfg(not(loom))]
 #[test]
 fn stroad_lock_held_during_validation() {
-    let mut list_ent = StroadNode::<u32, StroadTestingPayload>::default();
-    let stroad = Stroad::<u32, StroadTestingPayload>::new();
-    let hash = hash(&12345);
+    let mut list_ent = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let stroad = Stroad::<StroadTestingPayload>::new();
+    let hash = hash(DUMMY_OBJ_0_REF);
     let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
-    let _ = stroad.unordered_park_conditionally(&mut list_ent, 12345, || unsafe {
+    let _ = stroad.unordered_park_conditionally(&mut list_ent, || unsafe {
         println!("validation callback");
         let ptr = (*stroad.shards[shard as usize].get())
             .buckets_and_lock
@@ -45,19 +79,24 @@ fn stroad_lock_held_during_validation() {
     }
 }
 
+#[cfg(not(loom))]
 #[test]
 #[ignore = "not automated, human eye verified"]
 fn stroad_manual_tests() {
-    println!(
-        "size {}",
-        mem::size_of::<Stroad<u32, StroadTestingPayload>>()
-    );
-    let list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
+    println!("size {}", mem::size_of::<Stroad<StroadTestingPayload>>());
+    let list_ent_0 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
     dbg!(&list_ent_0);
-    dbg!(size_of::<StroadNode<u32, StroadTestingPayload>>());
-    dbg!(size_of::<StroadShard<u32, StroadTestingPayload>>());
+    dbg!(size_of::<StroadNode<StroadTestingPayload>>());
+    dbg!(size_of::<StroadShard<StroadTestingPayload>>());
     let x = UnsafeCell::new(list_ent_0);
-    let x = StroadBucket::<u32, StroadTestingPayload> {
+    let x = StroadBucket::<StroadTestingPayload> {
         wants_lock: DoubleLL {
             next: Some(&x),
             prev: Some(&x),
@@ -68,30 +107,58 @@ fn stroad_manual_tests() {
         },
     };
     dbg!(&x);
-    let x = Stroad::<u32, StroadTestingPayload>::new();
-    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
-    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
-    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
-    let _ = x.unordered_park_conditionally(&mut list_ent_0, 12345, || true);
-    let _ = x.unordered_park_conditionally(&mut list_ent_1, 12345, || true);
-    let _ = x.unordered_park_conditionally(&mut list_ent_2, 67890, || true);
+    let x = Stroad::<StroadTestingPayload>::new();
+    let mut list_ent_0 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let mut list_ent_1 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let mut list_ent_2 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_1_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let _ = x.unordered_park_conditionally(&mut list_ent_0, || true);
+    let _ = x.unordered_park_conditionally(&mut list_ent_1, || true);
+    let _ = x.unordered_park_conditionally(&mut list_ent_2, || true);
     dbg!(&x);
-    dbg!(x.lock_shard(19245));
-    dbg!(x.lock_shard(19994));
+    dbg!(x.lock_shard((hash(DUMMY_OBJ_0_REF) & (HASH_NUM_SHARDS as u64 - 1)) as usize));
+    dbg!(x.lock_shard((hash(DUMMY_OBJ_1_REF) & (HASH_NUM_SHARDS as u64 - 1)) as usize));
 }
 
 #[cfg(not(loom))]
 #[test]
 fn stroad_park_one() {
-    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
-    let stroad = Stroad::<u32, StroadTestingPayload>::new();
+    let mut list_ent_0 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<StroadTestingPayload>;
+    let stroad = Stroad::<StroadTestingPayload>::new();
 
-    let hash = hash(&12345);
+    let hash = hash(DUMMY_OBJ_0_REF);
     let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
     let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 1;
 
-    let _ = stroad.unordered_park_conditionally(&mut list_ent_0, 12345, || true);
+    let _ = stroad.unordered_park_conditionally(&mut list_ent_0, || true);
 
     unsafe {
         let shard_data = &*stroad.shards[shard as usize].get();
@@ -99,7 +166,7 @@ fn stroad_park_one() {
         assert_eq!(shard_data.nents, 1);
         let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
         assert_ne!(ptr, 0);
-        let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+        let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
         let ptr_i = &*(ptr.add(bucket as usize));
         assert_eq!(
             ptr_i.wants_lock.next.unwrap().get() as *const _,
@@ -112,24 +179,38 @@ fn stroad_park_one() {
 
         assert!((*list_ent_0_ptr).link.next.is_none());
         assert!((*list_ent_0_ptr).link.prev.is_none());
-        assert_eq!((*list_ent_0_ptr).key.unwrap(), 12345);
+        assert_eq!((*list_ent_0_ptr).key, DUMMY_OBJ_0_REF);
     }
 }
 
 #[cfg(not(loom))]
 #[test]
 fn stroad_unpark_all() {
-    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_0 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_1 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
-    let stroad = Stroad::<u32, StroadTestingPayload>::new();
+    let stroad = Stroad::<StroadTestingPayload>::new();
 
-    let _ = stroad.unordered_park_conditionally(&mut list_ent_0, 12345, || true);
-    let _ = stroad.unordered_park_conditionally(&mut list_ent_1, 12345, || true);
-    stroad.unordered_unpark_all(&12345, &mut ());
+    let _ = stroad.unordered_park_conditionally(&mut list_ent_0, || true);
+    let _ = stroad.unordered_park_conditionally(&mut list_ent_1, || true);
+    stroad.unordered_unpark_all(DUMMY_OBJ_0_REF, &mut ());
 
     unsafe {
         assert!((*list_ent_0_ptr)
@@ -142,7 +223,7 @@ fn stroad_unpark_all() {
             .load(Ordering::Relaxed));
     }
 
-    let hash = hash(&12345);
+    let hash = hash(DUMMY_OBJ_0_REF);
     let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
     let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 1;
     unsafe {
@@ -151,7 +232,7 @@ fn stroad_unpark_all() {
         assert_eq!(shard_data.nents, 0);
         let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
         assert_ne!(ptr, 0);
-        let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+        let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
         let ptr_i = &*(ptr.add(bucket as usize));
         assert!(ptr_i.wants_lock.next.is_none());
         assert!(ptr_i.wants_lock.prev.is_none());
@@ -161,18 +242,32 @@ fn stroad_unpark_all() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_park_two_separate_buckets() {
-    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_0 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_1 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_1_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
-    let stroad = Stroad::<u32, StroadTestingPayload>::new();
-    let _ = stroad.unordered_park_conditionally(&mut list_ent_0, 12345, || true);
-    let _ = stroad.unordered_park_conditionally(&mut list_ent_1, 67890, || true);
+    let stroad = Stroad::<StroadTestingPayload>::new();
+    let _ = stroad.unordered_park_conditionally(&mut list_ent_0, || true);
+    let _ = stroad.unordered_park_conditionally(&mut list_ent_1, || true);
 
     {
-        let hash = hash(&12345);
+        let hash = hash(DUMMY_OBJ_0_REF);
         let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
         let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 1;
 
@@ -182,7 +277,7 @@ fn stroad_park_two_separate_buckets() {
             assert_eq!(shard_data.nents, 1);
             let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
             assert_ne!(ptr, 0);
-            let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+            let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
             let ptr_i = &*(ptr.add(bucket as usize));
             assert_eq!(
                 ptr_i.wants_lock.next.unwrap().get() as *const _,
@@ -195,11 +290,11 @@ fn stroad_park_two_separate_buckets() {
 
             assert!((*list_ent_0_ptr).link.next.is_none());
             assert!((*list_ent_0_ptr).link.prev.is_none());
-            assert_eq!((*list_ent_0_ptr).key.unwrap(), 12345);
+            assert_eq!((*list_ent_0_ptr).key, DUMMY_OBJ_0_REF);
         }
     }
     {
-        let hash = hash(&67890);
+        let hash = hash(DUMMY_OBJ_1_REF);
         let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
         let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 1;
 
@@ -209,7 +304,7 @@ fn stroad_park_two_separate_buckets() {
             assert_eq!(shard_data.nents, 1);
             let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
             assert_ne!(ptr, 0);
-            let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+            let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
             let ptr_i = &*(ptr.add(bucket as usize));
             assert_eq!(
                 ptr_i.wants_lock.next.unwrap().get() as *const _,
@@ -222,7 +317,7 @@ fn stroad_park_two_separate_buckets() {
 
             assert!((*list_ent_1_ptr).link.next.is_none());
             assert!((*list_ent_1_ptr).link.prev.is_none());
-            assert_eq!((*list_ent_1_ptr).key.unwrap(), 67890);
+            assert_eq!((*list_ent_1_ptr).key, DUMMY_OBJ_1_REF);
         }
     }
 }
@@ -230,22 +325,43 @@ fn stroad_park_two_separate_buckets() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_park_many_same() {
-    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_0 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_1 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_2 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     dbg!(list_ent_2_ptr);
-    let stroad = Stroad::<u32, StroadTestingPayload>::new();
+    let stroad = Stroad::<StroadTestingPayload>::new();
 
-    let _ = stroad.unordered_park_conditionally(&mut list_ent_0, 12345, || true);
-    let _ = stroad.unordered_park_conditionally(&mut list_ent_1, 12345, || true);
+    let _ = stroad.unordered_park_conditionally(&mut list_ent_0, || true);
+    let _ = stroad.unordered_park_conditionally(&mut list_ent_1, || true);
 
     {
-        let hash = hash(&12345);
+        let hash = hash(DUMMY_OBJ_0_REF);
         let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
         let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 0b11;
 
@@ -256,7 +372,7 @@ fn stroad_park_many_same() {
             let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
             assert_ne!(ptr, 0);
 
-            let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+            let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
             let ptr_i = &*(ptr.add(bucket as usize));
             assert_eq!(
                 ptr_i.wants_lock.next.unwrap().get() as *const _,
@@ -281,10 +397,10 @@ fn stroad_park_many_same() {
         }
     }
 
-    let _ = stroad.unordered_park_conditionally(&mut list_ent_2, 12345, || true);
+    let _ = stroad.unordered_park_conditionally(&mut list_ent_2, || true);
 
     {
-        let hash = hash(&12345);
+        let hash = hash(DUMMY_OBJ_0_REF);
         let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
         let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 0b111;
 
@@ -295,7 +411,7 @@ fn stroad_park_many_same() {
             let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
             assert_ne!(ptr, 0);
 
-            let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+            let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
             let ptr_i = &*(ptr.add(bucket as usize));
             assert_eq!(
                 ptr_i.wants_lock.next.unwrap().get() as *const _,
@@ -333,24 +449,87 @@ fn stroad_park_many_same() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_priority_locking() {
-    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_3 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_3_ptr = &list_ent_3 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_4 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_4_ptr = &list_ent_4 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_5 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_5_ptr = &list_ent_5 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_6 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_6_ptr = &list_ent_6 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_7 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_7_ptr = &list_ent_7 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_8 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_8_ptr = &list_ent_8 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_0 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_1 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_2 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_3 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_3_ptr = &list_ent_3 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_4 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_4_ptr = &list_ent_4 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_5 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_5_ptr = &list_ent_5 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_6 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_6_ptr = &list_ent_6 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_7 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_7_ptr = &list_ent_7 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_8 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_8_ptr = &list_ent_8 as *const StroadNode<StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     dbg!(list_ent_2_ptr);
@@ -360,36 +539,36 @@ fn stroad_priority_locking() {
     dbg!(list_ent_6_ptr);
     dbg!(list_ent_7_ptr);
     dbg!(list_ent_8_ptr);
-    let stroad = Stroad::<u32, StroadTestingPayload>::new();
+    let stroad = Stroad::<StroadTestingPayload>::new();
 
     // some readers
     println!("* ent 0");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 12345, 0, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 0, || {});
     assert!(ret);
     println!("* ent 1");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 12345, 1, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 1, || {});
     assert!(ret);
 
     // failed writers
     println!("* ent 2");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, 12345, -2, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, -2, || {});
     assert!(!ret);
     println!("* ent 3");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, 12345, -1, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, -1, || {});
     assert!(!ret);
 
     // success writer
     println!("* ent 4");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, 12345, -10, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, -10, || {});
     assert!(ret);
 
     // fail writer
     println!("* ent 5");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_5, 12345, -11, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_5, -11, || {});
     assert!(!ret);
     // success writer, cancel _ent_4
     println!("* ent 6");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_6, 12345, -9, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_6, -9, || {});
     assert!(ret);
     unsafe {
         assert!((*list_ent_4_ptr)
@@ -400,18 +579,18 @@ fn stroad_priority_locking() {
 
     // fail reader
     println!("* ent 7");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_7, 12345, 8, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_7, 8, || {});
     assert!(!ret);
     // success reader
     println!("* ent 8");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_8, 12345, 7, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_8, 7, || {});
     assert!(ret);
 
     // test the lists
     {
-        let hash = hash(&12345);
+        let hash = hash(DUMMY_OBJ_0_REF);
         let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
-        let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 0b111;
+        let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 0b1111;
 
         unsafe {
             let shard_data = &*stroad.shards[shard as usize].get();
@@ -420,7 +599,7 @@ fn stroad_priority_locking() {
             let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
             assert_ne!(ptr, 0);
 
-            let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+            let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
             let ptr_i = &*(ptr.add(bucket as usize));
 
             // holds lock list
@@ -509,40 +688,75 @@ fn stroad_priority_locking() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_writer_canceling_readers() {
-    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_3 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_3_ptr = &list_ent_3 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_4 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_4_ptr = &list_ent_4 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_0 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_1 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_2 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_3 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_3_ptr = &list_ent_3 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_4 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_4_ptr = &list_ent_4 as *const StroadNode<StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     dbg!(list_ent_2_ptr);
     dbg!(list_ent_3_ptr);
     dbg!(list_ent_4_ptr);
-    let stroad = Stroad::<u32, StroadTestingPayload>::new();
+    let stroad = Stroad::<StroadTestingPayload>::new();
 
     // some readers, spaced out
     println!("* ent 0");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 12345, 1, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 1, || {});
     assert!(ret);
     println!("* ent 1");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 12345, 3, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 3, || {});
     assert!(ret);
     println!("* ent 2");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, 12345, 5, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, 5, || {});
     assert!(ret);
     println!("* ent 3");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, 12345, 7, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, 7, || {});
     assert!(ret);
 
     // success writer, cancel _ent_2 and _ent 3
     println!("* ent 4");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, 12345, -5, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, -5, || {});
     assert!(ret);
     unsafe {
         assert!((*list_ent_3_ptr)
@@ -557,7 +771,7 @@ fn stroad_writer_canceling_readers() {
 
     // test the lists
     {
-        let hash = hash(&12345);
+        let hash = hash(DUMMY_OBJ_0_REF);
         let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
         let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 0b111;
 
@@ -568,7 +782,7 @@ fn stroad_writer_canceling_readers() {
             let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
             assert_ne!(ptr, 0);
 
-            let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+            let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
             let ptr_i = &*(ptr.add(bucket as usize));
 
             // holds lock list
@@ -612,20 +826,69 @@ fn stroad_writer_canceling_readers() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_priority_unlocking() {
-    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_3 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_3_ptr = &list_ent_3 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_4 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_4_ptr = &list_ent_4 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_5 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_5_ptr = &list_ent_5 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_6 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_6_ptr = &list_ent_6 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_0 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_1 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_2 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_3 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_3_ptr = &list_ent_3 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_4 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_4_ptr = &list_ent_4 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_5 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_5_ptr = &list_ent_5 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_6 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_6_ptr = &list_ent_6 as *const StroadNode<StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     dbg!(list_ent_2_ptr);
@@ -633,28 +896,28 @@ fn stroad_priority_unlocking() {
     dbg!(list_ent_4_ptr);
     dbg!(list_ent_5_ptr);
     dbg!(list_ent_6_ptr);
-    let stroad = Stroad::<u32, StroadTestingPayload>::new();
+    let stroad = Stroad::<StroadTestingPayload>::new();
 
     println!("* ent 0");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 12345, 0, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 0, || {});
     assert!(ret);
     println!("* ent 1");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 12345, 1, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 1, || {});
     assert!(ret);
     println!("* ent 2");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, 12345, -3, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, -3, || {});
     assert!(ret);
     println!("* ent 3");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, 12345, 3, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, 3, || {});
     assert!(!ret);
     println!("* ent 4");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, 12345, 4, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, 4, || {});
     assert!(!ret);
     println!("* ent 5");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_5, 12345, -5, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_5, -5, || {});
     assert!(!ret);
     println!("* ent 6");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_6, 12345, -5, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_6, -5, || {});
     assert!(!ret);
 
     // ent 2 will cause an unlock (as a writer)
@@ -700,25 +963,46 @@ fn stroad_priority_unlocking() {
 #[cfg(not(loom))]
 #[test]
 fn stroad_writers_dont_cancel_if_conflict() {
-    let mut list_ent_0 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_1 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
-    let mut list_ent_2 = StroadNode::<u32, StroadTestingPayload>::default();
-    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<u32, StroadTestingPayload>;
+    let mut list_ent_0 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_0_ptr = &list_ent_0 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_1 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_1_ptr = &list_ent_1 as *const StroadNode<StroadTestingPayload>;
+    let mut list_ent_2 = {
+        let mut x = MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit();
+        unsafe {
+            StroadNode::init(x.as_mut_ptr(), DUMMY_OBJ_0_REF);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init()
+        }
+    };
+    let list_ent_2_ptr = &list_ent_2 as *const StroadNode<StroadTestingPayload>;
     dbg!(list_ent_0_ptr);
     dbg!(list_ent_1_ptr);
     dbg!(list_ent_2_ptr);
-    let stroad = Stroad::<u32, StroadTestingPayload>::new();
+    let stroad = Stroad::<StroadTestingPayload>::new();
 
     println!("* ent 0");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 12345, 0, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 0, || {});
     assert!(ret);
     println!("* ent 1");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 12345, -2, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, -2, || {});
     assert!(ret);
     println!("* ent 2");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, 12345, -1, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, -1, || {});
     assert!(!ret); // won't work, conflicts with the reader
 
     unsafe {
@@ -737,25 +1021,51 @@ fn stroad_writers_dont_cancel_if_conflict() {
 #[cfg(loom)]
 fn stroad_loom_concurrent_park() {
     loom::model(|| {
-        let list_ent_0 = Box::leak(Box::new(StroadNode::<u32, StroadTestingPayload>::default()));
-        let list_ent_0_ptr = list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
-        let list_ent_1 = Box::leak(Box::new(StroadNode::<u32, StroadTestingPayload>::default()));
-        let list_ent_1_ptr = list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
-        let stroad = &*Box::leak(Stroad::<u32, StroadTestingPayload>::new());
+        let loom_dummy_obj = Box::leak(Box::new(LockedObj {
+            lock_and_generation: AtomicU64::new(LOCK_GEN_VALID_BIT),
+            num_rw: UnsafeCell::new(0),
+            payload: UnsafeCell::new(()),
+        }));
+        let loom_dummy_obj_ref: TypeErasedObjRef = ObjRef {
+            ptr: loom_dummy_obj,
+            gen: 0,
+        }
+        .type_erase();
+
+        let list_ent_0 = unsafe {
+            let x = Box::leak(Box::new(
+                MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit(),
+            ));
+            StroadNode::init(x.as_mut_ptr(), loom_dummy_obj_ref);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init_mut()
+        };
+        let list_ent_0_ptr = list_ent_0 as *const StroadNode<StroadTestingPayload>;
+        let list_ent_1 = unsafe {
+            let x = Box::leak(Box::new(
+                MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit(),
+            ));
+            StroadNode::init(x.as_mut_ptr(), loom_dummy_obj_ref);
+
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init_mut()
+        };
+        let list_ent_1_ptr = list_ent_1 as *const StroadNode<StroadTestingPayload>;
+        let stroad = &*Box::leak(Stroad::<StroadTestingPayload>::new());
 
         let t1 = loom::thread::spawn(move || {
-            let _ = stroad.unordered_park_conditionally(list_ent_0, 12345, || true);
+            let _ = stroad.unordered_park_conditionally(list_ent_0, || true);
         });
         let t2 = loom::thread::spawn(move || {
-            let _ = stroad.unordered_park_conditionally(list_ent_1, 12345, || true);
+            let _ = stroad.unordered_park_conditionally(list_ent_1, || true);
         });
         t1.join().unwrap();
         t2.join().unwrap();
 
         {
-            let hash = hash(&12345);
+            let hash = hash(loom_dummy_obj_ref);
             let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
-            let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 1;
+            let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 0b11;
 
             unsafe {
                 let shard_data = &*stroad.shards[shard as usize].get();
@@ -763,7 +1073,7 @@ fn stroad_loom_concurrent_park() {
                 assert_eq!(shard_data.nents, 2);
                 let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
                 assert_ne!(ptr, 0);
-                let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+                let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
                 let ptr_i = &*(ptr.add(bucket as usize));
 
                 if ptr_i.wants_lock.next.unwrap().get() as *const _ == list_ent_0_ptr {
@@ -781,14 +1091,14 @@ fn stroad_loom_concurrent_park() {
                         list_ent_1_ptr
                     );
                     assert!((*list_ent_0_ptr).link.prev.is_none());
-                    assert_eq!((*list_ent_0_ptr).key.unwrap(), 12345);
+                    assert_eq!((*list_ent_0_ptr).key, loom_dummy_obj_ref);
 
                     assert!((*list_ent_1_ptr).link.next.is_none());
                     assert_eq!(
                         (*list_ent_1_ptr).link.prev.unwrap().get() as *const _,
                         list_ent_0_ptr
                     );
-                    assert_eq!((*list_ent_1_ptr).key.unwrap(), 12345);
+                    assert_eq!((*list_ent_1_ptr).key, loom_dummy_obj_ref);
                 } else if ptr_i.wants_lock.next.unwrap().get() as *const _ == list_ent_1_ptr {
                     assert_eq!(
                         ptr_i.wants_lock.next.unwrap().get() as *const _,
@@ -804,14 +1114,14 @@ fn stroad_loom_concurrent_park() {
                         list_ent_0_ptr
                     );
                     assert!((*list_ent_1_ptr).link.prev.is_none());
-                    assert_eq!((*list_ent_1_ptr).key.unwrap(), 12345);
+                    assert_eq!((*list_ent_1_ptr).key, loom_dummy_obj_ref);
 
                     assert!((*list_ent_0_ptr).link.next.is_none());
                     assert_eq!(
                         (*list_ent_0_ptr).link.prev.unwrap().get() as *const _,
                         list_ent_1_ptr
                     );
-                    assert_eq!((*list_ent_0_ptr).key.unwrap(), 12345);
+                    assert_eq!((*list_ent_0_ptr).key, loom_dummy_obj_ref);
                 } else {
                     panic!("bad list pointer");
                 }
@@ -824,18 +1134,43 @@ fn stroad_loom_concurrent_park() {
 #[cfg(loom)]
 fn stroad_loom_park_unpark() {
     loom::model(|| {
-        let list_ent_0 = Box::leak(Box::new(StroadNode::<u32, StroadTestingPayload>::default()));
-        let list_ent_0_ptr = list_ent_0 as *const StroadNode<u32, StroadTestingPayload>;
-        let list_ent_1 = Box::leak(Box::new(StroadNode::<u32, StroadTestingPayload>::default()));
-        let list_ent_1_ptr = list_ent_1 as *const StroadNode<u32, StroadTestingPayload>;
-        let stroad = &*Box::leak(Stroad::<u32, StroadTestingPayload>::new());
-        let _ = stroad.unordered_park_conditionally(list_ent_0, 12345, || true);
+        let loom_dummy_obj = Box::leak(Box::new(LockedObj {
+            lock_and_generation: AtomicU64::new(LOCK_GEN_VALID_BIT),
+            num_rw: UnsafeCell::new(0),
+            payload: UnsafeCell::new(()),
+        }));
+        let loom_dummy_obj_ref: TypeErasedObjRef = ObjRef {
+            ptr: loom_dummy_obj,
+            gen: 0,
+        }
+        .type_erase();
+
+        let list_ent_0 = unsafe {
+            let x = Box::leak(Box::new(
+                MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit(),
+            ));
+            StroadNode::init(x.as_mut_ptr(), loom_dummy_obj_ref);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init_mut()
+        };
+        let list_ent_0_ptr = list_ent_0 as *const StroadNode<StroadTestingPayload>;
+        let list_ent_1 = unsafe {
+            let x = Box::leak(Box::new(
+                MaybeUninit::<StroadNode<StroadTestingPayload>>::uninit(),
+            ));
+            StroadNode::init(x.as_mut_ptr(), loom_dummy_obj_ref);
+            (*x.as_mut_ptr()).work_item_link = StroadTestingPayload::default();
+            x.assume_init_mut()
+        };
+        let list_ent_1_ptr = list_ent_1 as *const StroadNode<StroadTestingPayload>;
+        let stroad = &*Box::leak(Stroad::<StroadTestingPayload>::new());
+        let _ = stroad.unordered_park_conditionally(list_ent_0, || true);
 
         let t1 = loom::thread::spawn(move || {
-            let _ = stroad.unordered_park_conditionally(list_ent_1, 12345, || true);
+            let _ = stroad.unordered_park_conditionally(list_ent_1, || true);
         });
         let t2 = loom::thread::spawn(move || {
-            stroad.unordered_unpark_all(&12345, &mut ());
+            stroad.unordered_unpark_all(loom_dummy_obj_ref, &mut ());
         });
         t1.join().unwrap();
         t2.join().unwrap();
@@ -855,16 +1190,19 @@ fn stroad_loom_park_unpark() {
             };
             assert!(ent_0_unparked || ent_1_unparked);
             if !ent_1_unparked {
-                let hash = hash(&12345);
+                // unpark happened (uselessly), then park happened
+
+                let hash = hash(loom_dummy_obj_ref);
                 let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
                 let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 1;
 
                 unsafe {
                     let shard_data = &*stroad.shards[shard as usize].get();
+                    assert_eq!(shard_data.capacity_shift, 1);
                     assert_eq!(shard_data.nents, 1);
                     let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
                     assert_ne!(ptr, 0);
-                    let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+                    let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
                     let ptr_i = &*(ptr.add(bucket as usize));
 
                     assert_eq!(
@@ -880,16 +1218,19 @@ fn stroad_loom_park_unpark() {
                     assert!((*list_ent_1_ptr).link.prev.is_none());
                 }
             } else {
-                let hash = hash(&12345);
+                // both parks happened, then unpark happened
+
+                let hash = hash(loom_dummy_obj_ref);
                 let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
-                let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 1;
+                let bucket = (hash >> HASH_NUM_SHARDS_SHIFT) & 0b11;
 
                 unsafe {
                     let shard_data = &*stroad.shards[shard as usize].get();
+                    assert_eq!(shard_data.capacity_shift, 2);
                     assert_eq!(shard_data.nents, 0);
                     let ptr = shard_data.buckets_and_lock.load(Ordering::Relaxed) & !1;
                     assert_ne!(ptr, 0);
-                    let ptr = ptr as *const StroadBucket<u32, StroadTestingPayload>;
+                    let ptr = ptr as *const StroadBucket<StroadTestingPayload>;
                     let ptr_i = &*(ptr.add(bucket as usize));
 
                     assert!(ptr_i.wants_lock.next.is_none());

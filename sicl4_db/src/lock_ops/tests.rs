@@ -48,7 +48,7 @@ fn locking_manual_tests() {
     let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
     dbg!(&obj_ref);
 
-    let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
+    let stroad = Stroad::<LockingTestingPayload>::new();
 
     let mut lock = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
     #[allow(unused_mut)]
@@ -97,7 +97,7 @@ fn locking_loom_unordered_ww_nounlock() {
         };
         let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
         drop(thread_shard);
-        let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
+        let stroad = &*Box::leak(Stroad::<LockingTestingPayload>::new());
 
         let lock_0 = Box::leak(Box::new(MaybeUninit::<
             LockAndStroadData<'_, '_, LockingTestingPayload>,
@@ -161,7 +161,7 @@ fn locking_loom_unordered_rw_nounlock() {
         };
         let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
         drop(thread_shard);
-        let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
+        let stroad = &*Box::leak(Stroad::<LockingTestingPayload>::new());
 
         let lock_0 = Box::leak(Box::new(MaybeUninit::<
             LockAndStroadData<'_, '_, LockingTestingPayload>,
@@ -225,7 +225,7 @@ fn locking_loom_unordered_rr_nounlock() {
         };
         let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
         drop(thread_shard);
-        let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
+        let stroad = &*Box::leak(Stroad::<LockingTestingPayload>::new());
 
         let lock_0 = Box::leak(Box::new(MaybeUninit::<
             LockAndStroadData<'_, '_, LockingTestingPayload>,
@@ -289,7 +289,7 @@ fn locking_loom_unordered_ww_unlock() {
         };
         let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
         drop(thread_shard);
-        let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
+        let stroad = &*Box::leak(Stroad::<LockingTestingPayload>::new());
 
         let lock_0 = Box::leak(Box::new(MaybeUninit::<
             LockAndStroadData<'_, '_, LockingTestingPayload>,
@@ -433,7 +433,7 @@ fn locking_single_threaded_write_unpark_sim() {
     let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
     drop(thread_shard);
 
-    let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
+    let stroad = Stroad::<LockingTestingPayload>::new();
 
     let mut lock_0 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
     let lock_0 = unsafe {
@@ -492,7 +492,7 @@ fn locking_single_threaded_read_unpark_sim() {
     let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
     drop(thread_shard);
 
-    let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
+    let stroad = Stroad::<LockingTestingPayload>::new();
 
     let mut lock_0 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
     let lock_0 = unsafe {
@@ -574,7 +574,7 @@ fn locking_single_threaded_ordered_write_causes_unpark_sim() {
     let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
     drop(thread_shard);
 
-    let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
+    let stroad = Stroad::<LockingTestingPayload>::new();
 
     let mut lock_0 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
     let lock_0 = unsafe {
@@ -643,7 +643,7 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
     let obj_ref = ObjRefLockedU32 { ptr: obj, gen };
     drop(thread_shard);
 
-    let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
+    let stroad = Stroad::<LockingTestingPayload>::new();
 
     let mut lock_0 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
     let lock_0 = unsafe {
