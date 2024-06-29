@@ -176,19 +176,6 @@ pub struct StroadNode<'stroad_node, K, P> {
     pub work_item_link: P,
 }
 impl<'stroad_node, K, P: StroadToWorkItemLink> StroadNode<'stroad_node, K, P> {
-    /// Construct, with the given work item link
-    pub fn new(p: P) -> Self {
-        Self {
-            link: DoubleLL {
-                next: None,
-                prev: None,
-            },
-            key: None,
-            prio: 0,
-            work_item_link: p,
-        }
-    }
-
     /// Initialize in place, *EXCEPT* the external work item link
     pub unsafe fn init(self_: *mut Self) {
         (*self_).link = DoubleLL {

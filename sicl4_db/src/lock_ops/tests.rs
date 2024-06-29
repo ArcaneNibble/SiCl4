@@ -1,5 +1,7 @@
 use std::alloc::Layout;
 
+use mem::MaybeUninit;
+
 use super::*;
 
 #[derive(Default, Debug)]
@@ -48,11 +50,15 @@ fn locking_manual_tests() {
 
     let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
 
+    let mut lock = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
     #[allow(unused_mut)]
-    let mut lock = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock = unsafe {
+        LockAndStroadData::init(lock.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock.assume_init()
+    };
+
     dbg!(&lock);
     let ret = lock.unordered_try_write(&stroad);
     dbg!(&ret);
@@ -65,10 +71,13 @@ fn locking_manual_tests() {
     dbg!(&lock);
 
     // can't work
-    // let mut _lock2 = RWLock::<'_, '_, LockingTestingPayload>::new(
-    //     obj_ref,
-    //     LockingTestingPayload::default(),
-    // );
+    // let mut _lock2 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    // let mut _lock2 = unsafe {
+    //     LockAndStroadData::init(_lock2.as_mut_ptr(), obj_ref.type_erase());
+    //     (*(*_lock2.as_mut_ptr()).stroad_state.get()).work_item_link =
+    //         LockingTestingPayload::default();
+    //     _lock2.assume_init()
+    // };
     // std::mem::swap(&mut lock, &mut _lock2);
 }
 
@@ -90,25 +99,36 @@ fn locking_loom_unordered_ww_nounlock() {
         drop(thread_shard);
         let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
 
+        let lock_0 = Box::leak(Box::new(MaybeUninit::<
+            LockAndStroadData<'_, '_, LockingTestingPayload>,
+        >::uninit()));
+        let lock_0 = unsafe {
+            LockAndStroadData::init(lock_0.as_mut_ptr(), obj_ref.type_erase());
+            (*(*lock_0.as_mut_ptr()).stroad_state.get()).work_item_link =
+                LockingTestingPayload::default();
+            lock_0.assume_init_mut()
+        };
+        let lock_1 = Box::leak(Box::new(MaybeUninit::<
+            LockAndStroadData<'_, '_, LockingTestingPayload>,
+        >::uninit()));
+        let lock_1 = unsafe {
+            LockAndStroadData::init(lock_1.as_mut_ptr(), obj_ref.type_erase());
+            (*(*lock_1.as_mut_ptr()).stroad_state.get()).work_item_link =
+                LockingTestingPayload::default();
+            lock_1.assume_init_mut()
+        };
+
         let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
         let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
 
         let t1 = loom::thread::spawn(move || {
-            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
-                obj_ref.type_erase(),
-                LockingTestingPayload::default(),
-            )));
-            let ret = lock.unordered_try_write(stroad);
+            let ret = lock_0.unordered_try_write(stroad);
 
             assert!(ret.is_ok());
             t1_got_lock.store(ret.unwrap(), Ordering::Relaxed);
         });
         let t2 = loom::thread::spawn(move || {
-            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
-                obj_ref.type_erase(),
-                LockingTestingPayload::default(),
-            )));
-            let ret = lock.unordered_try_write(stroad);
+            let ret = lock_1.unordered_try_write(stroad);
 
             assert!(ret.is_ok());
             t2_got_lock.store(ret.unwrap(), Ordering::Relaxed);
@@ -143,25 +163,36 @@ fn locking_loom_unordered_rw_nounlock() {
         drop(thread_shard);
         let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
 
+        let lock_0 = Box::leak(Box::new(MaybeUninit::<
+            LockAndStroadData<'_, '_, LockingTestingPayload>,
+        >::uninit()));
+        let lock_0 = unsafe {
+            LockAndStroadData::init(lock_0.as_mut_ptr(), obj_ref.type_erase());
+            (*(*lock_0.as_mut_ptr()).stroad_state.get()).work_item_link =
+                LockingTestingPayload::default();
+            lock_0.assume_init_mut()
+        };
+        let lock_1 = Box::leak(Box::new(MaybeUninit::<
+            LockAndStroadData<'_, '_, LockingTestingPayload>,
+        >::uninit()));
+        let lock_1 = unsafe {
+            LockAndStroadData::init(lock_1.as_mut_ptr(), obj_ref.type_erase());
+            (*(*lock_1.as_mut_ptr()).stroad_state.get()).work_item_link =
+                LockingTestingPayload::default();
+            lock_1.assume_init_mut()
+        };
+
         let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
         let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
 
         let t1 = loom::thread::spawn(move || {
-            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
-                obj_ref.type_erase(),
-                LockingTestingPayload::default(),
-            )));
-            let ret = lock.unordered_try_read(stroad);
+            let ret = lock_0.unordered_try_read(stroad);
 
             assert!(ret.is_ok());
             t1_got_lock.store(ret.unwrap(), Ordering::Relaxed);
         });
         let t2 = loom::thread::spawn(move || {
-            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
-                obj_ref.type_erase(),
-                LockingTestingPayload::default(),
-            )));
-            let ret = lock.unordered_try_write(stroad);
+            let ret = lock_1.unordered_try_write(stroad);
 
             assert!(ret.is_ok());
             t2_got_lock.store(ret.unwrap(), Ordering::Relaxed);
@@ -196,25 +227,36 @@ fn locking_loom_unordered_rr_nounlock() {
         drop(thread_shard);
         let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
 
+        let lock_0 = Box::leak(Box::new(MaybeUninit::<
+            LockAndStroadData<'_, '_, LockingTestingPayload>,
+        >::uninit()));
+        let lock_0 = unsafe {
+            LockAndStroadData::init(lock_0.as_mut_ptr(), obj_ref.type_erase());
+            (*(*lock_0.as_mut_ptr()).stroad_state.get()).work_item_link =
+                LockingTestingPayload::default();
+            lock_0.assume_init_mut()
+        };
+        let lock_1 = Box::leak(Box::new(MaybeUninit::<
+            LockAndStroadData<'_, '_, LockingTestingPayload>,
+        >::uninit()));
+        let lock_1 = unsafe {
+            LockAndStroadData::init(lock_1.as_mut_ptr(), obj_ref.type_erase());
+            (*(*lock_1.as_mut_ptr()).stroad_state.get()).work_item_link =
+                LockingTestingPayload::default();
+            lock_1.assume_init_mut()
+        };
+
         let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
         let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
 
         let t1 = loom::thread::spawn(move || {
-            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
-                obj_ref.type_erase(),
-                LockingTestingPayload::default(),
-            )));
-            let ret = lock.unordered_try_read(stroad);
+            let ret = lock_0.unordered_try_read(stroad);
 
             assert!(ret.is_ok());
             t1_got_lock.store(ret.unwrap(), Ordering::Relaxed);
         });
         let t2 = loom::thread::spawn(move || {
-            let lock = &*Box::leak(Box::new(LockAndStroadData::new(
-                obj_ref.type_erase(),
-                LockingTestingPayload::default(),
-            )));
-            let ret = lock.unordered_try_read(stroad);
+            let ret = lock_1.unordered_try_read(stroad);
 
             assert!(ret.is_ok());
             t2_got_lock.store(ret.unwrap(), Ordering::Relaxed);
@@ -249,17 +291,30 @@ fn locking_loom_unordered_ww_unlock() {
         drop(thread_shard);
         let stroad = &*Box::leak(Stroad::<TypeErasedObjRef, LockingTestingPayload>::new());
 
+        let lock_0 = Box::leak(Box::new(MaybeUninit::<
+            LockAndStroadData<'_, '_, LockingTestingPayload>,
+        >::uninit()));
+        let lock_0 = unsafe {
+            LockAndStroadData::init(lock_0.as_mut_ptr(), obj_ref.type_erase());
+            (*(*lock_0.as_mut_ptr()).stroad_state.get()).work_item_link =
+                LockingTestingPayload::default();
+            lock_0.assume_init_mut()
+        };
+        let lock_1 = Box::leak(Box::new(MaybeUninit::<
+            LockAndStroadData<'_, '_, LockingTestingPayload>,
+        >::uninit()));
+        let lock_1 = unsafe {
+            LockAndStroadData::init(lock_1.as_mut_ptr(), obj_ref.type_erase());
+            (*(*lock_1.as_mut_ptr()).stroad_state.get()).work_item_link =
+                LockingTestingPayload::default();
+            lock_1.assume_init_mut()
+        };
+
         let t1_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
         let t2_got_lock = &*Box::leak(Box::new(AtomicBool::new(false)));
 
-        let t1_lock = &*Box::leak(Box::new(LockAndStroadData::new(
-            obj_ref.type_erase(),
-            LockingTestingPayload::default(),
-        )));
-        let t2_lock = &*Box::leak(Box::new(LockAndStroadData::new(
-            obj_ref.type_erase(),
-            LockingTestingPayload::default(),
-        )));
+        let t1_lock = &*lock_0;
+        let t2_lock = &*lock_1;
 
         // println!("~~~~~ MODEL ITER ~~~~~");
 
@@ -380,10 +435,13 @@ fn locking_single_threaded_write_unpark_sim() {
 
     let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
 
-    let lock_0 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_0 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_0 = unsafe {
+        LockAndStroadData::init(lock_0.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_0.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_0.assume_init()
+    };
     let ret = lock_0.unordered_try_write(&stroad);
     assert_eq!(ret, Ok(true));
     assert_eq!(
@@ -391,10 +449,13 @@ fn locking_single_threaded_write_unpark_sim() {
         0x800000000000007f | (gen << 8)
     );
 
-    let lock_1 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_1 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_1 = unsafe {
+        LockAndStroadData::init(lock_1.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_1.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_1.assume_init()
+    };
     let ret = lock_1.unordered_try_write(&stroad);
     assert_eq!(ret, Ok(false));
     assert_eq!(
@@ -433,10 +494,13 @@ fn locking_single_threaded_read_unpark_sim() {
 
     let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
 
-    let lock_0 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_0 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_0 = unsafe {
+        LockAndStroadData::init(lock_0.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_0.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_0.assume_init()
+    };
     let ret = lock_0.unordered_try_read(&stroad);
     assert_eq!(ret, Ok(true));
     assert_eq!(
@@ -444,10 +508,13 @@ fn locking_single_threaded_read_unpark_sim() {
         0x8000000000000001 | (gen << 8)
     );
 
-    let lock_1 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_1 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_1 = unsafe {
+        LockAndStroadData::init(lock_1.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_1.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_1.assume_init()
+    };
     let ret = lock_1.unordered_try_read(&stroad);
     assert_eq!(ret, Ok(true));
     assert_eq!(
@@ -455,10 +522,13 @@ fn locking_single_threaded_read_unpark_sim() {
         0x8000000000000002 | (gen << 8)
     );
 
-    let lock_2 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_2 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_2 = unsafe {
+        LockAndStroadData::init(lock_2.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_2.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_2.assume_init()
+    };
     let ret = lock_2.unordered_try_write(&stroad);
     assert_eq!(ret, Ok(false));
     assert_eq!(
@@ -506,26 +576,35 @@ fn locking_single_threaded_ordered_write_causes_unpark_sim() {
 
     let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
 
-    let lock_0 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_0 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_0 = unsafe {
+        LockAndStroadData::init(lock_0.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_0.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_0.assume_init()
+    };
     let ret = lock_0.ordered_try_read(&stroad, 0);
     assert_eq!(ret, Ok(true));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 1);
 
-    let lock_1 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_1 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_1 = unsafe {
+        LockAndStroadData::init(lock_1.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_1.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_1.assume_init()
+    };
     let ret = lock_1.ordered_try_write(&stroad, 1);
     assert_eq!(ret, Ok(true));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
-    let lock_2 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_2 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_2 = unsafe {
+        LockAndStroadData::init(lock_2.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_2.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_2.assume_init()
+    };
     let ret = lock_2.ordered_try_read(&stroad, 2);
     assert_eq!(ret, Ok(false));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
@@ -566,42 +645,57 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
 
     let stroad = Stroad::<TypeErasedObjRef, LockingTestingPayload>::new();
 
-    let lock_0 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_0 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_0 = unsafe {
+        LockAndStroadData::init(lock_0.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_0.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_0.assume_init()
+    };
     let ret = lock_0.ordered_try_read(&stroad, 0);
     assert_eq!(ret, Ok(true));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 1);
 
-    let lock_1 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_1 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_1 = unsafe {
+        LockAndStroadData::init(lock_1.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_1.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_1.assume_init()
+    };
     let ret = lock_1.ordered_try_write(&stroad, 1);
     assert_eq!(ret, Ok(true));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
-    let lock_2 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_2 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_2 = unsafe {
+        LockAndStroadData::init(lock_2.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_2.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_2.assume_init()
+    };
     let ret = lock_2.ordered_try_read(&stroad, 2);
     assert_eq!(ret, Ok(false));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
-    let lock_3 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_3 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_3 = unsafe {
+        LockAndStroadData::init(lock_3.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_3.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_3.assume_init()
+    };
     let ret = lock_3.ordered_try_read(&stroad, 3);
     assert_eq!(ret, Ok(false));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
-    let lock_4 = LockAndStroadData::<'_, '_, LockingTestingPayload>::new(
-        obj_ref.type_erase(),
-        LockingTestingPayload::default(),
-    );
+    let mut lock_4 = MaybeUninit::<LockAndStroadData<'_, '_, LockingTestingPayload>>::uninit();
+    let lock_4 = unsafe {
+        LockAndStroadData::init(lock_4.as_mut_ptr(), obj_ref.type_erase());
+        (*(*lock_4.as_mut_ptr()).stroad_state.get()).work_item_link =
+            LockingTestingPayload::default();
+        lock_4.assume_init()
+    };
     let ret = lock_4.ordered_try_write(&stroad, 3);
     assert_eq!(ret, Ok(false));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);

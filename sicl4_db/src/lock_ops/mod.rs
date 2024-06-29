@@ -205,16 +205,6 @@ impl<'arena, 'lock_inst, P: Debug> Debug for LockAndStroadData<'arena, 'lock_ins
     }
 }
 impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'lock_inst, P> {
-    /// Create a new lock state object
-    pub fn new(obj: TypeErasedObjRef<'arena>, work_item_link: P) -> Self {
-        Self {
-            state: Cell::new(LockState::Unlocked),
-            p: obj,
-            stroad_state: UnsafeCell::new(StroadNode::new(work_item_link)),
-            _pd1: PhantomData,
-        }
-    }
-
     /// Initialize a lock object in place, *EXCEPT* the external work item link
     pub unsafe fn init(self_: *mut Self, obj: TypeErasedObjRef<'arena>) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::init");
