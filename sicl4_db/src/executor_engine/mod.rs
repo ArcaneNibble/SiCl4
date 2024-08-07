@@ -1,12 +1,15 @@
 //! Code for controlling the running of algorithms against netlists
 
-use std::marker::PhantomData;
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 use std::{cell::Cell, fmt::Debug};
 
 use netlist::*;
 use single_threaded::SingleThreadedView;
 
 use crate::lock_ops::stroad::WorkItemInterface;
+use crate::lock_ops::LockAndStroadData;
+use crate::loom_testing::*;
 use crate::netlist::*;
 use crate::{allocator::SlabRoot, lock_ops::stroad::Stroad};
 
@@ -100,17 +103,56 @@ pub trait NetlistRWView<'arena> {
     ) -> &'arena mut WorkItem<'arena, 'arena>;
 }
 
+/// This many locks are stored in a work item
+///
+/// TODO: spill extra locks into another heap block?
+const MAX_LOCKS_PER_WORK_ITEM: usize = 8;
+
+const WORK_STATUS_DOING_CANCEL: u64 = 1 << 63;
+const WORK_STATUS_DOING_ORDERED_COMMIT: u64 = 1 << 62;
+const WORK_STATUS_UNPARK_TRIGGERED: u64 = 1 << 61;
+const WORK_STATUS_FINISHED_PARKING: u64 = 1 << 60;
+const WORK_STATUS_GRABBED_LOCKS: u64 = 1 << 59;
+const WORK_STATUS_NUM_LOCKS_MASK: u64 = (1 << 48) - 1;
+
 // TODO
 pub struct WorkItem<'arena, 'work_item> {
     seed_node: NetlistRef<'arena>,
     prio: u64,
-    _pd: PhantomData<&'work_item ()>,
+
+    /// * `bits[63]`    -- doing a cancel
+    ///     - this is used only for ordered algorithms
+    ///     - needed so that only *one* concurrent cancel takes effect
+    ///     - needed so that, if the work is currently being worked on, next attempts to do anything will fail
+    /// * `bits[62]`    -- doing the commit phase of an ordered algorithm
+    ///     - needed so that attempts to cancel it at this point become futile (i.e. spin)
+    ///     - not used for unordered algorithms because canceling doesn't happen
+    /// * `bits[61]`    -- unpark triggered
+    ///     - signal an (early) unpark, if thread doing the work hasn't finished abandoning locks yet when unpark is triggered
+    /// * `bits[60]`    -- parking finished
+    ///     - indicates, along with the above bit, which thread is responsible for handling re-queuing from an unpark
+    /// * `bits[59]`    -- ordered algorithm speculative lock grabbing phase complete
+    ///     - XXX not sure if this needs to be atomic with everything else, but doing so is easier to reason about
+    /// * `bits[47:0]`  -- number of locks
+    ///     - needs to be atomic with flags related to cancellation, as cancelling involves concurrent access to the locks
+    ///     (i.e. creating new locks from thread A, deleting locks from a cancelling thread B)
+    ///
+    /// See the <TODO DRAW/UPLOAD THESE> diagrams for details.
+    status: AtomicU64,
+
+    locks: [MaybeUninit<
+        UnsafeCell<LockAndStroadData<'arena, 'work_item, WorkItemPerLockData<'arena, 'work_item>>>,
+    >; MAX_LOCKS_PER_WORK_ITEM],
 }
+// safety: we carefully make sure unpark/cancel have correct thread-safety
+unsafe impl<'arena, 'work_item> Send for WorkItem<'arena, 'work_item> {}
+unsafe impl<'arena, 'work_item> Sync for WorkItem<'arena, 'work_item> {}
 impl<'arena, 'work_item> Debug for WorkItem<'arena, 'work_item> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkItem")
             .field("seed_node", &self.seed_node)
             .field("prio", &self.prio)
+            .field("status", &self.status)
             .finish()
     }
 }
@@ -123,6 +165,7 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     ) -> &'work_item mut Self {
         (*self_).seed_node = node;
         (*self_).prio = prio;
+        (*self_).status = AtomicU64::new(0);
         &mut *self_
     }
 
