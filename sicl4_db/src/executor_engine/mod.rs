@@ -2,6 +2,8 @@
 
 use std::marker::PhantomData;
 
+pub mod netlist;
+
 // TODO
 pub struct WorkItem<'arena, 'work_item> {
     _pd: PhantomData<(&'arena (), &'work_item ())>,
