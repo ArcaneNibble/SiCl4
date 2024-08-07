@@ -20,6 +20,7 @@ use crate::util::UsizePtr;
 use crate::{allocator::SlabRoot, lock_ops::stroad::Stroad};
 
 pub mod netlist;
+pub mod ordered_commit_queue;
 pub mod single_threaded;
 pub mod unordered;
 
