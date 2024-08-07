@@ -8,16 +8,18 @@ use std::thread;
 use std::{cell::Cell, fmt::Debug};
 
 use netlist::*;
+use ordered::{OrderedAlgorithm, OrderedAlgorithmROView, OrderedAlgorithmRWView};
+use ordered_commit_queue::ItemWithPriority;
 use single_threaded::SingleThreadedView;
 use tracing::Level;
 use unordered::{UnorderedAlgorithm, UnorderedAlgorithmROView, UnorderedAlgorithmRWView};
 
-use crate::lock_ops::stroad::WorkItemInterface;
+use crate::allocator::SlabRoot;
+use crate::lock_ops::stroad::{Stroad, WorkItemInterface};
 use crate::lock_ops::{LockAndStroadData, LockState, TypeErasedObjRef};
 use crate::loom_testing::*;
 use crate::netlist::*;
 use crate::util::UsizePtr;
-use crate::{allocator::SlabRoot, lock_ops::stroad::Stroad};
 
 pub mod netlist;
 pub mod ordered;
@@ -234,7 +236,57 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
     }
 
     fn cancel<Q: WorkQueueInterface<WorkItemTy = &'work_item Self>>(&'work_item self, q: &mut Q) {
-        todo!()
+        // cancel happens *only* on lock acquisition
+        // it happens *only* for ordered algorithms
+        // it can happen multiple times in a multithreaded race-prone way, because
+        // even though cancelling happens with the stroad bucket lock held,
+        // a speculative work item waiting to commit can hold multiple *different* locks.
+        // a cancellation can be triggered because of two *different* ones in a racy way
+
+        let mut old_status = self
+            .status
+            .fetch_or(WORK_STATUS_DOING_CANCEL, Ordering::Relaxed);
+
+        // if this bit gets set, it is too late. we have to wait for this to finish
+        if old_status & WORK_STATUS_DOING_ORDERED_COMMIT != 0 {
+            tracing::event!(
+                name: "work_item::cancel_toolate_spin",
+                Level::TRACE,
+                work = ?UsizePtr::from(self)
+            );
+
+            while old_status & WORK_STATUS_DOING_ORDERED_COMMIT != 0 {
+                spin_hint();
+                old_status = self.status.load(Ordering::Relaxed);
+            }
+
+            tracing::event!(
+                name: "work_item::cancel_toolate_spin_done",
+                Level::TRACE,
+                work = ?UsizePtr::from(self)
+            );
+        } else if old_status & WORK_STATUS_DOING_CANCEL != 0 {
+            // somebody else is trying to do a cancel, so we don't do anything
+
+            tracing::event!(
+                name: "work_item::cancel_duplicate",
+                Level::TRACE,
+                work = ?UsizePtr::from(self)
+            );
+        } else {
+            // we are doing the cancel
+
+            tracing::event!(
+                name: "work_item::cancel",
+                Level::TRACE,
+                work = ?UsizePtr::from(self)
+            );
+
+            // add the work item which we canceled to a list, so that
+            // all of its locks can be dropped. this needs to happen with
+            // the bucket lock *NOT* held, which is why it can't be done now
+            q.add_work(self);
+        }
     }
 
     /* Lock setup */
@@ -371,6 +423,46 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
                         || lock.state.get() == LockState::LockedForUnorderedWrite
                 );
                 lock.unlock(stroad, q);
+            }
+        }
+    }
+
+    fn drop_all_ordered_locks(
+        &self,
+        stroad: &Stroad<'arena, 'arena, WorkItemPerLockData<'arena, 'work_item>>,
+        mut q: &ordered_commit_queue::OrderedCommitQueue<&'arena WorkItem<'arena, 'arena>>,
+    ) {
+        let mut old_status = self.status.load(Ordering::Relaxed);
+
+        loop {
+            let locks_used = old_status & WORK_STATUS_NUM_LOCKS_MASK;
+            if locks_used == 0 {
+                return;
+            }
+
+            let new_status = (old_status & !WORK_STATUS_NUM_LOCKS_MASK) + locks_used - 1;
+            match self.status.compare_exchange_weak(
+                old_status,
+                new_status,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // successfully decremented by 1, meaning we "own" the one at index locks_used - 1
+                    let lock_idx = (locks_used - 1) as usize;
+                    unsafe {
+                        let lock = &*self.locks[lock_idx].assume_init_ref().get();
+                        debug_assert!(
+                            lock.state.get() == LockState::NewlyAllocatedOrdered
+                                || lock.state.get() == LockState::LockedForOrderedRead
+                                || lock.state.get() == LockState::LockedForOrderedWrite
+                        );
+                        lock.unlock(stroad, &mut q);
+                    }
+
+                    old_status = new_status;
+                }
+                Err(x) => old_status = x,
             }
         }
     }
@@ -513,6 +605,192 @@ impl<'arena> NetlistManager<'arena> {
                             stroad,
                             heap_thread_shard,
                         };
+                    }
+                });
+            }
+        });
+        // self.stroad._debug_dump();
+        self.in_use.set(false);
+    }
+
+    pub fn run_ordered_algorithm<A: OrderedAlgorithm>(
+        &'arena self,
+        algo: &A,
+        mut queue: &ordered_commit_queue::OrderedCommitQueue<&'arena WorkItem<'arena, 'arena>>,
+        num_threads: usize,
+    ) {
+        assert!(num_threads <= ordered_commit_queue::MAX_THREADS);
+        assert!(!self.in_use.get());
+        self.in_use.set(true);
+
+        thread::scope(|s| {
+            for thread_i in 0..num_threads {
+                let heap_thread_shard = self.heap.new_thread();
+                let stroad = &self.stroad;
+                s.spawn(move || {
+                    let tracing_span =
+                        tracing::span!(Level::TRACE, "ordered_algo::thread", thread_i);
+                    let _span_enter = tracing_span.enter();
+
+                    let mut ro_view = OrderedAlgorithmROView {
+                        stroad,
+                        unpark_q: queue,
+                        cancel_list: Vec::new(),
+                        heap_thread_shard,
+                    };
+                    while let Some(work_item_with_prio) = queue.get_some_work(thread_i) {
+                        let ItemWithPriority {
+                            item: work_item,
+                            prio: work_prio,
+                        } = work_item_with_prio;
+                        let item_status = work_item.status.load(Ordering::Relaxed);
+
+                        let work_span = tracing::span!(
+                            Level::TRACE,
+                            "ordered_algo::thread::work_item",
+                            attempted_work.item = ?UsizePtr::from(work_item),
+                            attempted_work.status = item_status,
+                            attempted_work.prio = work_prio,
+                        );
+                        let _work_span_enter = work_span.enter();
+
+                        if item_status & WORK_STATUS_GRABBED_LOCKS == 0 {
+                            // need to speculatively grab work
+                            work_item.reset_state();
+                            let ro_ret = algo.try_process_readonly(&mut ro_view, work_item);
+                            for cancel in ro_view.cancel_list.iter() {
+                                // FIXME completely untested
+                                cancel.drop_all_ordered_locks(stroad, queue);
+                            }
+                            if let Err(e) = ro_ret {
+                                match e {
+                                    SpeculativeLockGrabResult::Block => {
+                                        tracing::event!(
+                                            name: "ordered_algo::park",
+                                            Level::TRACE,
+                                            "parked"
+                                        );
+
+                                        work_item.drop_all_ordered_locks(stroad, queue);
+
+                                        let old_status = work_item.status.fetch_or(
+                                            WORK_STATUS_FINISHED_PARKING,
+                                            Ordering::Relaxed,
+                                        );
+                                        if old_status & WORK_STATUS_UNPARK_TRIGGERED != 0 {
+                                            // an unpark happened already while we were trying to release locks
+                                            tracing::event!(
+                                                name: "ordered_algo::unpark_tooearly_recovery",
+                                                Level::TRACE,
+                                                "unparked before we finished parking"
+                                            );
+                                            queue.add_work(work_item);
+                                        } else {
+                                            // just park, don't do anything
+                                            // println!("parked!");
+                                        }
+                                    }
+                                    SpeculativeLockGrabResult::Cancel => {
+                                        tracing::event!(
+                                            name: "ordered_algo::cancelled_during_ro",
+                                            Level::TRACE,
+                                            "cancelled during RO phase"
+                                        );
+
+                                        work_item.drop_all_ordered_locks(stroad, queue);
+                                        queue.add_work(work_item);
+                                    }
+                                }
+
+                                continue;
+                            } else {
+                                tracing::event!(
+                                    name: "ordered_algo::ro_done",
+                                    Level::TRACE,
+                                    "RO phase completed successfully!"
+                                );
+
+                                let _status = work_item
+                                    .status
+                                    .fetch_or(WORK_STATUS_GRABBED_LOCKS, Ordering::Relaxed);
+                            }
+                        }
+
+                        if work_item.prio <= queue.commit_priority() as u64 {
+                            // can attempt RW phase
+
+                            let old_status = work_item.status.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |x| {
+                                    if x & WORK_STATUS_DOING_CANCEL != 0 {
+                                        None
+                                    } else {
+                                        Some(x | WORK_STATUS_DOING_ORDERED_COMMIT)
+                                    }
+                                },
+                            );
+
+                            if old_status.is_err() {
+                                tracing::event!(
+                                    name: "ordered_algo::cancelled_starting_rw",
+                                    Level::TRACE,
+                                    "cancelled during RW phase start"
+                                );
+
+                                work_item.drop_all_ordered_locks(stroad, queue);
+                                queue.add_work(work_item);
+                            }
+
+                            // RW phase is committed to go ahead
+
+                            let heap_thread_shard = {
+                                let mut rw_view = OrderedAlgorithmRWView {
+                                    heap_thread_shard: ro_view.heap_thread_shard,
+                                    queue,
+                                };
+                                algo.process_finish_readwrite(&mut rw_view, work_item);
+                                rw_view.heap_thread_shard
+                            };
+
+                            // release *all* locks, even if the RW phase didn't use one
+                            work_item.drop_all_ordered_locks(stroad, queue);
+
+                            tracing::event!(
+                                name: "ordered_algo::rw_done",
+                                Level::TRACE,
+                                "RW phase completed successfully!"
+                            );
+                            ro_view = OrderedAlgorithmROView {
+                                stroad,
+                                unpark_q: queue,
+                                cancel_list: Vec::new(),
+                                heap_thread_shard,
+                            };
+
+                            queue.finish_work(
+                                thread_i,
+                                ItemWithPriority {
+                                    item: work_item,
+                                    prio: work_prio,
+                                },
+                            );
+                        } else {
+                            // cannot attempt RW phase
+                            tracing::event!(
+                                name: "ordered_algo::not_at_head",
+                                Level::TRACE,
+                                "cannot commit; not at head of priority queue"
+                            );
+
+                            queue.put_back_waiting_item(
+                                thread_i,
+                                ItemWithPriority {
+                                    item: work_item,
+                                    prio: work_prio,
+                                },
+                            )
+                        }
                     }
                 });
             }
