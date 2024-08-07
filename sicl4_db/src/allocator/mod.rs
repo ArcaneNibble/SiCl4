@@ -154,7 +154,7 @@ pub trait TypeMapper {
 /// Trait that maps (type which can be allocated) -> (allocator bin index)
 ///
 /// Also helps ensure that allocator only stores `Send + Sync` items
-pub trait TypeMappable<M>: Send + Sync {
+pub unsafe trait TypeMappable<M>: Send + Sync {
     const I: usize;
 }
 

@@ -12,7 +12,7 @@ impl TypeMapper for JustU8Mapper {
     type BinsArrayTy<T> = [T; 1];
     const LAYOUTS: &'static [&'static [Layout]] = &[&[Layout::new::<u8>()]];
 }
-impl TypeMappable<JustU8Mapper> for u8 {
+unsafe impl TypeMappable<JustU8Mapper> for u8 {
     const I: usize = 0;
 }
 
@@ -21,7 +21,7 @@ impl TypeMapper for JustBigArrayMapper {
     type BinsArrayTy<T> = [T; 1];
     const LAYOUTS: &'static [&'static [Layout]] = &[&[Layout::new::<[u8; 30000]>()]];
 }
-impl TypeMappable<JustBigArrayMapper> for [u8; 30000] {
+unsafe impl TypeMappable<JustBigArrayMapper> for [u8; 30000] {
     const I: usize = 0;
 }
 
@@ -33,10 +33,10 @@ impl TypeMapper for TwoBigArrayMapper {
         &[Layout::new::<[u8; 29999]>()],
     ];
 }
-impl TypeMappable<TwoBigArrayMapper> for [u8; 30000] {
+unsafe impl TypeMappable<TwoBigArrayMapper> for [u8; 30000] {
     const I: usize = 0;
 }
-impl TypeMappable<TwoBigArrayMapper> for [u8; 29999] {
+unsafe impl TypeMappable<TwoBigArrayMapper> for [u8; 29999] {
     const I: usize = 1;
 }
 
@@ -73,7 +73,7 @@ fn alloc_layout_compute() {
 fn test_num_that_fits() {
     assert_eq!(num_that_fits(Layout::new::<u32>(), 256), 256 / 4);
     #[repr(align(4))]
-    struct WithPadding(u8);
+    struct WithPadding(#[allow(dead_code)] u8);
     assert_eq!(num_that_fits(Layout::new::<WithPadding>(), 256), 256 / 4);
 }
 

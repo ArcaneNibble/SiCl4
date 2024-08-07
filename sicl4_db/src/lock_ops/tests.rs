@@ -26,7 +26,7 @@ impl TypeMapper for JustU32Mapper {
     type BinsArrayTy<T> = [T; 1];
     const LAYOUTS: &'static [&'static [Layout]] = &[&[Layout::new::<LockedObj<u32>>()]];
 }
-impl TypeMappable<JustU32Mapper> for LockedObj<u32> {
+unsafe impl TypeMappable<JustU32Mapper> for LockedObj<u32> {
     const I: usize = 0;
 }
 type ObjRefLockedU32<'arena> = ObjRef<'arena, u32>;

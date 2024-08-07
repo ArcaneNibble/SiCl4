@@ -448,10 +448,10 @@ impl TypeMapper for NetlistTypeMapper {
         &[Layout::new::<NetlistNodeWithLock<NetlistWire>>()],
     ];
 }
-impl<'arena> TypeMappable<NetlistTypeMapper> for NetlistNodeWithLock<NetlistCell<'arena>> {
+unsafe impl<'arena> TypeMappable<NetlistTypeMapper> for NetlistNodeWithLock<NetlistCell<'arena>> {
     const I: usize = 0;
 }
-impl<'arena> TypeMappable<NetlistTypeMapper> for NetlistNodeWithLock<NetlistWire<'arena>> {
+unsafe impl<'arena> TypeMappable<NetlistTypeMapper> for NetlistNodeWithLock<NetlistWire<'arena>> {
     const I: usize = 1;
 }
 
