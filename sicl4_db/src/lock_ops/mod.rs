@@ -193,6 +193,10 @@ impl Default for LockState {
 pub struct LockAndStroadData<'arena, 'lock_inst, P> {
     /// State the lock is in
     pub(crate) state: Cell<LockState>,
+    /// Used by executor to enforce shared XOR mut
+    pub(crate) rw_handed_out: Cell<bool>,
+    /// Used by executor to enforce shared XOR mut
+    pub(crate) ro_handed_out: Cell<bool>,
     /// Stroad module's state data
     // FIXME does this enforce too much invariance on lifetimes?
     stroad_state: UnsafeCell<StroadNode<'lock_inst, 'arena, P>>,
@@ -205,6 +209,8 @@ impl<'arena, 'lock_inst, P: Debug> Debug for LockAndStroadData<'arena, 'lock_ins
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut dbg = f.debug_struct("LockAndStroadData");
         dbg.field("state", &(self.state.get()));
+        dbg.field("rw_handed_out", &(self.rw_handed_out.get()));
+        dbg.field("ro_handed_out", &(self.ro_handed_out.get()));
         dbg.field("stroad_state", unsafe { &*self.stroad_state.get() });
         dbg.finish()
     }
@@ -217,6 +223,8 @@ impl<'arena, 'lock_inst, P: WorkItemInterface> LockAndStroadData<'arena, 'lock_i
         tracing::event!(Level::TRACE, lock_ptr = ?UsizePtr::from(self_), target.ptr = ?UsizePtr::from(obj.ptr), target.gen = obj.gen);
 
         (*self_).state = Cell::new(LockState::Unlocked);
+        (*self_).rw_handed_out = Cell::new(false);
+        (*self_).ro_handed_out = Cell::new(false);
         StroadNode::init((*self_).stroad_state.get(), obj);
     }
 
