@@ -8,6 +8,7 @@ pub struct WorkItem<'arena, 'work_item> {
 }
 
 /// Abstraction over ordered/unordered work queues
-pub trait WorkQueueInterface<'arena, 'work_item> {
-    fn add_work(&mut self, work_item: &'work_item WorkItem<'arena, 'work_item>);
+pub trait WorkQueueInterface {
+    type WorkItemTy;
+    fn add_work(&mut self, work_item: Self::WorkItemTy);
 }

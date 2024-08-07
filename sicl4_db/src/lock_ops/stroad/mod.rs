@@ -76,8 +76,8 @@ use std::{
     sync::atomic::Ordering,
 };
 
-use crate::loom_testing::*;
 use crate::util::to_unsafecell;
+use crate::{executor_engine::WorkQueueInterface, loom_testing::*};
 
 use super::TypeErasedObjRef;
 
@@ -88,18 +88,34 @@ use super::TypeErasedObjRef;
 ///
 /// This will be called, with the bucket lock held,
 /// on the thread that released the lock triggering the unpark/cancel.
+/// This thread will be an "other" thread, i.e. *not* the thread which
+/// is potentially actively working on the work item. These methods must
+/// internally synchronize s.t. this is safe.
 ///
 /// This can be called from multiple threads at the same time!
 /// Methods _must_ be safe to call from multiple threads, must be idempotent,
 /// and "cancel" must win over "unpark".
 // TODO: add "get priority" here maybe??? (difference is one pointer indirection)
-pub trait StroadToWorkItemLink: Send + Sync {
-    type UnparkXtraTy;
+pub trait WorkItemInterface: Send + Sync {
+    type WorkItemTy;
+
+    /// The given work item is now possible to attempt to run again
+    ///
+    /// Used for both ordered and unordered algorithms
+    ///
+    /// Called only once, after the thread working on the work item fails to grab a lock.
+    /// However, it can be called at the same time as the working thread is
+    /// still trying to release the locks it has successfully speculatively acquired.
+    fn unpark<Q: WorkQueueInterface<WorkItemTy = Self::WorkItemTy>>(&self, onto_q: &mut Q);
 
     /// The given work item has been invalidated by some other access
-    fn cancel(&self);
-    /// The given work item is now possible to attempt to run again
-    fn unpark(&self, xtra: &mut Self::UnparkXtraTy);
+    ///
+    /// Used only for ordered algorithms
+    ///
+    /// This can be called from multiple threads at the same time
+    /// (e.g. work item holds two speculative locks, both get cancelled due to *two*
+    /// higher-priority work items)
+    fn cancel<Q: WorkQueueInterface<WorkItemTy = Self::WorkItemTy>>(&self, onto_q: &mut Q);
 }
 
 /// log2 of the number of toplevel shards
@@ -178,7 +194,7 @@ pub struct StroadNode<'stroad_node, 'arena, P> {
     /// A link to get the work item from this node
     pub work_item_link: P,
 }
-impl<'stroad_node, 'arena, P: StroadToWorkItemLink> StroadNode<'stroad_node, 'arena, P> {
+impl<'stroad_node, 'arena, P> StroadNode<'stroad_node, 'arena, P> {
     /// Initialize in place, *EXCEPT* the external work item link
     pub unsafe fn init(self_: *mut Self, obj: TypeErasedObjRef<'arena>) {
         (*self_).link = DoubleLL {
@@ -331,7 +347,7 @@ impl<'stroad_node, 'arena, P> Debug for StroadShard<'stroad_node, 'arena, P> {
             .finish()
     }
 }
-impl<'stroad_node, 'arena, P: StroadToWorkItemLink> StroadShard<'stroad_node, 'arena, P> {
+impl<'stroad_node, 'arena, P: WorkItemInterface> StroadShard<'stroad_node, 'arena, P> {
     /// Insert the lock instance onto either the [wants_lock](StroadBucket::wants_lock)
     /// or [holds_lock](StroadBucket::holds_lock) list
     ///
@@ -446,11 +462,11 @@ impl<'stroad_node, 'arena, P: StroadToWorkItemLink> StroadShard<'stroad_node, 'a
     /// Unpark all items on the [wants_lock](StroadBucket::wants_lock) list
     ///
     /// This is used for the unordered case
-    pub fn unpark_all(
+    pub fn unpark_all<Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &mut self,
         key: TypeErasedObjRef<'arena>,
         hash: u64,
-        unpark_xtra: &mut P::UnparkXtraTy,
+        onto_q: &mut Q,
     ) {
         let buckets = self.buckets_and_lock.load(Ordering::Relaxed) & !1;
         let buckets = buckets as *mut StroadBucket<'stroad_node, 'arena, P>;
@@ -476,7 +492,7 @@ impl<'stroad_node, 'arena, P: StroadToWorkItemLink> StroadShard<'stroad_node, 'a
                 // only at this point, after unlink, do we know that nothing else
                 // is referencing the node
                 let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                list_ent_mut.work_item_link.unpark(unpark_xtra);
+                list_ent_mut.work_item_link.unpark(onto_q);
                 self.nents -= 1;
             } else {
                 list_ent = list_ent_ref.link.next;
@@ -544,10 +560,7 @@ pub struct Stroad<'stroad_node, 'arena, P> {
 //
 // we can compute hashes and unpark/cancel simultaneously from different threads
 // (see notes on the trait) --> require Sync on K (and P)
-unsafe impl<'stroad_node, 'arena, P: StroadToWorkItemLink> Sync
-    for Stroad<'stroad_node, 'arena, P>
-{
-}
+unsafe impl<'stroad_node, 'arena, P: WorkItemInterface> Sync for Stroad<'stroad_node, 'arena, P> {}
 impl<'stroad_node, 'arena, P> Debug for Stroad<'stroad_node, 'arena, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut dbg = f.debug_struct("Stroad");
@@ -561,7 +574,7 @@ impl<'stroad_node, 'arena, P> Debug for Stroad<'stroad_node, 'arena, P> {
         dbg.finish()
     }
 }
-impl<'stroad_node, 'arena, P: StroadToWorkItemLink> Stroad<'stroad_node, 'arena, P> {
+impl<'stroad_node, 'arena, P: WorkItemInterface> Stroad<'stroad_node, 'arena, P> {
     /// Allocate a new hash map
     ///
     /// Always returns a box because it overflows the stack otherwise
@@ -608,15 +621,15 @@ impl<'stroad_node, 'arena, P: StroadToWorkItemLink> Stroad<'stroad_node, 'arena,
     }
 
     /// For an ordered algorithm, unblock all the work items
-    pub fn unordered_unpark_all(
+    pub fn unordered_unpark_all<Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &self,
         key: TypeErasedObjRef<'arena>,
-        unpark_xtra: &mut P::UnparkXtraTy,
+        onto_q: &mut Q,
     ) {
         let hash = hash(key);
         let shard = hash & (HASH_NUM_SHARDS as u64 - 1);
         let mut shard = self.lock_shard(shard as usize);
-        shard.unpark_all(key, hash, unpark_xtra);
+        shard.unpark_all(key, hash, onto_q);
     }
 
     /// Lock a given shard, returning a guard that allows access to it from the current (OS) thread only
@@ -659,11 +672,12 @@ impl<'stroad_node, 'arena, P: StroadToWorkItemLink> Stroad<'stroad_node, 'arena,
     /// abort other work items if necessary, and eventually return whether we're allowed to run
     ///
     /// Calls the `mark_item` callback with the bucket lock held upon success
-    pub fn ordered_do_locking<MARK>(
+    pub fn ordered_do_locking<MARK, Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &self,
         stroad_node: &'stroad_node mut StroadNode<'stroad_node, 'arena, P>,
         prio: i64,
         mark_item: MARK,
+        cancel_q: &mut Q,
     ) -> (bool, &'stroad_node StroadNode<'stroad_node, 'arena, P>)
     where
         MARK: FnOnce(),
@@ -743,7 +757,7 @@ impl<'stroad_node, 'arena, P: StroadToWorkItemLink> Stroad<'stroad_node, 'arena,
                             // only at this point, after unlink, do we know that nothing else
                             // is referencing the node
                             let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                            list_ent_mut.work_item_link.cancel();
+                            list_ent_mut.work_item_link.cancel(cancel_q);
                             shard.nents -= 1;
                         } else {
                             let other_prio = list_ent_ref.prio;
@@ -753,7 +767,7 @@ impl<'stroad_node, 'arena, P: StroadToWorkItemLink> Stroad<'stroad_node, 'arena,
                                 // only at this point, after unlink, do we know that nothing else
                                 // is referencing the node
                                 let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                                list_ent_mut.work_item_link.cancel();
+                                list_ent_mut.work_item_link.cancel(cancel_q);
                                 shard.nents -= 1;
                             } else if prio == other_prio {
                                 panic!("reader with same priority, even though we checked?");
@@ -803,12 +817,12 @@ impl<'stroad_node, 'arena, P: StroadToWorkItemLink> Stroad<'stroad_node, 'arena,
     /// Should only be called if stroad_node is holding a write lock,
     /// or if the stroad_node is holding the *last* read lock, with no write lock
     /// of lower priority pending.
-    pub fn ordered_do_unlocking<VAL, UNMARK>(
+    pub fn ordered_do_unlocking<VAL, UNMARK, Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &self,
         stroad_node: &'stroad_node StroadNode<'stroad_node, 'arena, P>,
         unpark_validation: VAL,
         unmark_item: UNMARK,
-        unpark_xtra: &mut P::UnparkXtraTy,
+        unpark_q: &mut Q,
     ) -> &'stroad_node mut StroadNode<'stroad_node, 'arena, P>
     where
         VAL: FnOnce() -> bool,
@@ -907,7 +921,7 @@ impl<'stroad_node, 'arena, P: StroadToWorkItemLink> Stroad<'stroad_node, 'arena,
                         // only at this point, after unlink, do we know that nothing else
                         // is referencing the node
                         let list_ent_mut = unsafe { &mut *list_ent_.get() };
-                        list_ent_mut.work_item_link.unpark(unpark_xtra);
+                        list_ent_mut.work_item_link.unpark(unpark_q);
                         shard.nents -= 1;
                     } else {
                         list_ent = list_ent_ref.link.next;
@@ -922,7 +936,7 @@ impl<'stroad_node, 'arena, P: StroadToWorkItemLink> Stroad<'stroad_node, 'arena,
             if let Some(highest_found_writer) = highest_found_writer {
                 bucket.unlink_item(highest_found_writer, false);
                 let highest_found_writer_node = unsafe { &mut *highest_found_writer.get() };
-                highest_found_writer_node.work_item_link.unpark(unpark_xtra);
+                highest_found_writer_node.work_item_link.unpark(unpark_q);
                 shard.nents -= 1;
             }
         }

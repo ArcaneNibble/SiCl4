@@ -4,21 +4,27 @@ use mem::MaybeUninit;
 
 use super::*;
 
+struct DebugDummyQueue {}
+impl WorkQueueInterface for DebugDummyQueue {
+    type WorkItemTy = ();
+    fn add_work(&mut self, _: Self::WorkItemTy) {}
+}
+
 #[derive(Default, Debug)]
 struct LockingTestingPayload {
     unparked: AtomicBool,
     cancelled: AtomicBool,
 }
-impl StroadToWorkItemLink for LockingTestingPayload {
-    fn unpark(&self, _: &mut ()) {
+impl WorkItemInterface for LockingTestingPayload {
+    type WorkItemTy = ();
+
+    fn unpark<Q: WorkQueueInterface<WorkItemTy = Self::WorkItemTy>>(&self, _onto_q: &mut Q) {
         self.unparked.store(true, Ordering::Relaxed);
     }
 
-    fn cancel(&self) {
+    fn cancel<Q: WorkQueueInterface<WorkItemTy = Self::WorkItemTy>>(&self, _onto_q: &mut Q) {
         self.cancelled.store(true, Ordering::Relaxed);
     }
-
-    type UnparkXtraTy = ();
 }
 
 struct JustU32Mapper {}
@@ -66,7 +72,7 @@ fn locking_manual_tests() {
     dbg!(&lock);
 
     unsafe {
-        lock.unlock(&stroad, &mut ());
+        lock.unlock(&stroad, &mut DebugDummyQueue {});
     }
     dbg!(&lock);
 
@@ -327,7 +333,7 @@ fn locking_loom_unordered_ww_unlock() {
                 // needed in order to simulate processing taking some time
                 loom::thread::yield_now();
                 unsafe {
-                    t1_lock.unlock(stroad, &mut ());
+                    t1_lock.unlock(stroad, &mut DebugDummyQueue {});
                 }
             }
         });
@@ -341,7 +347,7 @@ fn locking_loom_unordered_ww_unlock() {
                 loom::thread::yield_now();
                 // drop guard
                 unsafe {
-                    t2_lock.unlock(stroad, &mut ());
+                    t2_lock.unlock(stroad, &mut DebugDummyQueue {});
                 }
             }
         });
@@ -464,7 +470,7 @@ fn locking_single_threaded_write_unpark_sim() {
     );
 
     unsafe {
-        lock_0.unlock(&stroad, &mut ());
+        lock_0.unlock(&stroad, &mut DebugDummyQueue {});
         assert_eq!(
             obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
             0x8000000000000000 | (gen << 8)
@@ -537,7 +543,7 @@ fn locking_single_threaded_read_unpark_sim() {
     );
 
     unsafe {
-        lock_0.unlock(&stroad, &mut ());
+        lock_0.unlock(&stroad, &mut DebugDummyQueue {});
         assert!(!(*lock_2.stroad_state.get())
             .work_item_link
             .unparked
@@ -546,7 +552,7 @@ fn locking_single_threaded_read_unpark_sim() {
             obj_ref.ptr.lock_and_generation.load(Ordering::Relaxed),
             0x8000000000000081 | (gen << 8)
         );
-        lock_1.unlock(&stroad, &mut ());
+        lock_1.unlock(&stroad, &mut DebugDummyQueue {});
         assert!((*lock_2.stroad_state.get())
             .work_item_link
             .unparked
@@ -583,7 +589,7 @@ fn locking_single_threaded_ordered_write_causes_unpark_sim() {
             LockingTestingPayload::default();
         lock_0.assume_init()
     };
-    let ret = lock_0.ordered_try_read(&stroad, 0);
+    let ret = lock_0.ordered_try_read(&stroad, 0, &mut DebugDummyQueue {});
     assert_eq!(ret, Ok(true));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 1);
 
@@ -594,7 +600,7 @@ fn locking_single_threaded_ordered_write_causes_unpark_sim() {
             LockingTestingPayload::default();
         lock_1.assume_init()
     };
-    let ret = lock_1.ordered_try_write(&stroad, 1);
+    let ret = lock_1.ordered_try_write(&stroad, 1, &mut DebugDummyQueue {});
     assert_eq!(ret, Ok(true));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
@@ -605,20 +611,20 @@ fn locking_single_threaded_ordered_write_causes_unpark_sim() {
             LockingTestingPayload::default();
         lock_2.assume_init()
     };
-    let ret = lock_2.ordered_try_read(&stroad, 2);
+    let ret = lock_2.ordered_try_read(&stroad, 2, &mut DebugDummyQueue {});
     assert_eq!(ret, Ok(false));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
     unsafe {
         // the read shouldn't trigger an unpark
-        lock_0.unlock(&stroad, &mut ());
+        lock_0.unlock(&stroad, &mut DebugDummyQueue {});
         assert!(!(*lock_2.stroad_state.get())
             .work_item_link
             .unparked
             .load(Ordering::Relaxed));
         assert_eq!(*obj_ref.ptr.num_rw.get(), 0x8000000000000000);
         // but the write should
-        lock_1.unlock(&stroad, &mut ());
+        lock_1.unlock(&stroad, &mut DebugDummyQueue {});
         assert!((*lock_2.stroad_state.get())
             .work_item_link
             .unparked
@@ -652,7 +658,7 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
             LockingTestingPayload::default();
         lock_0.assume_init()
     };
-    let ret = lock_0.ordered_try_read(&stroad, 0);
+    let ret = lock_0.ordered_try_read(&stroad, 0, &mut DebugDummyQueue {});
     assert_eq!(ret, Ok(true));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 1);
 
@@ -663,7 +669,7 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
             LockingTestingPayload::default();
         lock_1.assume_init()
     };
-    let ret = lock_1.ordered_try_write(&stroad, 1);
+    let ret = lock_1.ordered_try_write(&stroad, 1, &mut DebugDummyQueue {});
     assert_eq!(ret, Ok(true));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
@@ -674,7 +680,7 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
             LockingTestingPayload::default();
         lock_2.assume_init()
     };
-    let ret = lock_2.ordered_try_read(&stroad, 2);
+    let ret = lock_2.ordered_try_read(&stroad, 2, &mut DebugDummyQueue {});
     assert_eq!(ret, Ok(false));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
@@ -685,7 +691,7 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
             LockingTestingPayload::default();
         lock_3.assume_init()
     };
-    let ret = lock_3.ordered_try_read(&stroad, 3);
+    let ret = lock_3.ordered_try_read(&stroad, 3, &mut DebugDummyQueue {});
     assert_eq!(ret, Ok(false));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
@@ -696,12 +702,12 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
             LockingTestingPayload::default();
         lock_4.assume_init()
     };
-    let ret = lock_4.ordered_try_write(&stroad, 3);
+    let ret = lock_4.ordered_try_write(&stroad, 3, &mut DebugDummyQueue {});
     assert_eq!(ret, Ok(false));
     assert_eq!(unsafe { *obj_ref.ptr.num_rw.get() }, 0x8000000000000001);
 
     unsafe {
-        lock_0.unlock(&stroad, &mut ());
+        lock_0.unlock(&stroad, &mut DebugDummyQueue {});
         // shouldn't unpark anything yet
         assert_eq!(*obj_ref.ptr.num_rw.get(), 0x8000000000000000);
         assert!(!(*lock_2.stroad_state.get())
@@ -717,7 +723,7 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
             .unparked
             .load(Ordering::Relaxed));
 
-        lock_1.unlock(&stroad, &mut ());
+        lock_1.unlock(&stroad, &mut DebugDummyQueue {});
         assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
         // both of these should now be unparked
         assert!((*lock_2.stroad_state.get())
@@ -737,14 +743,14 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
         // xxx simulate 2 and 3 getting re-acquired
         lock_2.state.set(LockState::Unlocked);
         lock_3.state.set(LockState::Unlocked);
-        let ret = lock_2.ordered_try_read(&stroad, 2);
+        let ret = lock_2.ordered_try_read(&stroad, 2, &mut DebugDummyQueue {});
         assert_eq!(ret, Ok(true));
         assert_eq!(*obj_ref.ptr.num_rw.get(), 1);
-        let ret = lock_3.ordered_try_read(&stroad, 2);
+        let ret = lock_3.ordered_try_read(&stroad, 2, &mut DebugDummyQueue {});
         assert_eq!(ret, Ok(true));
         assert_eq!(*obj_ref.ptr.num_rw.get(), 2);
 
-        lock_2.unlock(&stroad, &mut ());
+        lock_2.unlock(&stroad, &mut DebugDummyQueue {});
         // shouldn't unpark yet
         assert_eq!(*obj_ref.ptr.num_rw.get(), 1);
         assert!(!(*lock_4.stroad_state.get())
@@ -752,7 +758,7 @@ fn locking_single_threaded_ordered_read_causes_unpark_sim() {
             .unparked
             .load(Ordering::Relaxed));
 
-        lock_3.unlock(&stroad, &mut ());
+        lock_3.unlock(&stroad, &mut DebugDummyQueue {});
         // now it should
         assert_eq!(*obj_ref.ptr.num_rw.get(), 0);
         assert!((*lock_4.stroad_state.get())

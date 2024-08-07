@@ -4,21 +4,27 @@ use crate::lock_ops::*;
 
 use super::*;
 
+struct DebugDummyQueue {}
+impl WorkQueueInterface for DebugDummyQueue {
+    type WorkItemTy = ();
+    fn add_work(&mut self, _: Self::WorkItemTy) {}
+}
+
 #[derive(Default, Debug)]
 struct StroadTestingPayload {
     unparked: AtomicBool,
     cancelled: AtomicBool,
 }
-impl StroadToWorkItemLink for StroadTestingPayload {
-    fn unpark(&self, _: &mut ()) {
+impl WorkItemInterface for StroadTestingPayload {
+    type WorkItemTy = ();
+
+    fn unpark<Q: WorkQueueInterface<WorkItemTy = Self::WorkItemTy>>(&self, _onto_q: &mut Q) {
         self.unparked.store(true, Ordering::Relaxed);
     }
 
-    fn cancel(&self) {
+    fn cancel<Q: WorkQueueInterface<WorkItemTy = Self::WorkItemTy>>(&self, _onto_q: &mut Q) {
         self.cancelled.store(true, Ordering::Relaxed);
     }
-
-    type UnparkXtraTy = ();
 }
 
 #[cfg(not(loom))]
@@ -210,7 +216,7 @@ fn stroad_unpark_all() {
 
     let _ = stroad.unordered_park_conditionally(&mut list_ent_0, || true);
     let _ = stroad.unordered_park_conditionally(&mut list_ent_1, || true);
-    stroad.unordered_unpark_all(DUMMY_OBJ_0_REF, &mut ());
+    stroad.unordered_unpark_all(DUMMY_OBJ_0_REF, &mut DebugDummyQueue {});
 
     unsafe {
         assert!((*list_ent_0_ptr)
@@ -543,32 +549,32 @@ fn stroad_priority_locking() {
 
     // some readers
     println!("* ent 0");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 0, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 0, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     println!("* ent 1");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 1, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 1, || {}, &mut DebugDummyQueue {});
     assert!(ret);
 
     // failed writers
     println!("* ent 2");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, -2, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, -2, || {}, &mut DebugDummyQueue {});
     assert!(!ret);
     println!("* ent 3");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, -1, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, -1, || {}, &mut DebugDummyQueue {});
     assert!(!ret);
 
     // success writer
     println!("* ent 4");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, -10, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, -10, || {}, &mut DebugDummyQueue {});
     assert!(ret);
 
     // fail writer
     println!("* ent 5");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_5, -11, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_5, -11, || {}, &mut DebugDummyQueue {});
     assert!(!ret);
     // success writer, cancel _ent_4
     println!("* ent 6");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_6, -9, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_6, -9, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     unsafe {
         assert!((*list_ent_4_ptr)
@@ -579,11 +585,11 @@ fn stroad_priority_locking() {
 
     // fail reader
     println!("* ent 7");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_7, 8, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_7, 8, || {}, &mut DebugDummyQueue {});
     assert!(!ret);
     // success reader
     println!("* ent 8");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_8, 7, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_8, 7, || {}, &mut DebugDummyQueue {});
     assert!(ret);
 
     // test the lists
@@ -742,21 +748,21 @@ fn stroad_writer_canceling_readers() {
 
     // some readers, spaced out
     println!("* ent 0");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 1, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 1, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     println!("* ent 1");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 3, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 3, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     println!("* ent 2");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, 5, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, 5, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     println!("* ent 3");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, 7, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, 7, || {}, &mut DebugDummyQueue {});
     assert!(ret);
 
     // success writer, cancel _ent_2 and _ent 3
     println!("* ent 4");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, -5, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, -5, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     unsafe {
         assert!((*list_ent_3_ptr)
@@ -899,30 +905,35 @@ fn stroad_priority_unlocking() {
     let stroad = Stroad::<StroadTestingPayload>::new();
 
     println!("* ent 0");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 0, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 0, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     println!("* ent 1");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 1, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, 1, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     println!("* ent 2");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, -3, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, -3, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     println!("* ent 3");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, 3, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_3, 3, || {}, &mut DebugDummyQueue {});
     assert!(!ret);
     println!("* ent 4");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, 4, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_4, 4, || {}, &mut DebugDummyQueue {});
     assert!(!ret);
     println!("* ent 5");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_5, -5, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_5, -5, || {}, &mut DebugDummyQueue {});
     assert!(!ret);
     println!("* ent 6");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_6, -5, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_6, -5, || {}, &mut DebugDummyQueue {});
     assert!(!ret);
 
     // ent 2 will cause an unlock (as a writer)
     println!("** unlock ent 2");
-    stroad.ordered_do_unlocking(unsafe { &*(list_ent_2_ptr) }, || true, || {}, &mut ());
+    stroad.ordered_do_unlocking(
+        unsafe { &*(list_ent_2_ptr) },
+        || true,
+        || {},
+        &mut DebugDummyQueue {},
+    );
     unsafe {
         assert!((*list_ent_4_ptr)
             .work_item_link
@@ -937,7 +948,12 @@ fn stroad_priority_unlocking() {
     // *one* of the readers will cause an unlock
     // it *shouldn't* matter which, as long as it's the last
     println!("** unlock ent 3");
-    stroad.ordered_do_unlocking(unsafe { &*(list_ent_3_ptr) }, || true, || {}, &mut ());
+    stroad.ordered_do_unlocking(
+        unsafe { &*(list_ent_3_ptr) },
+        || true,
+        || {},
+        &mut DebugDummyQueue {},
+    );
     unsafe {
         assert!((*list_ent_6_ptr)
             .work_item_link
@@ -947,7 +963,12 @@ fn stroad_priority_unlocking() {
 
     // this should unlock the other writer
     println!("** unlock ent 6");
-    stroad.ordered_do_unlocking(unsafe { &*(list_ent_6_ptr) }, || true, || {}, &mut ());
+    stroad.ordered_do_unlocking(
+        unsafe { &*(list_ent_6_ptr) },
+        || true,
+        || {},
+        &mut DebugDummyQueue {},
+    );
     unsafe {
         assert!((*list_ent_5_ptr)
             .work_item_link
@@ -957,7 +978,12 @@ fn stroad_priority_unlocking() {
 
     // this should unlock nothing
     println!("** unlock ent 5");
-    stroad.ordered_do_unlocking(unsafe { &*(list_ent_5_ptr) }, || true, || {}, &mut ());
+    stroad.ordered_do_unlocking(
+        unsafe { &*(list_ent_5_ptr) },
+        || true,
+        || {},
+        &mut DebugDummyQueue {},
+    );
 }
 
 #[cfg(not(loom))]
@@ -996,13 +1022,13 @@ fn stroad_writers_dont_cancel_if_conflict() {
     let stroad = Stroad::<StroadTestingPayload>::new();
 
     println!("* ent 0");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 0, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_0, 0, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     println!("* ent 1");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, -2, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_1, -2, || {}, &mut DebugDummyQueue {});
     assert!(ret);
     println!("* ent 2");
-    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, -1, || {});
+    let (ret, _) = stroad.ordered_do_locking(&mut list_ent_2, -1, || {}, &mut DebugDummyQueue {});
     assert!(!ret); // won't work, conflicts with the reader
 
     unsafe {
@@ -1170,7 +1196,7 @@ fn stroad_loom_park_unpark() {
             let _ = stroad.unordered_park_conditionally(list_ent_1, || true);
         });
         let t2 = loom::thread::spawn(move || {
-            stroad.unordered_unpark_all(loom_dummy_obj_ref, &mut ());
+            stroad.unordered_unpark_all(loom_dummy_obj_ref, &mut DebugDummyQueue {});
         });
         t1.join().unwrap();
         t2.join().unwrap();

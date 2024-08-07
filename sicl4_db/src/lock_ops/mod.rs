@@ -42,6 +42,7 @@ use std::sync::atomic::Ordering;
 use tracing::Level;
 
 use crate::allocator::*;
+use crate::executor_engine::WorkQueueInterface;
 use crate::loom_testing::*;
 use crate::util::UsizePtr;
 
@@ -201,7 +202,7 @@ impl<'arena, 'lock_inst, P: Debug> Debug for LockAndStroadData<'arena, 'lock_ins
         dbg.finish()
     }
 }
-impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'lock_inst, P> {
+impl<'arena, 'lock_inst, P: WorkItemInterface> LockAndStroadData<'arena, 'lock_inst, P> {
     /// Initialize a lock object in place, *EXCEPT* the external work item link
     pub unsafe fn init(self_: *mut Self, obj: TypeErasedObjRef<'arena>) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::init");
@@ -470,10 +471,11 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     ///
     /// Returns `Err(())` if the object has been deleted, or else `Ok(bool)`,
     /// where the bool indicates whether or not the locking was successful.
-    pub fn ordered_try_write<'stroad>(
+    pub fn ordered_try_write<'stroad, Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
         prio: u64,
+        cancel_q: &mut Q,
     ) -> Result<bool, ()> {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
@@ -505,14 +507,19 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         // xxx is this right?
 
         // object exists, try to lock it
-        let (locked, _) = stroad.ordered_do_locking(lock_inst, prio, || {
-            // here the bucket lock is held, so we indirectly have exclusive access to the
-            // object we are trying to lock, which means that we can manipulate this counter
-            let num_rw = p.ptr.num_rw.get();
-            unsafe {
-                *num_rw |= 0x8000000000000000;
-            }
-        });
+        let (locked, _) = stroad.ordered_do_locking(
+            lock_inst,
+            prio,
+            || {
+                // here the bucket lock is held, so we indirectly have exclusive access to the
+                // object we are trying to lock, which means that we can manipulate this counter
+                let num_rw = p.ptr.num_rw.get();
+                unsafe {
+                    *num_rw |= 0x8000000000000000;
+                }
+            },
+            cancel_q,
+        );
 
         if locked {
             self.state.set(LockState::LockedForOrderedWrite);
@@ -530,10 +537,11 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     ///
     /// Returns `Err(())` if the object has been deleted, or else `Ok(bool)`,
     /// where the bool indicates whether or not the locking was successful.
-    pub fn ordered_try_read<'stroad>(
+    pub fn ordered_try_read<'stroad, Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
         prio: u64,
+        cancel_q: &mut Q,
     ) -> Result<bool, ()> {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::ordered_try_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
@@ -565,16 +573,21 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         // xxx is this right?
 
         // object exists, try to lock it
-        let (locked, _) = stroad.ordered_do_locking(lock_inst, prio, || {
-            // here the bucket lock is held, so we indirectly have exclusive access to the
-            // object we are trying to lock, which means that we can manipulate this counter
-            let num_rw = p.ptr.num_rw.get();
-            unsafe {
-                let old_num_rw = *num_rw;
-                *num_rw =
-                    ((old_num_rw & 0x7fffffffffffffff) + 1) | (old_num_rw & 0x8000000000000000);
-            }
-        });
+        let (locked, _) = stroad.ordered_do_locking(
+            lock_inst,
+            prio,
+            || {
+                // here the bucket lock is held, so we indirectly have exclusive access to the
+                // object we are trying to lock, which means that we can manipulate this counter
+                let num_rw = p.ptr.num_rw.get();
+                unsafe {
+                    let old_num_rw = *num_rw;
+                    *num_rw =
+                        ((old_num_rw & 0x7fffffffffffffff) + 1) | (old_num_rw & 0x8000000000000000);
+                }
+            },
+            cancel_q,
+        );
 
         if locked {
             self.state.set(LockState::LockedForOrderedRead);
@@ -594,10 +607,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// * you need to pass in *the same* stroad object used to lock it.
     ///   (not storing this saves memory)
     /// * you can only call this when no references to the protected data exist
-    pub unsafe fn unlock<'stroad>(
+    pub unsafe fn unlock<'stroad, Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
-        unpark_xtra: &mut P::UnparkXtraTy,
+        unpark_q: &mut Q,
     ) {
         match self.state.get() {
             LockState::Unlocked => {
@@ -606,20 +619,20 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
             LockState::Parked => {
                 // fixme: what are we supposed to do here?
             }
-            LockState::LockedForUnorderedRead => self.unlock_unordered_read(stroad, unpark_xtra),
-            LockState::LockedForUnorderedWrite => self.unlock_unordered_write(stroad, unpark_xtra),
-            LockState::LockedForOrderedRead => self.unlock_ordered_read(stroad, unpark_xtra),
-            LockState::LockedForOrderedWrite => self.unlock_ordered_write(stroad, unpark_xtra),
+            LockState::LockedForUnorderedRead => self.unlock_unordered_read(stroad, unpark_q),
+            LockState::LockedForUnorderedWrite => self.unlock_unordered_write(stroad, unpark_q),
+            LockState::LockedForOrderedRead => self.unlock_ordered_read(stroad, unpark_q),
+            LockState::LockedForOrderedWrite => self.unlock_ordered_write(stroad, unpark_q),
         }
     }
 
     /// Unlock for an unordered r/w lock
     ///
     /// Always unparks everything
-    fn unlock_unordered_write<'stroad>(
+    fn unlock_unordered_write<'stroad, Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
-        unpark_xtra: &mut P::UnparkXtraTy,
+        unpark_q: &mut Q,
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
@@ -641,7 +654,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
         debug_assert_eq!(lock_gen_rwlock(old_atomic_val), 0x7f);
 
         if lock_gen_maybe_parked(old_atomic_val) {
-            stroad.unordered_unpark_all(p, unpark_xtra);
+            stroad.unordered_unpark_all(p, unpark_q);
         }
 
         self.state.set(LockState::Unlocked);
@@ -650,10 +663,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// Unlock for an unordered r/o lock
     ///
     /// Unparks if we are the final reader
-    fn unlock_unordered_read<'stroad>(
+    fn unlock_unordered_read<'stroad, Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
-        unpark_xtra: &mut P::UnparkXtraTy,
+        unpark_q: &mut Q,
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_unordered_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
@@ -684,7 +697,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     if lock_gen_rwlock(old_atomic_val) == 1 && lock_gen_maybe_parked(old_atomic_val)
                     {
                         // fixme can we optimize this?
-                        stroad.unordered_unpark_all(p, unpark_xtra);
+                        stroad.unordered_unpark_all(p, unpark_q);
                     }
                     break;
                 }
@@ -698,10 +711,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// Unlock for an ordered r/w lock
     ///
     /// Always unparks everything
-    fn unlock_ordered_write<'stroad>(
+    fn unlock_ordered_write<'stroad, Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
-        unpark_xtra: &mut P::UnparkXtraTy,
+        unpark_q: &mut Q,
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_write", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
@@ -726,7 +739,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                     *num_rw &= !0x8000000000000000;
                 }
             },
-            unpark_xtra,
+            unpark_q,
         );
 
         self.state.set(LockState::Unlocked);
@@ -735,10 +748,10 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
     /// Unlock for an ordered r/o lock
     ///
     /// Unparks if we are the final reader *and* there isn't a writer
-    fn unlock_ordered_read<'stroad>(
+    fn unlock_ordered_read<'stroad, Q: WorkQueueInterface<WorkItemTy = P::WorkItemTy>>(
         &'lock_inst self,
         stroad: &'stroad Stroad<'lock_inst, 'arena, P>,
-        unpark_xtra: &mut P::UnparkXtraTy,
+        unpark_q: &mut Q,
     ) {
         let tracing_span = tracing::span!(Level::TRACE, "LockAndStroadData::unlock_ordered_read", lock_ptr = ?UsizePtr::from(self));
         let _span_enter = tracing_span.enter();
@@ -767,7 +780,7 @@ impl<'arena, 'lock_inst, P: StroadToWorkItemLink> LockAndStroadData<'arena, 'loc
                         ((old_num_rw & 0x7fffffffffffffff) - 1) | (old_num_rw & 0x8000000000000000);
                 }
             },
-            unpark_xtra,
+            unpark_q,
         );
     }
 }
