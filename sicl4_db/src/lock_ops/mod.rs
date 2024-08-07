@@ -97,11 +97,18 @@ pub struct LockedObj<T> {
 unsafe impl<T: Send + Sync> Send for LockedObj<T> {}
 unsafe impl<T: Send + Sync> Sync for LockedObj<T> {}
 impl<T> LockedObj<T> {
-    pub unsafe fn init(self_: *mut Self, gen: u64, xtra: u64) {
+    pub unsafe fn init_unordered(self_: *mut Self, gen: u64) {
         (*self_)
             .lock_and_generation
-            .store(LOCK_GEN_VALID_BIT | (gen << 8) | xtra, Ordering::Relaxed);
+            .store(LOCK_GEN_VALID_BIT | (gen << 8) | 0x7f, Ordering::Relaxed);
         *(*self_).num_rw.get() = 0;
+    }
+
+    pub unsafe fn init_ordered(self_: *mut Self, gen: u64) {
+        (*self_)
+            .lock_and_generation
+            .store(LOCK_GEN_VALID_BIT | (gen << 8), Ordering::Relaxed);
+        *(*self_).num_rw.get() = 1 << 63;
     }
 }
 
