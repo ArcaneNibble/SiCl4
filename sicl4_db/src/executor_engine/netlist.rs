@@ -95,7 +95,7 @@ impl<'arena, T> DerefMut for RWGuard<'arena, T> {
 }
 
 /// Separate cells/wires/work items into separate type bins
-struct NetlistTypeMapper {}
+pub struct NetlistTypeMapper {}
 impl TypeMapper for NetlistTypeMapper {
     type BinsArrayTy<T> = [T; 3];
     const LAYOUTS: &'static [&'static [Layout]] = &[
