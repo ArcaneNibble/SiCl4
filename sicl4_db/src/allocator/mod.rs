@@ -124,13 +124,13 @@ impl<T, const N: usize> ConstGenericsHackWorkaround<T> for [T; N] {
 ///         &[Layout::new::<u16>(), Layout::new::<u32>()],
 ///     ];
 /// }
-/// impl TypeMappable<ExampleMapper> for u8 {
+/// unsafe impl TypeMappable<ExampleMapper> for u8 {
 ///     const I: usize = 0;
 /// }
-/// impl TypeMappable<ExampleMapper> for u16 {
+/// unsafe impl TypeMappable<ExampleMapper> for u16 {
 ///     const I: usize = 1;
 /// }
-/// impl TypeMappable<ExampleMapper> for u32 {
+/// unsafe impl TypeMappable<ExampleMapper> for u32 {
 ///     const I: usize = 1;
 /// }
 /// ```
