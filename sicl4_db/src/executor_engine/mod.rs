@@ -614,7 +614,7 @@ impl<'arena> NetlistManager<'arena> {
                 });
             }
         });
-        // self.stroad._debug_dump();
+        self.stroad._debug_dump();
         self.in_use.set(false);
     }
 
@@ -801,7 +801,10 @@ impl<'arena> NetlistManager<'arena> {
                 });
             }
         });
-        // self.stroad._debug_dump();
+        self.stroad._debug_dump();
         self.in_use.set(false);
     }
 }
+
+#[cfg(test)]
+mod tests;
