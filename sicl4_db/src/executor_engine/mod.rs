@@ -3,14 +3,102 @@
 use std::marker::PhantomData;
 use std::{cell::Cell, fmt::Debug};
 
-use netlist::{NetlistRef, NetlistTypeMapper};
+use netlist::*;
 use single_threaded::SingleThreadedView;
 
 use crate::lock_ops::stroad::WorkItemInterface;
+use crate::netlist::*;
 use crate::{allocator::SlabRoot, lock_ops::stroad::Stroad};
 
 pub mod netlist;
 pub mod single_threaded;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum SpeculativeLockGrabResult {
+    /// This work item should block, as it tried to grab an item that is currently in use.
+    /// The other thing will tell us when it's done, and there's no point in retrying before then.
+    Block,
+    /// Whilst trying to get a lock, somebody else came in and told us to cancel.
+    /// We have no idea when we can retry. The thing causing the cancellation wants to write to
+    /// data that we might've read, so we have to start over.
+    Cancel,
+}
+
+/// Common API for speculatively grabbing locks on a netlist
+pub trait NetlistROView<'arena> {
+    /// Try to get a lock on a cell
+    ///
+    /// Returns:
+    /// * `Err(e)` - lock contention
+    /// * `Ok(None)` - object is gone, deleted, don't try again
+    /// * `Ok(Some(x))` - locked the thing
+    fn try_lock_cell<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistCellRef<'arena>,
+        want_write: bool,
+    ) -> Result<Option<ROGuard<'arena, NetlistCell<'arena>>>, SpeculativeLockGrabResult>;
+
+    /// Try to get a lock on a wire
+    ///
+    /// See [Self::try_lock_cell]
+    fn try_lock_wire<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistWireRef<'arena>,
+        want_write: bool,
+    ) -> Result<Option<ROGuard<'arena, NetlistWire<'arena>>>, SpeculativeLockGrabResult>;
+}
+
+/// Common API for doing stuff to a netlist
+pub trait NetlistRWView<'arena> {
+    fn new_cell<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+    ) -> RWGuard<'arena, NetlistCell<'arena>>;
+    fn new_wire<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+    ) -> RWGuard<'arena, NetlistWire<'arena>>;
+    fn delete_cell<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        guard: RWGuard<'arena, NetlistCell<'arena>>,
+    );
+    fn delete_wire<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        guard: RWGuard<'arena, NetlistWire<'arena>>,
+    );
+
+    fn get_cell_read<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistCellRef<'arena>,
+    ) -> ROGuard<'arena, NetlistCell<'arena>>;
+    fn get_cell_write<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistCellRef<'arena>,
+    ) -> RWGuard<'arena, NetlistCell<'arena>>;
+
+    fn get_wire_read<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistWireRef<'arena>,
+    ) -> ROGuard<'arena, NetlistWire<'arena>>;
+    fn get_wire_write<'wrapper>(
+        &'wrapper mut self,
+        work_item: &'arena WorkItem<'arena, 'arena>,
+        obj: NetlistWireRef<'arena>,
+    ) -> RWGuard<'arena, NetlistWire<'arena>>;
+
+    fn allocate_new_work<'wrapper>(
+        &'wrapper mut self,
+        node: NetlistRef<'arena>,
+        prio: u64,
+    ) -> &'arena mut WorkItem<'arena, 'arena>;
+}
 
 // TODO
 pub struct WorkItem<'arena, 'work_item> {
