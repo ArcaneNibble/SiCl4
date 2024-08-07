@@ -41,7 +41,7 @@ impl<'arena> NetlistRef<'arena> {
         }
     }
 
-    fn type_erase(self) -> TypeErasedObjRef<'arena> {
+    pub(crate) fn type_erase(self) -> TypeErasedObjRef<'arena> {
         match self {
             NetlistRef::Cell(x) => x.type_erase(),
             NetlistRef::Wire(x) => x.type_erase(),
@@ -72,7 +72,7 @@ impl<'arena, T> Deref for ROGuard<'arena, T> {
 #[derive(Debug)]
 pub struct RWGuard<'arena, T> {
     pub x: ObjRef<'arena, T>,
-    _lock_idx: usize,
+    pub(crate) lock_idx: usize,
 }
 impl<'arena, T> NetlistGuard<'arena, T> for RWGuard<'arena, T> {
     fn ref_<'guard>(&'guard self) -> ObjRef<'arena, T> {

@@ -2,19 +2,22 @@
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
+use std::sync::atomic::Ordering;
 use std::{cell::Cell, fmt::Debug};
 
 use netlist::*;
 use single_threaded::SingleThreadedView;
+use tracing::Level;
 
 use crate::lock_ops::stroad::WorkItemInterface;
-use crate::lock_ops::LockAndStroadData;
+use crate::lock_ops::{LockAndStroadData, LockState, TypeErasedObjRef};
 use crate::loom_testing::*;
 use crate::netlist::*;
 use crate::{allocator::SlabRoot, lock_ops::stroad::Stroad};
 
 pub mod netlist;
 pub mod single_threaded;
+pub mod unordered;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum SpeculativeLockGrabResult {
@@ -175,6 +178,96 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
 
     fn cancel<Q: WorkQueueInterface<WorkItemTy = &'work_item Self>>(&'work_item self, q: &mut Q) {
         todo!()
+    }
+
+    /* Lock setup */
+
+    /// returns (old_status, index, lock) of newly-set-up lock
+    fn set_up_next_lock(
+        &'work_item self,
+        obj: NetlistRef<'arena>,
+    ) -> Option<(
+        u64,
+        usize,
+        &'work_item mut LockAndStroadData<
+            'arena,
+            'work_item,
+            WorkItemPerLockData<'arena, 'work_item>,
+        >,
+    )> {
+        let old_status = self.status.load(Ordering::Relaxed);
+        if old_status & WORK_STATUS_DOING_CANCEL != 0 {
+            return None;
+        }
+
+        let lock_idx = old_status & WORK_STATUS_NUM_LOCKS_MASK;
+        if lock_idx == MAX_LOCKS_PER_WORK_ITEM as u64 {
+            todo!("need to allocate a spill block?");
+        }
+        // self.locks_used.set(lock_idx + 1);
+        let ret = unsafe {
+            // this can only write to the thing @ lock_idx
+            // (i.e. cannot data race with a cancel on another thread which can only access up to and *not* including lock_idx)
+            let lock_ptr = (*self.locks[lock_idx as usize].as_ptr()).get();
+            LockAndStroadData::init(lock_ptr, obj.type_erase());
+            let inner_payload = LockAndStroadData::unsafe_stroad_work_item_link_ptr(lock_ptr);
+            // lifetimes should've made it s.t. this is pinned in place
+            (*inner_payload).w = self;
+            (old_status, lock_idx as usize, &mut *lock_ptr)
+        };
+
+        tracing::event!(
+            name: "work_item::next_lock",
+            Level::TRACE,
+            lock_idx,
+        );
+
+        Some(ret)
+    }
+
+    fn commit_unordered_lock(&self, old_status: u64, lock_idx: usize) {
+        let new_status = (old_status & !WORK_STATUS_NUM_LOCKS_MASK) + lock_idx as u64 + 1;
+        // can just write, cancel cannot happen
+        self.status.store(new_status, Ordering::Relaxed);
+    }
+
+    /* Find lock, for RW phase */
+
+    fn find_lock<C: FnOnce(LockState) -> bool>(
+        &self,
+        obj: TypeErasedObjRef<'arena>,
+        check_state: C,
+        rw: bool,
+    ) -> usize {
+        let status = self.status.load(Ordering::Relaxed);
+        let num_locks = status & WORK_STATUS_NUM_LOCKS_MASK;
+        // once we've started work, cancel is not allowed
+        debug_assert!(status & WORK_STATUS_DOING_CANCEL == 0);
+
+        // xxx can this be done more efficiently?
+        for lock_idx in 0..num_locks as usize {
+            let lock_i = unsafe { &*self.locks[lock_idx].assume_init_ref().get() };
+            if lock_i.target() == obj {
+                if !check_state(lock_i.state.get()) {
+                    panic!("Tried to access a node in the wrong state")
+                }
+
+                if rw {
+                    if lock_i.rw_handed_out.get() || lock_i.ro_handed_out.get() {
+                        panic!("Tried to get RW guard, but guards already handed out");
+                    }
+                    lock_i.rw_handed_out.set(true);
+                } else {
+                    if lock_i.rw_handed_out.get() {
+                        panic!("Tried to get RO guard, but RW guard already handed out");
+                    }
+                    lock_i.ro_handed_out.set(true);
+                }
+
+                return lock_idx;
+            }
+        }
+        panic!("Tried to access a node that wasn't tagged in phase 1")
     }
 }
 #[derive(Debug)]
