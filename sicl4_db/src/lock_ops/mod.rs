@@ -175,6 +175,7 @@ pub enum LockState {
     LockedForUnorderedWrite,
     LockedForOrderedRead,
     LockedForOrderedWrite,
+    NewlyAllocatedOrdered,
 }
 impl Default for LockState {
     fn default() -> Self {
@@ -628,16 +629,11 @@ impl<'arena, 'lock_inst, P: WorkItemInterface> LockAndStroadData<'arena, 'lock_i
         unpark_q: &mut Q,
     ) {
         match self.state.get() {
-            LockState::Unlocked => {
-                // don't have to do anything, haven't even tried locking
-            }
-            LockState::Parked => {
-                // fixme: what are we supposed to do here?
-            }
             LockState::LockedForUnorderedRead => self.unlock_unordered_read(stroad, unpark_q),
             LockState::LockedForUnorderedWrite => self.unlock_unordered_write(stroad, unpark_q),
             LockState::LockedForOrderedRead => self.unlock_ordered_read(stroad, unpark_q),
             LockState::LockedForOrderedWrite => self.unlock_ordered_write(stroad, unpark_q),
+            _ => {}
         }
     }
 

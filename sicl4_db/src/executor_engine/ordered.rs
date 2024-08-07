@@ -1,53 +1,60 @@
-//! This module contains code to support operations where the order does not matter.
+//! This module contains code to support operations where the order *does* matter.
 //!
-//! In other words, the "fringe" of the graph algorithm is an unordered set.
+//! In other words, the "fringe" of the graph algorithm is a priority queue.
 
-// FIXME there's a lot of code duplication here
+// FIXME MASSIVE CODE DUPLICATION
 
-use std::{mem, sync::atomic::Ordering};
+use std::mem;
+
+use ordered_commit_queue::ItemWithPriority;
 
 use crate::allocator::SlabThreadShard;
 use crate::lock_ops::*;
 
 use super::*;
 
-pub trait UnorderedAlgorithm: Send + Sync {
-    type ROtoRWTy;
-
-    fn try_process_readonly<'algo_global_state, 'view, 'arena>(
+pub trait OrderedAlgorithm: Send + Sync {
+    fn try_process_readonly<'algo_global_state, 'view, 'arena, 'q>(
         &'algo_global_state self,
-        view: &'view mut UnorderedAlgorithmROView<'arena>,
+        view: &'view mut OrderedAlgorithmROView<'arena, 'q>,
         work_item: &'arena WorkItem<'arena, 'arena>,
-    ) -> Result<Self::ROtoRWTy, SpeculativeLockGrabResult>;
+    ) -> Result<(), SpeculativeLockGrabResult>;
 
     fn process_finish_readwrite<'algo_state, 'view, 'arena, 'q>(
         &'algo_state self,
-        view: &'view mut UnorderedAlgorithmRWView<'arena, 'q>,
+        view: &'view mut OrderedAlgorithmRWView<'arena, 'q>,
         work_item: &'arena WorkItem<'arena, 'arena>,
-        ro_output: Self::ROtoRWTy,
     );
 }
 
 #[derive(Debug)]
-pub struct UnorderedAlgorithmROView<'arena> {
+pub struct OrderedAlgorithmROView<'arena, 'q> {
     pub(super) stroad: &'arena Stroad<'arena, 'arena, WorkItemPerLockData<'arena, 'arena>>,
+    pub(super) unpark_q:
+        &'q ordered_commit_queue::OrderedCommitQueue<&'arena WorkItem<'arena, 'arena>>,
+    pub(super) cancel_list: Vec<&'arena WorkItem<'arena, 'arena>>,
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
 }
-impl<'arena> NetlistROView<'arena> for UnorderedAlgorithmROView<'arena> {
+impl<'arena, 'q> NetlistROView<'arena> for OrderedAlgorithmROView<'arena, 'q> {
     fn try_lock_cell<'wrapper>(
         &'wrapper mut self,
         work_item: &'arena WorkItem<'arena, 'arena>,
         obj: NetlistCellRef<'arena>,
         want_write: bool,
     ) -> Result<Option<ROGuard<'arena, NetlistCell<'arena>>>, SpeculativeLockGrabResult> {
-        let (old_status, lock_idx, lock) =
-            work_item.set_up_next_lock(NetlistRef::Cell(obj)).unwrap();
+        let (old_status, lock_idx, lock) = work_item
+            .set_up_next_lock(NetlistRef::Cell(obj))
+            .ok_or(SpeculativeLockGrabResult::Cancel)?;
         let lock_gotten = if !want_write {
-            lock.unordered_try_read(self.stroad)
+            lock.ordered_try_read(self.stroad, work_item.prio, &mut self.cancel_list)
         } else {
-            lock.unordered_try_write(self.stroad)
+            lock.ordered_try_write(self.stroad, work_item.prio, &mut self.cancel_list)
         };
-        work_item.commit_unordered_lock(old_status, lock_idx);
+        if work_item.commit_ordered_lock(old_status, lock_idx).is_err() {
+            // *sigh*, canceled just as we grabbed this lock
+            unsafe { lock.unlock(self.stroad, &mut self.unpark_q) };
+            return Err(SpeculativeLockGrabResult::Cancel);
+        }
         if let Ok(lock_gotten) = lock_gotten {
             if !lock_gotten {
                 return Err(SpeculativeLockGrabResult::Block);
@@ -64,14 +71,19 @@ impl<'arena> NetlistROView<'arena> for UnorderedAlgorithmROView<'arena> {
         obj: NetlistWireRef<'arena>,
         want_write: bool,
     ) -> Result<Option<ROGuard<'arena, NetlistWire<'arena>>>, SpeculativeLockGrabResult> {
-        let (old_status, lock_idx, lock) =
-            work_item.set_up_next_lock(NetlistRef::Wire(obj)).unwrap();
+        let (old_status, lock_idx, lock) = work_item
+            .set_up_next_lock(NetlistRef::Wire(obj))
+            .ok_or(SpeculativeLockGrabResult::Cancel)?;
         let lock_gotten = if !want_write {
-            lock.unordered_try_read(self.stroad)
+            lock.ordered_try_read(self.stroad, work_item.prio, &mut self.cancel_list)
         } else {
-            lock.unordered_try_write(self.stroad)
+            lock.ordered_try_write(self.stroad, work_item.prio, &mut self.cancel_list)
         };
-        work_item.commit_unordered_lock(old_status, lock_idx);
+        if work_item.commit_ordered_lock(old_status, lock_idx).is_err() {
+            // *sigh*, canceled just as we grabbed this lock
+            unsafe { lock.unlock(self.stroad, &mut self.unpark_q) };
+            return Err(SpeculativeLockGrabResult::Cancel);
+        }
         if let Ok(lock_gotten) = lock_gotten {
             if !lock_gotten {
                 return Err(SpeculativeLockGrabResult::Block);
@@ -84,11 +96,12 @@ impl<'arena> NetlistROView<'arena> for UnorderedAlgorithmROView<'arena> {
 }
 
 #[derive(Debug)]
-pub struct UnorderedAlgorithmRWView<'arena, 'q> {
+pub struct OrderedAlgorithmRWView<'arena, 'q> {
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
-    pub(super) queue: &'q mut work_queue::LocalQueue<&'arena WorkItem<'arena, 'arena>>,
+    pub(super) queue:
+        &'q ordered_commit_queue::OrderedCommitQueue<&'arena WorkItem<'arena, 'arena>>,
 }
-impl<'arena, 'q> NetlistRWView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> {
+impl<'arena, 'q> NetlistRWView<'arena> for OrderedAlgorithmRWView<'arena, 'q> {
     fn new_cell<'wrapper>(
         &'wrapper mut self,
         work_item: &'arena WorkItem<'arena, 'arena>,
@@ -97,7 +110,7 @@ impl<'arena, 'q> NetlistRWView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> 
             .heap_thread_shard
             .allocate::<LockedObj<NetlistCell<'arena>>>();
         unsafe {
-            LockedObj::init_unordered(new.as_mut_ptr(), gen);
+            LockedObj::init_ordered(new.as_mut_ptr(), gen);
             let _ = NetlistCell::init((*new.as_mut_ptr()).payload.get());
             let new_ref = ObjRef {
                 ptr: new.assume_init_ref(),
@@ -106,8 +119,8 @@ impl<'arena, 'q> NetlistRWView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> 
             let (old_status, lock_idx, lock) = work_item
                 .set_up_next_lock(NetlistRef::Cell(new_ref))
                 .unwrap();
-            lock.state.set(LockState::LockedForUnorderedWrite);
-            work_item.commit_unordered_lock(old_status, lock_idx);
+            lock.state.set(LockState::NewlyAllocatedOrdered);
+            work_item.commit_ordered_lock(old_status, lock_idx).unwrap();
             RWGuard {
                 x: new_ref,
                 lock_idx,
@@ -122,7 +135,7 @@ impl<'arena, 'q> NetlistRWView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> 
             .heap_thread_shard
             .allocate::<LockedObj<NetlistWire<'arena>>>();
         unsafe {
-            LockedObj::init_unordered(new.as_mut_ptr(), gen);
+            LockedObj::init_ordered(new.as_mut_ptr(), gen);
             let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get());
             let new_ref = ObjRef {
                 ptr: new.assume_init_ref(),
@@ -131,8 +144,8 @@ impl<'arena, 'q> NetlistRWView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> 
             let (old_status, lock_idx, lock) = work_item
                 .set_up_next_lock(NetlistRef::Wire(new_ref))
                 .unwrap();
-            lock.state.set(LockState::LockedForUnorderedWrite);
-            work_item.commit_unordered_lock(old_status, lock_idx);
+            lock.state.set(LockState::NewlyAllocatedOrdered);
+            work_item.commit_ordered_lock(old_status, lock_idx).unwrap();
             RWGuard {
                 x: new_ref,
                 lock_idx,
@@ -179,7 +192,7 @@ impl<'arena, 'q> NetlistRWView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> 
         let _lock_idx = work_item.find_lock(
             obj.type_erase(),
             |state| match state {
-                LockState::LockedForUnorderedRead | LockState::LockedForUnorderedWrite => true,
+                LockState::LockedForOrderedRead | LockState::LockedForOrderedWrite => true,
                 _ => false,
             },
             false,
@@ -194,7 +207,7 @@ impl<'arena, 'q> NetlistRWView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> 
         let lock_idx = work_item.find_lock(
             obj.type_erase(),
             |state| match state {
-                LockState::LockedForUnorderedWrite => true,
+                LockState::LockedForOrderedWrite => true,
                 _ => false,
             },
             true,
@@ -210,14 +223,13 @@ impl<'arena, 'q> NetlistRWView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> 
         let _lock_idx = work_item.find_lock(
             obj.type_erase(),
             |state| match state {
-                LockState::LockedForUnorderedRead | LockState::LockedForUnorderedWrite => true,
+                LockState::LockedForOrderedRead | LockState::LockedForOrderedWrite => true,
                 _ => false,
             },
             false,
         );
         ROGuard { x: obj }
     }
-
     fn get_wire_write<'wrapper>(
         &'wrapper mut self,
         work_item: &'arena WorkItem<'arena, 'arena>,
@@ -226,7 +238,7 @@ impl<'arena, 'q> NetlistRWView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> 
         let lock_idx = work_item.find_lock(
             obj.type_erase(),
             |state| match state {
-                LockState::LockedForUnorderedWrite => true,
+                LockState::LockedForOrderedWrite => true,
                 _ => false,
             },
             true,
@@ -245,32 +257,37 @@ impl<'arena, 'q> NetlistRWView<'arena> for UnorderedAlgorithmRWView<'arena, 'q> 
         work_item
     }
 }
-impl<'arena, 'q> UnorderedAlgorithmRWView<'arena, 'q> {
-    pub fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>) {
-        let work_item = self.allocate_new_work(node, 0);
-        self.queue.push(&*work_item);
+impl<'arena, 'q> OrderedAlgorithmRWView<'arena, 'q> {
+    pub fn add_work<'wrapper>(&'wrapper mut self, node: NetlistRef<'arena>, prio: u64) {
+        let work_item = self.allocate_new_work(node, prio);
+        self.queue.add_work(work_item);
     }
 }
 
 impl<'arena, 'work_item> WorkQueueInterface
-    for work_queue::LocalQueue<&'work_item WorkItem<'arena, 'work_item>>
+    for ordered_commit_queue::OrderedCommitQueue<&'work_item WorkItem<'arena, 'work_item>>
 {
     type WorkItemTy = &'work_item WorkItem<'arena, 'work_item>;
     fn add_work(&mut self, work_item: &'work_item WorkItem<'arena, 'work_item>) {
-        self.push(work_item);
-    }
-}
-impl<'arena, 'work_item> WorkQueueInterface
-    for work_queue::Queue<&'work_item WorkItem<'arena, 'work_item>>
-{
-    type WorkItemTy = &'work_item WorkItem<'arena, 'work_item>;
-    fn add_work(&mut self, work_item: &'work_item WorkItem<'arena, 'work_item>) {
-        self.push(work_item);
+        self.create_new_work(ItemWithPriority {
+            item: work_item,
+            prio: work_item.prio as i64,
+        })
     }
 }
 impl<'q, 'arena, 'work_item> WorkQueueInterface
-    for &'q work_queue::Queue<&'work_item WorkItem<'arena, 'work_item>>
+    for &'q ordered_commit_queue::OrderedCommitQueue<&'work_item WorkItem<'arena, 'work_item>>
 {
+    type WorkItemTy = &'work_item WorkItem<'arena, 'work_item>;
+    fn add_work(&mut self, work_item: &'work_item WorkItem<'arena, 'work_item>) {
+        self.create_new_work(ItemWithPriority {
+            item: work_item,
+            prio: work_item.prio as i64,
+        })
+    }
+}
+
+impl<'arena, 'work_item> WorkQueueInterface for Vec<&'work_item WorkItem<'arena, 'work_item>> {
     type WorkItemTy = &'work_item WorkItem<'arena, 'work_item>;
     fn add_work(&mut self, work_item: &'work_item WorkItem<'arena, 'work_item>) {
         self.push(work_item);

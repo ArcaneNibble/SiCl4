@@ -20,6 +20,7 @@ use crate::util::UsizePtr;
 use crate::{allocator::SlabRoot, lock_ops::stroad::Stroad};
 
 pub mod netlist;
+pub mod ordered;
 pub mod ordered_commit_queue;
 pub mod single_threaded;
 pub mod unordered;
@@ -285,6 +286,25 @@ impl<'arena, 'work_item> WorkItem<'arena, 'work_item> {
         let new_status = (old_status & !WORK_STATUS_NUM_LOCKS_MASK) + lock_idx as u64 + 1;
         // can just write, cancel cannot happen
         self.status.store(new_status, Ordering::Relaxed);
+    }
+
+    /// if canceled, *this* thread has to release the just-acquired lock
+    /// (other threads can't see it)
+    fn commit_ordered_lock(&self, old_status: u64, lock_idx: usize) -> Result<(), ()> {
+        let new_status = (old_status & !WORK_STATUS_NUM_LOCKS_MASK) + lock_idx as u64 + 1;
+        // need release ordering to synchronize-with an acquire in the cancel code path
+        if let Err(err_status) = self.status.compare_exchange(
+            old_status,
+            new_status,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            // raced with cancel and lost
+            debug_assert!(err_status & WORK_STATUS_DOING_CANCEL != 0);
+            Err(())
+        } else {
+            Ok(())
+        }
     }
 
     /* Find lock, for RW phase */
