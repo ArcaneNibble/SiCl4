@@ -5,6 +5,8 @@ use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
 
+use uuid::Uuid;
+
 use crate::allocator::SlabThreadShard;
 use crate::lock_ops::*;
 use crate::netlist::*;
@@ -16,6 +18,7 @@ use super::*;
 pub struct SingleThreadedView<'arena> {
     pub(super) x: &'arena NetlistManager<'arena>,
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
+    pub(super) debug_id: Cell<usize>,
 }
 // safety: only one of these objects can exist at once
 unsafe impl<'arena> Send for SingleThreadedView<'arena> {}
@@ -25,13 +28,23 @@ impl<'arena> Drop for SingleThreadedView<'arena> {
     }
 }
 impl<'arena> SingleThreadedView<'arena> {
-    pub fn new_cell<'wrapper>(&'wrapper mut self) -> SingleThreadedCellGuard<'arena> {
+    pub fn new_cell<'wrapper>(
+        &'wrapper mut self,
+        cell_type: Uuid,
+        num_connections: usize,
+    ) -> SingleThreadedCellGuard<'arena> {
         let (new, gen) = self
             .heap_thread_shard
             .allocate::<LockedObj<NetlistCell<'arena>>>();
         unsafe {
             LockedObj::init_unordered(new.as_mut_ptr(), gen);
-            let _ = NetlistCell::init((*new.as_mut_ptr()).payload.get());
+            let _ = NetlistCell::init(
+                (*new.as_mut_ptr()).payload.get(),
+                cell_type,
+                self.debug_id.get(),
+                num_connections,
+            );
+            self.debug_id.set(self.debug_id.get() + 1);
             let new_ref = ObjRef {
                 ptr: new.assume_init_ref(),
                 gen,
@@ -45,7 +58,8 @@ impl<'arena> SingleThreadedView<'arena> {
             .allocate::<LockedObj<NetlistWire<'arena>>>();
         unsafe {
             LockedObj::init_unordered(new.as_mut_ptr(), gen);
-            let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get());
+            let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get(), self.debug_id.get());
+            self.debug_id.set(self.debug_id.get() + 1);
             let new_ref = ObjRef {
                 ptr: new.assume_init_ref(),
                 gen,

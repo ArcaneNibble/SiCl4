@@ -100,18 +100,27 @@ pub struct OrderedAlgorithmRWView<'arena, 'q> {
     pub(super) heap_thread_shard: SlabThreadShard<'arena, NetlistTypeMapper>,
     pub(super) queue:
         &'q ordered_commit_queue::OrderedCommitQueue<&'arena WorkItem<'arena, 'arena>>,
+    pub(super) debug_id: Cell<usize>,
 }
 impl<'arena, 'q> NetlistRWView<'arena> for OrderedAlgorithmRWView<'arena, 'q> {
     fn new_cell<'wrapper>(
         &'wrapper mut self,
         work_item: &'arena WorkItem<'arena, 'arena>,
+        cell_type: Uuid,
+        num_connections: usize,
     ) -> RWGuard<'arena, NetlistCell<'arena>> {
         let (new, gen) = self
             .heap_thread_shard
             .allocate::<LockedObj<NetlistCell<'arena>>>();
         unsafe {
             LockedObj::init_ordered(new.as_mut_ptr(), gen);
-            let _ = NetlistCell::init((*new.as_mut_ptr()).payload.get());
+            let _ = NetlistCell::init(
+                (*new.as_mut_ptr()).payload.get(),
+                cell_type,
+                self.debug_id.get(),
+                num_connections,
+            );
+            self.debug_id.set(self.debug_id.get() + 1);
             let new_ref = ObjRef {
                 ptr: new.assume_init_ref(),
                 gen,
@@ -136,7 +145,8 @@ impl<'arena, 'q> NetlistRWView<'arena> for OrderedAlgorithmRWView<'arena, 'q> {
             .allocate::<LockedObj<NetlistWire<'arena>>>();
         unsafe {
             LockedObj::init_ordered(new.as_mut_ptr(), gen);
-            let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get());
+            let _ = NetlistWire::init((*new.as_mut_ptr()).payload.get(), self.debug_id.get());
+            self.debug_id.set(self.debug_id.get() + 1);
             let new_ref = ObjRef {
                 ptr: new.assume_init_ref(),
                 gen,

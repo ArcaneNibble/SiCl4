@@ -13,6 +13,7 @@ use ordered_commit_queue::ItemWithPriority;
 use single_threaded::SingleThreadedView;
 use tracing::Level;
 use unordered::{UnorderedAlgorithm, UnorderedAlgorithmROView, UnorderedAlgorithmRWView};
+use uuid::Uuid;
 
 use crate::allocator::SlabRoot;
 use crate::lock_ops::stroad::{Stroad, WorkItemInterface};
@@ -69,6 +70,8 @@ pub trait NetlistRWView<'arena> {
     fn new_cell<'wrapper>(
         &'wrapper mut self,
         work_item: &'arena WorkItem<'arena, 'arena>,
+        cell_type: Uuid,
+        num_connections: usize,
     ) -> RWGuard<'arena, NetlistCell<'arena>>;
     fn new_wire<'wrapper>(
         &'wrapper mut self,
@@ -514,6 +517,7 @@ impl<'arena> NetlistManager<'arena> {
         SingleThreadedView {
             x: self,
             heap_thread_shard: self.heap.new_thread(),
+            debug_id: Cell::new(0),
         }
     }
 
@@ -589,6 +593,7 @@ impl<'arena> NetlistManager<'arena> {
                             let mut rw_view = UnorderedAlgorithmRWView {
                                 heap_thread_shard: ro_view.heap_thread_shard,
                                 queue: &mut local_queue_rc.borrow_mut(),
+                                debug_id: Cell::new(0), // fucked
                             };
                             algo.process_finish_readwrite(&mut rw_view, work_item, ro_ret);
                             rw_view.heap_thread_shard
@@ -748,6 +753,7 @@ impl<'arena> NetlistManager<'arena> {
                                 let mut rw_view = OrderedAlgorithmRWView {
                                     heap_thread_shard: ro_view.heap_thread_shard,
                                     queue,
+                                    debug_id: Cell::new(0), // fucked
                                 };
                                 algo.process_finish_readwrite(&mut rw_view, work_item);
                                 rw_view.heap_thread_shard
